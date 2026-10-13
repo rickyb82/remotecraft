@@ -1,0 +1,3 @@
+# Le chiavi del server e il database restano solo sul server: mai nel repository.
+/data/
+.env

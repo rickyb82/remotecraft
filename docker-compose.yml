@@ -1,0 +1,32 @@
+# RustDesk Server OSS: hbbs (ID / rendezvous) and hbbr (relay).
+# Avvio: docker compose up -d   ·   Chiave pubblica per i client: data/id_ed25519.pub
+#
+# RUSTDESK_TAG fissa la versione dell'immagine (default: latest). Dopo il primo avvio
+# conviene fissarla alla versione installata, per aggiornare solo quando lo decidi tu.
+
+services:
+  hbbs:
+    image: rustdesk/rustdesk-server:${RUSTDESK_TAG:-latest}
+    container_name: rustdesk-hbbs
+    # -k _ : usa la coppia di chiavi in /root (generata al primo avvio) e accetta solo
+    # i client configurati con la chiave pubblica.
+    command: hbbs -k _
+    volumes:
+      - ./data:/root
+    ports:
+      - "21115:21115"       # TCP: test del tipo di NAT
+      - "21116:21116"       # TCP: registrazione ID e connessioni
+      - "21116:21116/udp"   # UDP: registrazione ID, heartbeat, connessione diretta
+    depends_on:
+      - hbbr
+    restart: unless-stopped
+
+  hbbr:
+    image: rustdesk/rustdesk-server:${RUSTDESK_TAG:-latest}
+    container_name: rustdesk-hbbr
+    command: hbbr -k _
+    volumes:
+      - ./data:/root
+    ports:
+      - "21117:21117"       # TCP: relay, quando la connessione diretta non riesce
+    restart: unless-stopped

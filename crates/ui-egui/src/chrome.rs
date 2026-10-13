@@ -95,6 +95,7 @@ pub fn top_bar(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                 let (icon, tip) = if app.dark { (Icon::Sun, "Light theme") } else { (Icon::Moon, "Dark theme") };
                 if icon_button(ui, t, icon, app.tr(tip), true, false).clicked() {
                     app.dark = !app.dark;
+                    app.run("prefs.set", json!({"theme": if app.dark { "dark" } else { "light" }}));
                 }
                 let lang = icon_button(ui, t, Icon::Globe, &format!("{}: {}", app.tr("Language"), app.language.name()), true, false);
                 egui::Popup::menu(&lang).show(|ui| {

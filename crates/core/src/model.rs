@@ -156,6 +156,8 @@ impl Intervention {
 pub struct Preferences {
     /// `it` or `en`: the language of texts made for people (MCP summaries, reports).
     pub language: String,
+    /// `light`, `dark` or `system`: the interface's theme.
+    pub theme: String,
     /// The data controller (titolare del trattamento) named in exports.
     pub company_name: String,
     /// Billable time is rounded up to this many minutes per intervention (0 or 1 = exact).
@@ -178,6 +180,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             language: "it".into(),
+            theme: "system".into(),
             company_name: String::new(),
             billing_unit_minutes: 15,
             minimum_minutes: 0,

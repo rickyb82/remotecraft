@@ -176,12 +176,13 @@ impl DeskApp {
             "en" => Language::En,
             _ => Language::system(),
         };
+        let dark = session.data().preferences.theme == "dark";
         let empty = session.data().customers.is_empty() && session.data().notices.is_empty() && session.problem().is_none();
         let screen = if empty { Screen::Settings } else { Screen::Customers };
         Self {
             session,
             language,
-            dark: false,
+            dark,
             applied_dark: None,
             screen,
             previous: Screen::Customers,

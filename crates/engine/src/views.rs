@@ -151,6 +151,7 @@ pub fn intervention_json(data: &Data, i: &Intervention, now: DateTime<Utc>) -> V
     v["customer_name"] = json!(customer_name(data, i.customer_id));
     v["device_name"] = json!(device_name(data, i.device_id));
     v["running"] = json!(i.running());
+    v["billable_minutes"] = json!(data.preferences.billable_minutes(i));
     v["started_local"] = json!(time::local_text(&i.started_at));
     if i.running() {
         v["elapsed_minutes"] = json!(time::minutes_between(&i.started_at, &time::stamp(now)).unwrap_or(0));

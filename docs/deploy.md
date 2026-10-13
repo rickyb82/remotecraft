@@ -11,7 +11,7 @@ utente non privilegiato `remotecraft`:
 |---|---|---|
 | `hbbs -k _ [-r $RUSTDESK_HOST]` | 21115/tcp, 21116/tcp+udp | ID e avvio delle connessioni RustDesk; accetta solo client con la chiave del server |
 | `hbbr -k _` | 21117/tcp | relay RustDesk |
-| `remotecraft-cli serve` | 7979/tcp | API del gestionale |
+| `remotecraft-cli serve` | 7979/tcp | API del gestionale e app web |
 
 Se uno dei tre si ferma, si ferma il container e la policy `restart: unless-stopped` lo
 riavvia. L'`HEALTHCHECK` verifica le porte RustDesk ogni minuto.
@@ -53,6 +53,24 @@ GET  /api/users                       → {"users": ["marco"]}
 ```
 
 Solo con il token di servizio. I token utente sono in `/data/desk/tokens.json` (0600).
+
+## L'app web nel framework
+
+Il container serve l'app web (WebAssembly) su `/`. Quando un tecnico apre la sezione
+assistenza del framework, crea (o riusa) il suo token e apri la pagina con il token:
+
+```
+https://assistenza.example.it/?token=<token del tecnico>&lang=it
+```
+
+La pagina tiene il token nello storage del browser e parla con la propria origine (il server
+che l'ha servita). Può anche essere ospitata altrove (GitHub Pages) e puntata al server con
+`?server=https://assistenza.example.it`: il server risponde al CORS per qualunque origine, è il
+token a proteggere i dati. Il link `rustdesk://` apre il client RustDesk installato sul PC del
+tecnico; gli export GDPR arrivano come download.
+
+L'app desktop (`cargo install --path apps/remotecraft`, oppure `remotecraft --demo`) lavora
+sul gestionale locale nella cartella dei dati, senza server.
 
 ## Chiamare l'API
 
@@ -112,5 +130,5 @@ hbbs e hbbr vanno allora avviati a parte (il vecchio `docker-compose.yml` o i bi
 - Le scritture passano da un solo processo alla volta (il server). La CLI nello stesso container
   vede le modifiche del server e viceversa, ma due scritture simultanee da processi diversi
   possono sovrascriversi: per lavorare usa l'API o l'MCP, la CLI per consultare.
-- Nessuna interfaccia grafica propria per ora: il gestionale si usa dal framework, dall'MCP o
-  dalla CLI.
+- L'app web mostra l'intero gestionale al tecnico (è pensata per una piccola azienda di
+  assistenza): i token dei tecnici vanno dati solo a chi deve vedere tutti i clienti.

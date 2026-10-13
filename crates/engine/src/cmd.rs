@@ -200,7 +200,7 @@ pub const COMMANDS: &[Command] = &[
         "prefs.set",
         "Set Preferences",
         "Settings › Preferences",
-        "{key, value} or {language?: it|en, company_name?, billing_unit_minutes?, minimum_minutes?, require_consent?, consent_validity_months?, retention_years?, rustdesk_host?, rustdesk_key?}",
+        "{key, value} or {language?: it|en, theme?: light|dark|system, company_name?, billing_unit_minutes?, minimum_minutes?, require_consent?, consent_validity_months?, retention_years?, rustdesk_host?, rustdesk_key?}",
         W,
         W,
     ),
@@ -1519,6 +1519,14 @@ fn prefs_set(data: &mut Data, p: &Value) -> CoreResult<Value> {
         }
         prefs.language = l;
         changed.push("language");
+    }
+    if let Some(v) = text(&p, "theme")? {
+        let v = v.to_lowercase();
+        if !matches!(v.as_str(), "light" | "dark" | "system") {
+            return Err(invalid("`theme` must be light, dark or system"));
+        }
+        prefs.theme = v;
+        changed.push("theme");
     }
     if let Some(v) = text(&p, "company_name")? {
         prefs.company_name = v;

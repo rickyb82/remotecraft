@@ -33,6 +33,22 @@ impl App {
     }
 }
 
+/// Opens a TCP connection (3 s at most per address) and answers how long it took, for
+/// `rustdesk.check`.
+fn probe(host: &str, port: u16) -> Result<u64, String> {
+    use std::net::ToSocketAddrs;
+    let start = std::time::Instant::now();
+    let addrs: Vec<_> = (host, port).to_socket_addrs().map_err(|e| format!("cannot resolve {host}: {e}"))?.take(4).collect();
+    let mut last = format!("{host} has no address");
+    for a in addrs {
+        match std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(3)) {
+            Ok(_) => return Ok(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            Err(e) => last = format!("{a}: {e}"),
+        }
+    }
+    Err(last)
+}
+
 /// Opens a URL with the system's default application (the RustDesk client for `rustdesk://`).
 fn open_with_system(target: &str) {
     let _ = std::process::Command::new(if cfg!(target_os = "macos") {
@@ -89,10 +105,12 @@ fn main() -> Result<(), String> {
     if let Some(a) = &actor {
         desk.set_actor(a);
     }
+    desk.set_rustdesk_probe("", Box::new(probe));
     let mut app = DeskApp::new(Box::new(Session::new(desk)));
     if let Some(l) = lang {
         app.language = l;
     }
+    let theme = app.session.data().preferences.theme.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1380.0, 880.0]).with_min_inner_size([900.0, 600.0]).with_title("RemoteCraft"),
         ..Default::default()
@@ -101,7 +119,11 @@ fn main() -> Result<(), String> {
         "RemoteCraft",
         options,
         Box::new(move |cc| {
-            app.dark = cc.egui_ctx.system_theme() == Some(egui::Theme::Dark);
+            app.dark = match theme.as_str() {
+                "dark" => true,
+                "light" => false,
+                _ => cc.egui_ctx.system_theme() == Some(egui::Theme::Dark),
+            };
             Ok(Box::new(App(app)))
         }),
     )

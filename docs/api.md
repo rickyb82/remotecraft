@@ -74,7 +74,8 @@ L'elenco sempre aggiornato è `remotecraft-cli commands` (o `GET /api/commands`)
 
 | Chiave | Predefinito | Significato |
 |---|---|---|
-| `language` | `it` | lingua dei testi per le persone (descrizioni delle finalità) |
+| `language` | `it` | lingua dei testi per le persone (descrizioni delle finalità) e dell'interfaccia |
+| `theme` | `system` | tema dell'interfaccia: `light`, `dark`, `system` |
 | `company_name` | — | titolare del trattamento, riportato negli export |
 | `billing_unit_minutes` | 15 | arrotondamento per eccesso delle ore fatturabili, per intervento (0/1 = esatto) |
 | `minimum_minutes` | 0 | durata minima fatturabile di un intervento |

@@ -315,7 +315,7 @@ fn tools() -> Vec<Tool> {
             name: "set_preferences",
             command: "prefs.set",
             description: "Change preferences (only the fields given).",
-            properties: json!({"language": {"type": "string", "enum": ["it", "en"]}, "company_name": text, "billing_unit_minutes": {"type": "integer", "minimum": 0, "maximum": 480}, "minimum_minutes": {"type": "integer", "minimum": 0, "maximum": 480}, "require_consent": flag, "consent_validity_months": {"type": "integer", "minimum": 0, "maximum": 240}, "retention_years": {"type": "integer", "minimum": 0, "maximum": 100}, "rustdesk_host": text, "rustdesk_key": text}),
+            properties: json!({"language": {"type": "string", "enum": ["it", "en"]}, "theme": {"type": "string", "enum": ["light", "dark", "system"]}, "company_name": text, "billing_unit_minutes": {"type": "integer", "minimum": 0, "maximum": 480}, "minimum_minutes": {"type": "integer", "minimum": 0, "maximum": 480}, "require_consent": flag, "consent_validity_months": {"type": "integer", "minimum": 0, "maximum": 240}, "retention_years": {"type": "integer", "minimum": 0, "maximum": 100}, "rustdesk_host": text, "rustdesk_key": text}),
             required: &[],
         },
         Tool {

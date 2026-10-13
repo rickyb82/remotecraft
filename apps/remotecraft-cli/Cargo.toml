@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 remotecraft-engine = { workspace = true }
 remotecraft-mcp = { workspace = true }
+remotecraft-remote = { workspace = true }
 serde_json = { workspace = true }
 ureq = { workspace = true }
 

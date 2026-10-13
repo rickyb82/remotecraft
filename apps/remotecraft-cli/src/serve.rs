@@ -4,8 +4,10 @@
 //! - `POST /api/cmd {"command", "params"}` runs any engine command;
 //! - read-only REST routes for the common lookups (`GET /api/customers?query=…`,
 //!   `GET /api/rustdesk/123456789`, `GET /api/interventions?from=…`, `GET /api/rustdesk/check`…);
+//! - `GET /api/snapshot?since=N` for the web app: the whole desk when its revision moved;
 //! - `GET /api/health` (no token), `GET /api/commands`;
-//! - `POST /api/users/<user>/token`, `/revoke`, `GET /api/users` (service token only).
+//! - `POST /api/users/<user>/token`, `/revoke`, `GET /api/users` (service token only);
+//! - the web app's files from a directory (`--static DIR`), when given.
 //!
 //! The service token is the framework's: it names the technician with `X-Remotecraft-User`.
 //! A user token is a technician's (the MCP process): the token is the technician.
@@ -27,11 +29,14 @@ pub struct Options {
     pub token: String,
     /// Where `tokens.json` lives (the desk's directory); `None` keeps tokens in memory.
     pub tokens_dir: Option<PathBuf>,
+    /// The web app's files (`trunk build` output), served at `/`.
+    pub static_dir: Option<PathBuf>,
 }
 
 struct Hub {
     desk: Mutex<Desk>,
     token: String,
+    static_dir: Option<PathBuf>,
     tokens_path: Option<PathBuf>,
     /// User tokens: token → technician.
     tokens: Mutex<HashMap<String, String>>,
@@ -198,18 +203,52 @@ fn query_params(query: &str) -> Value {
     Value::Object(out)
 }
 
-fn respond(stream: &mut TcpStream, status: &str, body: &Value, origin: Option<&str>) {
-    let body = body.to_string();
+fn respond_bytes(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8], origin: Option<&str>) {
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\
 Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Remotecraft-User\r\nAccess-Control-Max-Age: 600\r\n\r\n",
         body.len(),
         origin.unwrap_or("*")
     );
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.write_all(body);
     let _ = stream.flush();
 }
+
+fn respond(stream: &mut TcpStream, status: &str, body: &Value, origin: Option<&str>) {
+    respond_bytes(stream, status, "application/json; charset=utf-8", body.to_string().as_bytes(), origin);
+}
+
+fn mime_of(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or_default() {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript",
+        "wasm" => "application/wasm",
+        "css" => "text/css",
+        "json" => "application/json",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A file of the web app (`index.html` for `/`); paths never leave the directory.
+fn serve_static(stream: &mut TcpStream, dir: &std::path::Path, path: &str, origin: Option<&str>) {
+    let rel = url_decode(path.trim_start_matches('/'));
+    let rel = if rel.is_empty() { "index.html".to_string() } else { rel };
+    if rel.contains("..") || rel.contains('\\') || rel.contains('\0') {
+        respond_bytes(stream, "400 Bad Request", "text/plain", b"bad path", origin);
+        return;
+    }
+    let file = dir.join(&rel);
+    match std::fs::read(&file) {
+        Ok(bytes) => respond_bytes(stream, "200 OK", mime_of(&file), &bytes, origin),
+        Err(_) => respond_bytes(stream, "404 Not Found", "text/plain; charset=utf-8", b"not found", origin),
+    }
+}
+
+const WELCOME: &str = "RemoteCraft server is running.\n\nAPI: POST /api/cmd {\"command\", \"params\"}  ·  GET /api/snapshot?since=N  ·  GET /api/health\nStart the server with --static DIR to serve the web app's files (apps/remotecraft-web, built with trunk).\n";
 
 /// The HTTP status of an engine error.
 fn status_of(e: &Error) -> &'static str {
@@ -322,7 +361,12 @@ fn handle(mut stream: TcpStream, hub: &Hub) {
         return;
     }
     if !req.path.starts_with("/api/") {
-        respond(&mut stream, "404 Not Found", &json!({"error": "RemoteCraft API: see /api/health, POST /api/cmd, GET /api/commands"}), origin);
+        match (req.method.as_str(), &hub.static_dir) {
+            ("GET", Some(dir)) => serve_static(&mut stream, dir, &req.path, origin),
+            ("GET", None) if req.path == "/" => respond_bytes(&mut stream, "200 OK", "text/plain; charset=utf-8", WELCOME.as_bytes(), origin),
+            ("GET", None) => respond(&mut stream, "404 Not Found", &json!({"error": "RemoteCraft API: see /api/health, POST /api/cmd, GET /api/commands"}), origin),
+            _ => respond(&mut stream, "405 Method Not Allowed", &json!({"error": "method not allowed"}), origin),
+        }
         return;
     }
     let caller = match authenticate(hub, &req) {
@@ -360,6 +404,17 @@ fn handle(mut stream: TcpStream, hub: &Hub) {
         Caller::Service(None) => String::new(),
     };
     let (status, body) = match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/snapshot") => {
+            let since: u64 = query_params(&req.query)["since"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+            match hub.desk.lock() {
+                Ok(mut d) => match d.snapshot(since, &actor) {
+                    Ok(Some(s)) => ("200 OK", serde_json::to_value(s).unwrap_or(Value::Null)),
+                    Ok(None) => ("200 OK", json!({"unchanged": true})),
+                    Err(e) => (status_of(&e), json!({"error": e.to_string()})),
+                },
+                Err(_) => ("500 Internal Server Error", json!({"error": "the desk is unavailable"})),
+            }
+        }
         ("POST", "/api/cmd") => match serde_json::from_slice::<Value>(&req.body) {
             Ok(body) => {
                 let command = body.get("command").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -386,6 +441,10 @@ pub fn run_server(desk: Desk, opts: Options) -> Result<(), String> {
     let listener = bind(&opts)?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     eprintln!("RemoteCraft API on http://{addr}/api/ ({})", if opts.token.is_empty() { "no token: local use only" } else { "token required" });
+    match &opts.static_dir {
+        Some(d) => eprintln!("serving the web app from {}", d.display()),
+        None => eprintln!("no --static DIR: the web app is not served (see docs/deploy.md)"),
+    }
     serve(listener, desk, opts);
     Ok(())
 }
@@ -401,6 +460,7 @@ pub(crate) fn serve(listener: TcpListener, desk: Desk, opts: Options) {
     let hub = Arc::new(Hub {
         desk: Mutex::new(desk),
         token: opts.token,
+        static_dir: opts.static_dir,
         tokens_path: opts.tokens_dir.map(|d| d.join("tokens.json")),
         tokens: Mutex::new(HashMap::new()),
     });
@@ -417,7 +477,7 @@ mod tests {
     use super::*;
 
     fn start(token: &str) -> String {
-        let opts = Options { bind: "127.0.0.1:0".into(), token: token.into(), tokens_dir: None };
+        let opts = Options { bind: "127.0.0.1:0".into(), token: token.into(), tokens_dir: None, static_dir: None };
         let listener = bind(&opts).unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let mut desk = Desk::demo();
@@ -499,7 +559,50 @@ mod tests {
             let _ = s.read_to_string(&mut out);
         }
         assert_eq!(http(&addr, "GET", "/api/health", &[], "").0, 200);
-        assert!(bind(&Options { bind: "0.0.0.0:0".into(), token: String::new(), tokens_dir: None }).is_err());
+        assert!(bind(&Options { bind: "0.0.0.0:0".into(), token: String::new(), tokens_dir: None, static_dir: None }).is_err());
+    }
+
+    #[test]
+    fn snapshots_and_static_files() {
+        let dir = std::env::temp_dir().join(format!("remotecraft-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<html>app</html>").unwrap();
+        std::fs::write(dir.join("app.wasm"), [0u8, 1, 2]).unwrap();
+        let opts = Options { bind: "127.0.0.1:0".into(), token: "svc".into(), tokens_dir: None, static_dir: Some(dir.clone()) };
+        let listener = bind(&opts).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || serve(listener, Desk::demo(), opts));
+        let auth = ("Authorization", "Bearer svc");
+        let (st, v) = http(&addr, "GET", "/api/snapshot?since=0", &[auth, ("X-Remotecraft-User", "Anna")], "");
+        assert_eq!(st, 200);
+        let rev = v["revision"].as_u64().unwrap();
+        assert_eq!(v["actor"], "anna");
+        assert_eq!(v["data"]["customers"].as_array().unwrap().len(), 3);
+        assert_eq!(http(&addr, "GET", &format!("/api/snapshot?since={rev}"), &[auth], "").1, json!({"unchanged": true}));
+        http(&addr, "POST", "/api/cmd", &[auth], r#"{"command": "customer.add", "params": {"name": "Nuovo"}}"#);
+        let (_, v) = http(&addr, "GET", &format!("/api/snapshot?since={rev}"), &[auth], "");
+        assert!(v["revision"].as_u64().unwrap() > rev);
+        assert_eq!(http(&addr, "GET", "/api/snapshot", &[], "").0, 401);
+        // Static files, with the index at the root, and nothing above the directory.
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200") && out.contains("text/html") && out.ends_with("<html>app</html>"), "{out}");
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.write_all(b"GET /app.wasm HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("application/wasm"));
+        for bad in ["/../Cargo.toml", "/%2e%2e/Cargo.toml", "/missing.js"] {
+            let mut s = TcpStream::connect(&addr).unwrap();
+            s.write_all(format!("GET {bad} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            assert!(out.starts_with("HTTP/1.1 4"), "{bad}: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

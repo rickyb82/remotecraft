@@ -8,12 +8,14 @@
 
 pub mod cmd;
 pub mod params;
+mod session;
 mod views;
 
 use std::path::{Path, PathBuf};
 
 pub use cmd::{COMMANDS, Command};
 pub use remotecraft_core as core;
+pub use session::{Completed, DeskSession, Session};
 use remotecraft_core::chrono::{DateTime, Utc};
 use remotecraft_core::{Data, storage, time};
 use serde::{Deserialize, Serialize};
@@ -77,6 +79,21 @@ pub struct AuditEntry {
     pub detail: String,
 }
 
+/// The desk as a remote interface sees it (`GET /api/snapshot`): everything, by revision, so
+/// clients fetch it only when it changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Snapshot {
+    pub revision: u64,
+    pub data: Data,
+    /// The technician the client works as (from its token).
+    pub actor: String,
+    pub problems: Vec<String>,
+    /// The RustDesk server next to the desk: name and key, when the container knows them.
+    pub rustdesk_host: String,
+    pub rustdesk_key: String,
+}
+
 /// Audit entries kept in memory when the desk has no files (tests, demo).
 const MAX_MEMORY_AUDIT: usize = 10_000;
 
@@ -110,6 +127,8 @@ pub struct Desk {
     problems: Vec<String>,
     /// What the host knows about the RustDesk server next to it.
     rustdesk: RustDeskEnv,
+    /// Bumped on every change (and every reload), for remote interfaces.
+    revision: u64,
 }
 
 /// Opens a TCP connection to `host:port` and answers how long it took (ms), or why it failed.
@@ -143,6 +162,7 @@ impl Desk {
             memory_audit: Vec::new(),
             problems,
             rustdesk: RustDeskEnv::default(),
+            revision: 1,
         })
     }
 
@@ -159,6 +179,7 @@ impl Desk {
             memory_audit: Vec::new(),
             problems,
             rustdesk: RustDeskEnv::default(),
+            revision: 1,
         }
     }
 
@@ -275,7 +296,30 @@ impl Desk {
             storage::save(&p.desk, &self.data)?;
             self.stamp = file_stamp(&p.desk);
         }
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
+    }
+
+    /// The current revision: changes whenever the data does.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The whole desk for a remote interface working as `actor`, or `None` when nothing
+    /// changed since `since`. Reads the file again first, so another process's changes show.
+    pub fn snapshot(&mut self, since: u64, actor: &str) -> Result<Option<Snapshot>> {
+        self.reload_if_changed()?;
+        if since == self.revision {
+            return Ok(None);
+        }
+        Ok(Some(Snapshot {
+            revision: self.revision,
+            data: self.data.clone(),
+            actor: remotecraft_core::line(actor),
+            problems: self.problems.clone(),
+            rustdesk_host: self.rustdesk.host.clone(),
+            rustdesk_key: self.rustdesk.key.clone(),
+        }))
     }
 
     /// Reads the file again when another process wrote it.
@@ -287,6 +331,7 @@ impl Desk {
             self.problems = data.repair();
             self.data = data;
             self.stamp = now;
+            self.revision = self.revision.wrapping_add(1);
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 //! RemoteCraft headless.
 //!
 //! ```text
-//! remotecraft-cli serve [--bind 127.0.0.1:7979] [--token SECRET]     # HTTP API for the framework
+//! remotecraft-cli serve [--bind 127.0.0.1:7979] [--token SECRET] [--static DIR]   # HTTP API (and the web app)
 //! remotecraft-cli mcp                                                # MCP server on stdio (local desk)
 //! remotecraft-cli mcp --server URL --token USER_TOKEN                # MCP for one technician of a server
 //! remotecraft-cli customers [QUERY]                                  # find customers
@@ -23,6 +23,7 @@
 
 mod serve;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use remotecraft_mcp::{Runner, Server};
 use serde_json::{Value, json};
 
 const USAGE: &str = "Usage:
-  remotecraft-cli serve [--bind 127.0.0.1:7979] [--token SECRET]
+  remotecraft-cli serve [--bind 127.0.0.1:7979] [--token SECRET] [--static DIR]
   remotecraft-cli mcp [--as NAME]
   remotecraft-cli mcp --server URL --token USER_TOKEN
   remotecraft-cli customers [QUERY]
@@ -226,6 +227,7 @@ fn run(raw: Vec<String>) -> Result<(), String> {
                 bind: flag(&rest, "--bind").or_else(|| env("REMOTECRAFT_BIND")).unwrap_or_else(|| "127.0.0.1:7979".into()),
                 token: flag(&rest, "--token").or_else(|| env("REMOTECRAFT_TOKEN")).unwrap_or_default(),
                 tokens_dir: d.paths().map(|p| p.dir.clone()),
+                static_dir: flag(&rest, "--static").or_else(|| env("REMOTECRAFT_STATIC")).map(PathBuf::from),
             };
             serve::run_server(d, opts)
         }
@@ -437,8 +439,44 @@ mod tests {
     }
 
     #[test]
+    fn remote_desk_mirrors_the_server() {
+        use remotecraft_engine::{Completed, DeskSession};
+        use remotecraft_remote::RemoteDesk;
+        let opts = serve::Options { bind: "127.0.0.1:0".into(), token: "svc".into(), tokens_dir: None, static_dir: None };
+        let listener = serve::bind(&opts).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve::serve(listener, Desk::demo(), opts));
+        // Pumps until `until` holds (or 4 s pass), keeping every completion.
+        fn pump_until(r: &mut RemoteDesk, done: &mut Vec<Completed>, until: &dyn Fn(&RemoteDesk, &[Completed]) -> bool) -> bool {
+            for _ in 0..200 {
+                done.extend(r.pump());
+                if until(r, done) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        }
+        let mut r = RemoteDesk::new(&format!("http://{addr}"), "svc");
+        let mut done = Vec::new();
+        assert!(pump_until(&mut r, &mut done, &|r, _| r.problem().is_none() && !r.data().customers.is_empty()), "{:?}", r.problem());
+        assert_eq!(r.data().customers.len(), 3);
+        let job = r.execute("customer.add", &json!({"name": "Dal browser"}));
+        assert!(pump_until(&mut r, &mut done, &|r, d| d.iter().any(|c| c.job == job) && r.data().customers.len() == 4));
+        let c = done.iter().find(|c| c.job == job).unwrap();
+        assert_eq!(c.command, "customer.add");
+        assert_eq!(c.result.as_ref().unwrap()["customer"]["name"], "Dal browser");
+        let bad = r.execute("customer.get", &json!({"customer": 999}));
+        assert!(pump_until(&mut r, &mut done, &|_, d| d.iter().any(|c| c.job == bad)));
+        assert!(done.iter().find(|c| c.job == bad).unwrap().result.as_ref().unwrap_err().to_string().contains("no customer"));
+        let mut wrong = RemoteDesk::new(&format!("http://{addr}"), "nope");
+        let mut none = Vec::new();
+        assert!(pump_until(&mut wrong, &mut none, &|r, _| r.problem().is_some_and(|p| p.contains("token"))), "{:?}", wrong.problem());
+    }
+
+    #[test]
     fn mcp_over_http_reaches_the_server() {
-        let opts = serve::Options { bind: "127.0.0.1:0".into(), token: "svc".into(), tokens_dir: None };
+        let opts = serve::Options { bind: "127.0.0.1:0".into(), token: "svc".into(), tokens_dir: None, static_dir: None };
         let listener = serve::bind(&opts).unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || serve::serve(listener, Desk::demo(), opts));

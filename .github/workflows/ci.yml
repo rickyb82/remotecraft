@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # The toolchain (and so the clippy lints) comes from rust-toolchain.toml.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the image (RustDesk Server + desk)
+        run: docker build -t remotecraft .
+      - name: Start it and check RustDesk and the API
+        run: |
+          docker run -d --name rc -e REMOTECRAFT_TOKEN=ci-secret -e RUSTDESK_HOST=rustdesk.example.net -p 127.0.0.1:7979:7979 remotecraft
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:7979/api/health && break; sleep 1; done
+          curl -fsS -H "Authorization: Bearer ci-secret" http://127.0.0.1:7979/api/rustdesk/check | tee check.json
+          grep -q '"ok":true' check.json
+          docker exec -u remotecraft rc remotecraft-cli rustdesk

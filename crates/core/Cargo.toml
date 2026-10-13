@@ -1,0 +1,17 @@
+[package]
+name = "remotecraft-core"
+description = "RemoteCraft model: customers, their PCs with the RustDesk ID, interventions, privacy notices and GDPR consent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,4 +1,5 @@
 //! Finding records from what people and agents type, and the JSON the commands answer with.
+//! Public so an interface can match and summarise records exactly as the engine does.
 
 use remotecraft_core::chrono::{DateTime, Utc};
 use remotecraft_core::privacy::{self, PURPOSES, PurposeState};
@@ -200,6 +201,96 @@ pub fn privacy_status(data: &Data, customer: u64, now: DateTime<Utc>) -> Value {
     })
 }
 
+/// A purpose state as a word.
+pub fn state_name(s: PurposeState) -> &'static str {
+    match s {
+        PurposeState::Given => "given",
+        PurposeState::Withdrawn => "withdrawn",
+        PurposeState::Expired => "expired",
+        PurposeState::Missing => "missing",
+    }
+}
+
+/// Whether a device's own fields contain the folded query (or its RustDesk ID equals it).
+pub fn device_matches(d: &Device, fq: &str) -> bool {
+    let rid = rustdesk::normalize(fq).ok().filter(|r| !r.is_empty());
+    rid.is_some_and(|r| d.rustdesk_id == r)
+        || [&d.name, &d.hostname, &d.os, &d.serial, &d.location, &d.assigned_to].iter().any(|f| fold(f).contains(fq))
+}
+
+/// Whether an intervention's texts (or its customer's or device's name) contain the folded query.
+pub fn intervention_matches(data: &Data, i: &Intervention, fq: &str) -> bool {
+    fold(&i.summary).contains(fq)
+        || fold(&i.notes).contains(fq)
+        || fold(&i.reference).contains(fq)
+        || fold(&i.technician).contains(fq)
+        || fold(&customer_name(data, i.customer_id)).contains(fq)
+        || i.device_id.and_then(|d| data.device(d)).is_some_and(|d| fold(&d.name).contains(fq) || d.rustdesk_id == fq)
+}
+
+/// What the GDPR record needs: notices to deliver, consents to collect, data past retention,
+/// timers left running. The same list as `gdpr.review`, for interfaces that hold the data.
+pub fn review(data: &Data, now: DateTime<Utc>) -> Value {
+    let prefs = &data.preferences;
+    let current = privacy::current_notice(&data.notices, now);
+    let mut findings = Vec::new();
+    if current.is_none() {
+        findings.push(json!({"issue": "no_notice", "text": "no privacy notice in the desk: add the text you give customers (notice.add)"}));
+    }
+    let now_stamp = time::stamp(now);
+    for c in data.customers.iter().filter(|c| c.erased_at.is_none()) {
+        let mut add = |issue: &str, text: String| findings.push(json!({"customer": c.id, "name": c.name, "issue": issue, "text": text}));
+        if !c.archived
+            && let Some(cur) = current
+        {
+            match privacy::last_delivery(&data.privacy, c.id) {
+                None => add("notice_missing", format!("privacy notice {} not delivered", cur.version)),
+                Some(e) if e.notice_version != cur.version => {
+                    add("notice_outdated", format!("has notice {}, current is {}", e.notice_version, cur.version))
+                }
+                Some(_) => {}
+            }
+        }
+        let remote_devices = data.devices.iter().any(|d| d.customer_id == c.id && !d.retired && !d.rustdesk_id.is_empty());
+        let remote_work = data.interventions.iter().any(|i| i.customer_id == c.id && i.kind.is_remote());
+        for purpose in ["remote_assistance", "unattended_access"] {
+            let (state, _) = privacy::purpose_state(&data.privacy, c.id, purpose, now, prefs.consent_validity_months);
+            let needed = match purpose {
+                "remote_assistance" => !c.archived && (remote_devices || remote_work),
+                _ => data.devices.iter().any(|d| d.customer_id == c.id && d.unattended && !d.retired),
+            };
+            if needed && state != PurposeState::Given {
+                add(
+                    &format!("{purpose}_{}", state_name(state)),
+                    format!(
+                        "{purpose} consent is {} but the customer has {}",
+                        state_name(state),
+                        if purpose == "remote_assistance" { "PCs with RustDesk or remote interventions" } else { "devices with unattended access" }
+                    ),
+                );
+            }
+        }
+        if prefs.retention_years > 0 {
+            let last =
+                data.interventions.iter().filter(|i| i.customer_id == c.id).map(|i| i.started_at.as_str()).max().unwrap_or(c.created_at.as_str());
+            if let Some(due) = time::add_months(last, prefs.retention_years.saturating_mul(12))
+                && due <= now_stamp
+            {
+                add(
+                    "retention_due",
+                    format!("no activity since {}: past the {}-year retention, consider gdpr.erase", time::local_text(last), prefs.retention_years),
+                );
+            }
+        }
+    }
+    for i in data.interventions.iter().filter(|i| i.running()) {
+        if time::minutes_between(&i.started_at, &now_stamp).unwrap_or(0) > 12 * 60 {
+            findings.push(json!({"intervention": i.id, "technician": i.technician, "issue": "timer_running", "text": format!("running since {}: stop it or fix the times", time::local_text(&i.started_at))}));
+        }
+    }
+    json!({"findings": findings, "count": findings.len()})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +326,18 @@ mod tests {
         assert!(device_ref(&d, &json!("pc"), None).is_err());
         assert_eq!(device_ref(&d, &json!("notebook"), Some(3)).unwrap(), 5);
         assert!(device_ref(&d, &json!("pc cassa"), Some(1)).is_err());
+    }
+
+    #[test]
+    fn matching_and_review_from_the_data() {
+        let d = demo();
+        assert!(device_matches(d.device(1).unwrap(), "100 200 300"));
+        assert!(device_matches(d.device(1).unwrap(), "lun-seg"));
+        assert!(!device_matches(d.device(1).unwrap(), "cassa"));
+        assert!(intervention_matches(&d, d.intervention(1).unwrap(), "stampante"));
+        assert!(intervention_matches(&d, d.intervention(1).unwrap(), "lunaria"));
+        assert!(!intervention_matches(&d, d.intervention(1).unwrap(), "nulla"));
+        let r = review(&d, time::now());
+        assert!(r["count"].as_u64().unwrap() >= 1);
     }
 }

@@ -82,6 +82,13 @@ pub fn input(stamp: &str) -> String {
     local(stamp).map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
 }
 
+/// A time typed in a form (`13/10/2026 09:30`, `09:30`, `now`…) as the stamp the engine stores,
+/// read in this machine's time zone (the browser's on the web), so what the technician types is
+/// what is saved whatever zone the server runs in. `None` when unreadable.
+pub fn stamp_from_input(text: &str, now: DateTime<Utc>) -> Option<String> {
+    time::input_stamp(text, now).ok()
+}
+
 /// The first and the day after the last of the month of `now`, as form inputs.
 pub fn month_bounds(now: DateTime<Utc>, months_ago: u32) -> (String, String) {
     let n = now.with_timezone(&Local);
@@ -145,5 +152,7 @@ mod tests {
         assert_eq!(clipped("abcdef", 4), "abc…");
         assert_eq!(clipped("abc", 4), "abc");
         assert_eq!(input("bad"), "");
+        assert!(stamp_from_input("09:30", now).is_some_and(|s| s.ends_with('Z')));
+        assert!(stamp_from_input("ieri", now).is_none());
     }
 }

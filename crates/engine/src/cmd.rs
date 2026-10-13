@@ -9,7 +9,7 @@ use remotecraft_core::{
 use serde_json::{Value, json};
 
 use crate::params::{boolean, bounded, first, list, notes, number, page, required, text};
-use crate::views::{self, customer_ref, device_ref, intervention_json, privacy_status, to_value};
+use crate::views::{self, customer_ref, device_ref, intervention_json, privacy_status, state_name, to_value};
 use crate::{Ctx, Desk, Result};
 
 /// A command's description (the catalogue the CLI, the MCP server and an interface show).
@@ -589,15 +589,6 @@ fn unattended_warning(data: &Data, d: &Device, ctx: &Ctx) -> Option<String> {
     })
 }
 
-fn state_name(s: PurposeState) -> &'static str {
-    match s {
-        PurposeState::Given => "given",
-        PurposeState::Withdrawn => "withdrawn",
-        PurposeState::Expired => "expired",
-        PurposeState::Missing => "missing",
-    }
-}
-
 fn device_add(data: &mut Data, ctx: &mut Ctx, p: &Value) -> CoreResult<Value> {
     let customer = customer_of_strict(data, p)?;
     if data.devices.len() >= limits::MAX_DEVICES {
@@ -1116,15 +1107,8 @@ impl WorkFilter {
     }
 }
 
-/// Billable minutes of one intervention: the minimum, then rounded up to the unit.
 fn billable_minutes(data: &Data, i: &Intervention) -> u64 {
-    if !i.billable || i.running() {
-        return 0;
-    }
-    let prefs = &data.preferences;
-    let m = u64::from(i.minutes.max(prefs.minimum_minutes));
-    let unit = u64::from(prefs.billing_unit_minutes);
-    if unit <= 1 { m } else { m.div_ceil(unit).saturating_mul(unit) }
+    data.preferences.billable_minutes(i)
 }
 
 fn intervention_list(data: &Data, ctx: &Ctx, p: &Value) -> CoreResult<Value> {
@@ -1488,64 +1472,7 @@ fn gdpr_erase(data: &mut Data, ctx: &mut Ctx, p: &Value) -> CoreResult<Value> {
 }
 
 fn gdpr_review(data: &Data, ctx: &Ctx) -> Value {
-    let prefs = &data.preferences;
-    let current = privacy::current_notice(&data.notices, ctx.now);
-    let mut findings = Vec::new();
-    if current.is_none() {
-        findings.push(json!({"issue": "no_notice", "text": "no privacy notice in the desk: add the text you give customers (notice.add)"}));
-    }
-    let now = time::stamp(ctx.now);
-    for c in data.customers.iter().filter(|c| c.erased_at.is_none()) {
-        let mut add = |issue: &str, text: String| findings.push(json!({"customer": c.id, "name": c.name, "issue": issue, "text": text}));
-        if !c.archived
-            && let Some(cur) = current
-        {
-            match privacy::last_delivery(&data.privacy, c.id) {
-                None => add("notice_missing", format!("privacy notice {} not delivered", cur.version)),
-                Some(e) if e.notice_version != cur.version => {
-                    add("notice_outdated", format!("has notice {}, current is {}", e.notice_version, cur.version))
-                }
-                Some(_) => {}
-            }
-        }
-        let remote_devices = data.devices.iter().any(|d| d.customer_id == c.id && !d.retired && !d.rustdesk_id.is_empty());
-        let remote_work = data.interventions.iter().any(|i| i.customer_id == c.id && i.kind.is_remote());
-        for purpose in ["remote_assistance", "unattended_access"] {
-            let (state, _) = privacy::purpose_state(&data.privacy, c.id, purpose, ctx.now, prefs.consent_validity_months);
-            let needed = match purpose {
-                "remote_assistance" => !c.archived && (remote_devices || remote_work),
-                _ => data.devices.iter().any(|d| d.customer_id == c.id && d.unattended && !d.retired),
-            };
-            if needed && state != PurposeState::Given {
-                add(
-                    &format!("{purpose}_{}", state_name(state)),
-                    format!(
-                        "{purpose} consent is {} but the customer has {}",
-                        state_name(state),
-                        if purpose == "remote_assistance" { "PCs with RustDesk or remote interventions" } else { "devices with unattended access" }
-                    ),
-                );
-            }
-        }
-        if prefs.retention_years > 0 {
-            let last =
-                data.interventions.iter().filter(|i| i.customer_id == c.id).map(|i| i.started_at.as_str()).max().unwrap_or(c.created_at.as_str());
-            if let Some(due) = time::add_months(last, prefs.retention_years.saturating_mul(12))
-                && due <= now
-            {
-                add(
-                    "retention_due",
-                    format!("no activity since {}: past the {}-year retention, consider gdpr.erase", time::local_text(last), prefs.retention_years),
-                );
-            }
-        }
-    }
-    for i in data.interventions.iter().filter(|i| i.running()) {
-        if time::minutes_between(&i.started_at, &now).unwrap_or(0) > 12 * 60 {
-            findings.push(json!({"intervention": i.id, "technician": i.technician, "issue": "timer_running", "text": format!("running since {}: stop it or fix the times", time::local_text(&i.started_at))}));
-        }
-    }
-    json!({"findings": findings, "count": findings.len()})
+    views::review(data, ctx.now)
 }
 
 fn audit_list(desk: &Desk, p: &Value) -> CoreResult<Value> {

@@ -9,7 +9,7 @@
 pub mod cmd;
 pub mod params;
 mod session;
-mod views;
+pub mod views;
 
 use std::path::{Path, PathBuf};
 

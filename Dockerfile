@@ -12,9 +12,12 @@ FROM rustdesk/rustdesk-server:${RUSTDESK_TAG} AS rustdesk
 
 FROM rust:1.97-bookworm AS build
 WORKDIR /src
+RUN rustup target add wasm32-unknown-unknown \
+ && curl -sSL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C /usr/local/bin trunk
 COPY . .
 # The image's own toolchain (rust-toolchain.toml would download the same release again).
-RUN RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" cargo build --release -p remotecraft-cli
+RUN RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" cargo build --release -p remotecraft-cli \
+ && cd apps/remotecraft-web && RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" trunk build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -23,6 +26,7 @@ RUN apt-get update \
  && useradd --system --home-dir /data --shell /usr/sbin/nologin remotecraft
 COPY --from=rustdesk /usr/bin/hbbs /usr/bin/hbbr /usr/local/bin/
 COPY --from=build /src/target/release/remotecraft-cli /usr/local/bin/remotecraft-cli
+COPY --from=build /src/dist/web /app/web
 COPY docker/entrypoint.sh /usr/local/bin/remotecraft-entrypoint
 RUN chmod 0755 /usr/local/bin/remotecraft-entrypoint
 
@@ -33,8 +37,9 @@ ENV REMOTECRAFT_HOME=/data/desk \
     REMOTECRAFT_RUSTDESK_KEY_FILE=/data/rustdesk/id_ed25519.pub \
     REMOTECRAFT_RUSTDESK_CHECK_HOST=127.0.0.1 \
     REMOTECRAFT_BIND=0.0.0.0:7979 \
+    REMOTECRAFT_STATIC=/app/web \
     TZ=Europe/Rome
-# 21115 TCP NAT test · 21116 TCP+UDP IDs and connections · 21117 TCP relay · 7979 the desk API
+# 21115 TCP NAT test · 21116 TCP+UDP IDs and connections · 21117 TCP relay · 7979 the desk API and web app
 EXPOSE 21115/tcp 21116/tcp 21116/udp 21117/tcp 7979/tcp
 HEALTHCHECK --interval=60s --timeout=10s --start-period=20s \
   CMD remotecraft-cli rustdesk >/dev/null 2>&1 || exit 1

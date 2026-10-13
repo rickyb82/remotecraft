@@ -21,7 +21,7 @@ services:
       - "21116:21116"           # TCP: ID registration and connections
       - "21116:21116/udp"       # UDP: ID registration, heartbeat, direct connections
       - "21117:21117"           # TCP: relay, when the direct connection fails
-      - "127.0.0.1:7979:7979"   # the desk API: only for the framework / reverse proxy on this machine
+      - "127.0.0.1:7979:7979"   # the desk API and web app: only for the framework / reverse proxy on this machine
     environment:
       REMOTECRAFT_TOKEN: ${REMOTECRAFT_TOKEN:?set the service token for the desk API}
       RUSTDESK_HOST: ${RUSTDESK_HOST:-}

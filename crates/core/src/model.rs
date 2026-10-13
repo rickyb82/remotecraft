@@ -190,6 +190,19 @@ impl Default for Preferences {
     }
 }
 
+impl Preferences {
+    /// Billable minutes of one intervention: nothing while it runs or when not billable; else
+    /// the minimum, then rounded up to the billing unit.
+    pub fn billable_minutes(&self, i: &Intervention) -> u64 {
+        if !i.billable || i.running() {
+            return 0;
+        }
+        let m = u64::from(i.minutes.max(self.minimum_minutes));
+        let unit = u64::from(self.billing_unit_minutes);
+        if unit <= 1 { m } else { m.div_ceil(unit).saturating_mul(unit) }
+    }
+}
+
 /// The last id given to each kind of record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -316,5 +329,22 @@ mod tests {
         d.customers.push(Customer { id: 0, ..Customer::default() });
         d.repair();
         assert_eq!(d.customers.len(), 1);
+    }
+
+    #[test]
+    fn billable_rounding() {
+        let prefs = Preferences { billing_unit_minutes: 15, minimum_minutes: 10, ..Preferences::default() };
+        let mut i = Intervention { minutes: 3, billable: true, ended_at: Some("x".into()), ..Intervention::default() };
+        assert_eq!(prefs.billable_minutes(&i), 15);
+        i.minutes = 16;
+        assert_eq!(prefs.billable_minutes(&i), 30);
+        i.billable = false;
+        assert_eq!(prefs.billable_minutes(&i), 0);
+        i.billable = true;
+        i.ended_at = None;
+        assert_eq!(prefs.billable_minutes(&i), 0);
+        let exact = Preferences { billing_unit_minutes: 0, ..Preferences::default() };
+        i.ended_at = Some("x".into());
+        assert_eq!(exact.billable_minutes(&i), 16);
     }
 }

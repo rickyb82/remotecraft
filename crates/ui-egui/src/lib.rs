@@ -110,6 +110,23 @@ pub struct Confirm {
     pub intent: Intent,
 }
 
+/// The period and filters the Interventions screen and the Reports share (a report row drills
+/// down into the interventions behind it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkFilter {
+    /// Form text the engine accepts (`2026-10-01`), empty = no bound.
+    pub from: String,
+    pub to: String,
+    pub customer: Option<u64>,
+    pub device: Option<u64>,
+    /// Empty = every technician.
+    pub technician: String,
+    /// Empty = every kind; else `remote`, `onsite`, `phone`, `lab`, `other`.
+    pub kind: String,
+    pub running_only: bool,
+    pub billable_only: bool,
+}
+
 /// The whole app state the interface keeps on top of the session.
 pub struct DeskApp {
     /// The local desk, or a server mirrored over HTTP (the web app).
@@ -132,6 +149,8 @@ pub struct DeskApp {
     pub selected_customer: Option<u64>,
     pub selected_device: Option<u64>,
     pub selected_intervention: Option<u64>,
+    /// The period and filters of the Interventions screen and the Reports.
+    pub work_filter: WorkFilter,
     pub customers: customers::State,
     pub devices: devices::State,
     pub interventions: interventions::State,
@@ -228,6 +247,7 @@ impl DeskApp {
             selected_customer: None,
             selected_device: None,
             selected_intervention: None,
+            work_filter: WorkFilter::default(),
             customers: customers::State::default(),
             devices: devices::State::default(),
             interventions: interventions::State::default(),

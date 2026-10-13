@@ -25,16 +25,27 @@ following the same conventions.
 - Tokens are compared in constant time; `serve` refuses to bind beyond localhost without one.
 
 ## Architecture
-- Layers (checked by `cargo xtask layers`): `core` (L0) → `engine` (L5) → `mcp` (L6) →
-  `apps/remotecraft-cli` (L7). Only the app touches the network (`ureq`, the TCP probe injected
-  into the engine for `rustdesk.check`).
+- Layers (checked by `cargo xtask layers`): `core` (L0) → `engine` (L5) → `mcp` / `remote` /
+  `ui-egui` (L6) → `apps/remotecraft-cli`, `apps/remotecraft`, `apps/remotecraft-web` (L7).
+  Only apps and `remote` touch the network (`ureq`, `ehttp`, the TCP probe injected into the
+  engine for `rustdesk.check`); only apps use `eframe`/`rfd`.
+- **The UI is thin**: it reads a `DeskSession` (the local `Session` or `RemoteDesk`), acts only
+  through `DeskApp::run_as(command, params, Intent)` and applies results in `on_result`; it never
+  mutates `Data`. Colours from `theme::Tokens`, icons from `icons.rs`, derived per-customer state
+  from `derived.rs`; host-only actions (links, files) are `Request`s served by the apps.
+- Interface strings are English in code; Italian in `i18n/it.rs` (shared) or the screen's own
+  `LABELS_IT` table; engine messages are translated by prefix in `it.rs` `MESSAGES`.
+- **Never break wasm**: `apps/remotecraft-web` must build for `wasm32-unknown-unknown`; use
+  `web_time` instead of `std::time::{Instant, SystemTime}` in the UI.
+- For UI work, look at the result:
+  `cargo run -p remotecraft-ui-egui --example snapshot -- out.png --lang it --screen customers --open 0`.
 - **Everything is a command** (`crates/engine/src/cmd.rs`). The CLI, the HTTP API and the MCP
   server call the same commands; a new feature is a command first, then a route or a tool.
 - RustDesk binaries come unmodified from the official image (AGPL-3.0); never copy RustDesk code
   into the repository. No vendor assets; any asset file needs a row in `ATTRIBUTION.md`.
 
 ## Working
-- Quality gate before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests, layers).
+- Quality gate before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests, layers, wasm).
 - Rust is pinned in `rust-toolchain.toml`.
 - Code, comments and engine messages in English; user docs (`README.md`, `docs/`) in Italian
   except `docs/architecture.md`.

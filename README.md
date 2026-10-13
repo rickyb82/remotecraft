@@ -3,18 +3,47 @@
 Assistenza remota per la tua attività: il **server RustDesk** e un **gestionale dell'assistenza**
 nello stesso container. Il gestionale tiene l'anagrafica dei clienti, i loro PC con l'ID RustDesk,
 lo storico degli interventi con tempi e note e la registrazione di informativa e consensi GDPR.
-Ha un'**API HTTP** per il tuo framework e un **server MCP**, così un assistente AI può lavorarci
-in linguaggio naturale. Fa parte della famiglia *craft* (`mailcraft`, `gridcraft`, …) e ne segue
+Ha un'**interfaccia grafica** come quella di MailCraft (web e desktop), un'**API HTTP** per il tuo
+framework e un **server MCP**, così un assistente AI può lavorarci in linguaggio naturale. Fa parte della famiglia *craft* (`mailcraft`, `gridcraft`, …) e ne segue
 le convenzioni: Rust, «tutto è un comando», mai crash.
 
 ```
 ┌──────────────────────────── container remotecraft ────────────────────────────┐
 │  hbbs  :21115 :21116 tcp/udp   ID e avvio delle connessioni   ┐ RustDesk       │
 │  hbbr  :21117                  relay                          ┘ Server OSS     │
-│  remotecraft-cli serve :7979   API del gestionale ──► framework, MCP dei tecnici│
+│  remotecraft-cli serve :7979   app web + API ──► browser, framework, MCP        │
 │  /data/rustdesk  chiavi del server        /data/desk  gestionale + audit       │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
+
+## L'interfaccia
+
+```
+┌──────────────┬────────────────────────────────────┬───────────────────────────────┐
+│ ▶ Avvia      │ Clienti · 3        ⏷Etichetta  + Nuovo│ Studio Tecnico Lunaria   ▶ ✎ ⋯│
+│ ▸ Clienti  3 │ SL Studio Tecnico Lunaria  🛡 3 PC   │ ▌Informativa 2026-01 consegnata│
+│   PC       5 │ FC Ferramenta Corvo        ⚠ 1 PC   │ ▌Assistenza remota   Dato      │
+│   Interventi │ EB Elio Brina              ⛔ 1 PC   │ PC · Interventi · Note         │
+│   Privacy  1 │                                    │                 ┌ Avvia timer ┐│
+│   Report     │                                    │                 │ ID o nome…  ││
+└──────────────┴────────────────────────────────────┴─────────────────┴─────────────┘┘
+```
+
+La stessa interfaccia gira **nel browser** (servita dal container su `/`, o da GitHub Pages) e
+come **app desktop**: barra in alto con la ricerca (un ID RustDesk porta dritto al PC), la
+navigazione a sinistra, l'elenco al centro e la scheda a destra, la scheda dell'intervento
+agganciata in basso a destra con il **cronometro**, tema chiaro e scuro, italiano e inglese,
+scorciatoie da tastiera (`/` cerca, `s` avvia, `x` chiude, `n` nuovo, `?` aiuto).
+
+- **Telefonata in arrivo**: digiti l'ID RustDesk che il cliente legge, `Ctrl+Invio` avvia il
+  cronometro e apre il client RustDesk sul suo PC; a fine lavoro scrivi le note e chiudi.
+- **Privacy a colpo d'occhio**: ogni cliente ha un indicatore (consenso dato, da sistemare,
+  mancante); la scheda mostra per prima l'informativa e i consensi, con i pulsanti per
+  registrarli; un avvio remoto senza consenso chiede di registrarlo o di indicare il motivo.
+- **Report**: ore e ore fatturabili del mese per cliente, tecnico, PC o tipo, con il dettaglio
+  degli interventi, esportabili in CSV.
+- **Impostazioni**: guida iniziale (azienda, informativa, server RustDesk), regole di
+  fatturazione e privacy, verifica del server RustDesk e configurazione dei client da copiare.
 
 ## Cosa fa il gestionale
 
@@ -86,6 +115,12 @@ docker compose exec -u remotecraft remotecraft remotecraft-cli run prefs.set \
 Il primo comando mostra server, chiave, stringa di configurazione e nome dell'installer, e
 verifica le porte. Usa sempre `-u remotecraft` con `exec`, così i file restano del servizio.
 
+L'**app web** è su `http://127.0.0.1:7979/` (dietro il proxy HTTPS o il framework): la si apre
+con il token del tecnico, `https://assistenza.example.it/?token=<token>&lang=it` (vedi
+[docs/deploy.md](docs/deploy.md)). L'**app desktop** lavora sul gestionale locale:
+`cargo install --path apps/remotecraft` e poi `remotecraft --as riccardo`, oppure
+`remotecraft --demo` per provarla.
+
 ## La rete per RustDesk
 
 RustDesk non passa dal proxy HTTPS: usa porte TCP e UDP proprie.
@@ -123,10 +158,13 @@ In basso nella finestra principale deve comparire **Pronto**.
 ## Fare un'assistenza
 
 1. Il cliente apre RustDesk e ti comunica **ID** e **password monouso**.
-2. Nel gestionale: `remotecraft-cli who 123 456 789` (o `find_device` in MCP) dice di chi è il
-   PC, e `remotecraft-cli start --device "123 456 789"` avvia il cronometro e dà il link
-   `rustdesk://`. Se manca il consenso all'assistenza remota, l'avvio viene rifiutato.
-3. A fine lavoro: `remotecraft-cli stop --notes "cosa ho fatto"`.
+2. Nell'interfaccia premi `/`, scrivi l'ID e `Ctrl+Invio`: il cronometro parte e si apre il
+   client RustDesk sul suo PC (dalla riga di comando: `remotecraft-cli who 123 456 789` e
+   `remotecraft-cli start --device "123 456 789"`; in MCP: `find_device`, `start_intervention`).
+   Se manca il consenso all'assistenza remota, l'avvio viene rifiutato finché non lo registri o
+   indichi il motivo.
+3. A fine lavoro scrivi le note nella scheda dell'intervento e chiudi (`remotecraft-cli stop
+   --notes "cosa ho fatto"`).
 
 Sul PC del cliente compare la finestra della connessione attiva: vede che sei collegato e può
 chiudere quando vuole. Per i PC che gestisci stabilmente RustDesk permette una password
@@ -165,9 +203,14 @@ remotecraft-cli commands                        # tutti i comandi e i parametri
 ## Sviluppo
 
 ```sh
-cargo xtask ci        # fmt, clippy -D warnings, test, controllo dei livelli
-cargo run -p remotecraft-cli -- --demo customers
+cargo xtask ci        # fmt, clippy -D warnings, test, controllo dei livelli, build wasm
+cargo run -p remotecraft -- --demo                     # l'app desktop sul gestionale demo
+cd apps/remotecraft-web && trunk serve                 # l'app web (con remotecraft-cli serve --demo)
+cargo run -p remotecraft-ui-egui --example snapshot -- out.png --lang it --screen customers --open 0
 ```
+
+L'ultimo comando disegna l'interfaccia in un PNG senza finestra né GPU, per guardarla mentre
+la si modifica.
 
 ## Licenze
 

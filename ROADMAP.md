@@ -20,10 +20,16 @@
   per-technician tokens; MCP server (37 tools, 4 prompts, 2 resources), local or against the
   server; CLI.
 
+- The MailCraft-style egui interface, web (wasm, served by the container) and desktop:
+  customers with the privacy strip and the GDPR erasure, devices with *Connect*, interventions
+  with the shared period filter, the docked intervention card and the timer chip, the privacy
+  review, notices and audit log, the time report with CSV export, settings with the setup guide
+  and the RustDesk client setup; light/dark, Italian/English, keyboard shortcuts. It reads the
+  desk through `DeskSession` (local, or mirrored from `serve` over HTTP) and acts only through
+  engine commands.
+
 ## Next (0.2)
 
-- An egui interface (web and desktop) on the same commands, as in MailCraft: customer card,
-  devices with a *Connect* button, the running timer, the privacy panel.
 - Printable consent form generated from the current notice, and attachments (scans of signed
   forms) stored with the privacy event.
 - Monthly report export (CSV) and invoice lines.
@@ -35,3 +41,5 @@
 
 - 2026-10-13: RemoteCraft 0.1: the desk (core, engine, MCP, CLI and HTTP API) and the
   all-in-one container with RustDesk Server OSS 1.1.16.
+- 2026-10-14: the graphical interface (egui, web and desktop), `DeskSession`, `RemoteDesk`,
+  `GET /api/snapshot`, the web app served by the container.

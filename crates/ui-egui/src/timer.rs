@@ -1258,17 +1258,28 @@ struct TimeRow<'a> {
 }
 
 fn time_row(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, row: &TimeRow<'_>, value: &mut String, now: DateTime<Utc>) {
-    ui.horizontal(|ui| {
+    // Wrapped: on a narrow card the chips go to a second line instead of widening it.
+    ui.horizontal_wrapped(|ui| {
         label_box(ui, t, app.tr(row.label));
+        // The chips keep their width; the text box takes what is left of the card.
+        let chips_w: f32 = row
+            .chips
+            .iter()
+            .map(|(label, _)| ui.painter().layout_no_wrap(app.tr(label).to_string(), FontId::proportional(14.0), t.ui_text).size().x + 16.0)
+            .sum();
+        // In a wrapped row `available_width` is the whole line: measure from the cursor.
+        let room = ui.max_rect().right() - ui.cursor().left();
+        let w = (room - chips_w - 12.0).clamp(48.0, 180.0);
         ui.add(
             egui::TextEdit::singleline(value)
                 .id(row.field.id())
                 .hint_text(row.hint)
-                .desired_width(136.0)
+                .desired_width(w)
                 .frame(egui::Frame::NONE)
                 .font(FontId::monospace(13.0)),
         );
         ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = vec2(6.0, 1.0);
         for (label, minutes) in row.chips {
             if ui.small_button(app.tr(label)).clicked() {
                 *value = if *minutes == 0 { String::new() } else { shifted(now, *minutes) };

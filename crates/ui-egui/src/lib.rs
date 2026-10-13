@@ -156,14 +156,46 @@ pub fn device_name(data: &Data, id: Option<u64>) -> String {
     id.and_then(|id| data.device(id)).map(|d| d.name.clone()).unwrap_or_default()
 }
 
+/// The screens' `(English, Italian)` label tables, one after the other.
+pub fn module_labels() -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    for table in [
+        customers::LABELS_IT,
+        devices::LABELS_IT,
+        interventions::LABELS_IT,
+        privacy::LABELS_IT,
+        reports::LABELS_IT,
+        settings::LABELS_IT,
+        timer::LABELS_IT,
+    ] {
+        out.extend(table.iter().copied());
+    }
+    out
+}
+
+/// The Italian of a screen's label, from the screens' tables.
+pub(crate) fn module_label(text: &str) -> Option<&'static str> {
+    [
+        customers::LABELS_IT,
+        devices::LABELS_IT,
+        interventions::LABELS_IT,
+        privacy::LABELS_IT,
+        reports::LABELS_IT,
+        settings::LABELS_IT,
+        timer::LABELS_IT,
+    ]
+    .iter()
+    .flat_map(|t| t.iter())
+    .find(|(en, _)| *en == text)
+    .map(|(_, it)| *it)
+}
+
 /// Every translated label of the interface: the shared ones and each screen's.
 pub fn all_labels() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = i18n::LABELS.to_vec();
-    for table in [customers::LABELS, devices::LABELS, interventions::LABELS, privacy::LABELS, reports::LABELS, settings::LABELS, timer::LABELS] {
-        for l in table {
-            if !out.contains(l) {
-                out.push(l);
-            }
+    for (en, _) in module_labels() {
+        if !out.contains(&en) {
+            out.push(en);
         }
     }
     out

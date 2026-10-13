@@ -46,7 +46,7 @@ impl Language {
     pub fn tr(self, text: &str) -> &str {
         match self {
             Self::En => text,
-            Self::It => it::translate(text).unwrap_or(text),
+            Self::It => it::translate(text).or_else(|| crate::module_label(text)).unwrap_or(text),
         }
     }
 
@@ -73,8 +73,8 @@ impl Language {
     }
 }
 
-/// Every label the interface translates (kept in step with the `it` table by a test). The
-/// view modules declare theirs in their own `LABELS` and the test walks them all.
+/// The shared labels the interface translates (kept in step with the `it` table by a test).
+/// Each screen declares its own in its `LABELS_IT` table of `(English, Italian)` pairs.
 pub const LABELS: &[&str] = &[
     "Customers",
     "Devices",
@@ -122,10 +122,15 @@ mod tests {
     #[test]
     fn every_label_has_an_italian_translation() {
         let mut seen: Vec<&str> = Vec::new();
-        for label in crate::all_labels() {
-            assert!(!seen.contains(&label), "duplicate {label}");
+        for label in LABELS {
+            assert!(!seen.contains(label), "duplicate {label}");
             seen.push(label);
             assert!(it::translate(label).is_some_and(|t| !t.is_empty()), "missing Italian: {label}");
+        }
+        for (en, itx) in crate::module_labels() {
+            assert!(!en.is_empty() && !itx.is_empty(), "empty row {en:?} {itx:?}");
+            assert!(!seen.contains(&en), "label {en} declared twice (shared table or another screen)");
+            seen.push(en);
         }
         for c in remotecraft_engine::COMMANDS {
             assert!(it::translate(c.label).is_some_and(|t| !t.is_empty()), "missing Italian for command label: {}", c.label);

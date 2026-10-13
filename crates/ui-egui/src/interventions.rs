@@ -5,8 +5,8 @@ use egui::RichText;
 use crate::theme::Tokens;
 use crate::{Completed, DeskApp};
 
-/// Labels this screen translates.
-pub const LABELS: &[&str] = &[];
+/// The labels this screen shows: `(English, Italian)`.
+pub const LABELS_IT: &[(&str, &str)] = &[];
 
 /// What a command queued by this screen was for.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -232,3 +232,68 @@ pub fn truncate(painter: &egui::Painter, text: &str, font: FontId, color: Color3
     job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(10.0));
     painter.layout_job(job)
 }
+
+/// A warning or a note across a pane: the tone's fill, a bar in the tone's colour, an icon,
+/// wrapped text and small action buttons at the right; answers the index of the action clicked.
+pub fn banner(ui: &mut Ui, t: &Tokens, tone: Tone, icon: Icon, text: &str, actions: &[&str]) -> Option<usize> {
+    let (fill, color) = tone_colors(t, tone);
+    let mut clicked = None;
+    egui::Frame::NONE.fill(fill).corner_radius(8).inner_margin(egui::Margin { left: 12, right: 10, top: 8, bottom: 8 }).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let left = ui.max_rect().left() - 10.0;
+        ui.painter().rect_filled(
+            Rect::from_min_max(egui::pos2(left, ui.max_rect().top() - 6.0), egui::pos2(left + 3.0, ui.max_rect().bottom() + 6.0)),
+            2.0,
+            color,
+        );
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+            icons::paint(ui.painter(), r, icon, color);
+            let actions_w = actions.iter().map(|a| a.chars().count() as f32 * 7.5 + 24.0).sum::<f32>();
+            ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap()).on_hover_text(text);
+            ui.allocate_ui_with_layout(vec2(actions_w.max(10.0), 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for (i, a) in actions.iter().enumerate().rev() {
+                    if ui.small_button(*a).clicked() {
+                        clicked = Some(i);
+                    }
+                }
+            });
+        });
+    });
+    ui.add_space(6.0);
+    clicked
+}
+
+/// The icon of an intervention kind.
+pub fn kind_icon(kind: remotecraft_engine::core::InterventionKind) -> Icon {
+    use remotecraft_engine::core::InterventionKind as K;
+    match kind {
+        K::Remote => Icon::Remote,
+        K::Onsite => Icon::Onsite,
+        K::Phone => Icon::Phone,
+        K::Lab => Icon::Lab,
+        K::Other => Icon::More,
+    }
+}
+
+/// A small filled disc in a tone's text colour (a state dot).
+pub fn dot(ui: &mut Ui, t: &Tokens, tone: Tone, size: f32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    ui.painter().circle_filled(rect.center(), size / 2.0, tone_colors(t, tone).1);
+    resp
+}
+
+/// A monospace text (RustDesk IDs, command lines, keys), selectable.
+pub fn mono(ui: &mut Ui, t: &Tokens, text: &str, size: f32) -> Response {
+    ui.add(egui::Label::new(RichText::new(text).font(FontId::monospace(size)).color(t.ui_text)).selectable(true))
+}
+
+/// A copy icon button; copies `text` to the clipboard and answers true when clicked (toast
+/// "Copied" is the caller's).
+pub fn copy_button(ui: &mut Ui, t: &Tokens, tip: &str, text: &str) -> bool {
+    if icon_button(ui, t, Icon::Copy, tip, !text.is_empty(), false).clicked() {
+        ui.ctx().copy_text(text.to_string());
+        return true;
+    }
+    false
+}

@@ -34,6 +34,15 @@ pub fn nav_item(ui: &mut egui::Ui, t: &Tokens, icon: Option<Icon>, label: &str, 
     resp
 }
 
+/// A navigation row with a text (an elapsed time) instead of a count on the right.
+pub fn nav_item_text(ui: &mut egui::Ui, t: &Tokens, icon: Option<Icon>, label: &str, right: &str, active: bool) -> egui::Response {
+    let resp = nav_item(ui, t, icon, label, 0, active);
+    if !right.is_empty() {
+        ui.painter().text(egui::pos2(resp.rect.right() - 14.0, resp.rect.center().y), Align2::RIGHT_CENTER, right, FontId::monospace(12.0), t.muted);
+    }
+    resp
+}
+
 /// The navigation panel.
 pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     let frame = egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin { left: 10, right: 10, top: 12, bottom: 10 });
@@ -61,23 +70,35 @@ pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             }
             ui.add_space(14.0);
             ui.label(RichText::new(app.tr("Running")).small().strong().color(t.muted));
-            let mine: Vec<(u64, String, String)> = app
-                .session
-                .data()
-                .interventions
+            let actor = app.session.actor().to_string();
+            let now = app.now();
+            let mut rows: Vec<(u64, String, String, String, bool)> = app
+                .derived
+                .running
                 .iter()
-                .filter(|i| i.running())
-                .map(|i| (i.id, crate::customer_name(app.session.data(), i.customer_id), i.technician.clone()))
+                .filter_map(|id| app.session.data().intervention(*id))
+                .map(|i| {
+                    (
+                        i.id,
+                        crate::customer_name(app.session.data(), i.customer_id),
+                        i.technician.clone(),
+                        crate::format::elapsed_short(&i.started_at, now),
+                        i.technician == actor,
+                    )
+                })
                 .collect();
-            if mine.is_empty() {
+            rows.sort_by_key(|r| !r.4);
+            if rows.is_empty() {
                 ui.label(RichText::new(app.tr("No running interventions")).small().color(t.muted));
             }
-            for (id, customer, tech) in mine {
+            for (id, customer, tech, elapsed, mine) in rows {
                 let label = format!("{customer} · {tech}");
-                if nav_item(ui, t, Some(Icon::Timer), &label, 0, app.selected_intervention == Some(id) && app.screen == Screen::Interventions)
-                    .clicked()
-                {
+                let active = app.selected_intervention == Some(id) && app.screen == Screen::Interventions;
+                if nav_item_text(ui, t, Some(Icon::Timer), &label, &elapsed, active).clicked() {
                     app.open_intervention(id);
+                    if mine {
+                        crate::timer::open_running(app, id, false);
+                    }
                 }
             }
         });

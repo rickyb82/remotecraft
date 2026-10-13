@@ -112,7 +112,51 @@ pub const LABELS: &[&str] = &[
     "Start intervention",
     "Running",
     "No running interventions",
-    "Exported",
+    "Export saved (recorded in the audit log)",
+    "Privacy review: {n} findings",
+    "Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}",
+    "Privacy notice not delivered",
+    "Privacy notice outdated",
+    "Remote assistance consent missing",
+    "Remote assistance consent withdrawn",
+    "Remote assistance consent expired",
+    "A PC has unattended access without consent",
+    "Type a name…",
+    "Name or RustDesk ID…",
+    "No PC",
+    "Now",
+    "−1 h",
+    "Yesterday",
+    "Required",
+    "Not a time: use 2026-10-13 09:30, 13/10/2026 09:30 or 09:30",
+    "Saving…",
+    "Remote",
+    "On site",
+    "Phone",
+    "Lab",
+    "Other",
+    "Paper",
+    "E-mail",
+    "Online",
+    "Verbal",
+    "Given",
+    "Expired",
+    "Withdrawn",
+    "Missing",
+    "Copied",
+    "Start intervention on the selection",
+    "Stop my running intervention",
+    "New record on this screen",
+    "Log past work",
+    "Edit the open record",
+    "Connect to the open PC",
+    "Record consent for the open customer",
+    "Next / previous row",
+    "Close the card, the form or the pane",
+    "Customers, Devices, Interventions, Privacy, Reports",
+    "Reload this screen's data",
+    "Save the form, or start on the PC found by the search",
+    "This help",
 ];
 
 #[cfg(test)]
@@ -127,10 +171,16 @@ mod tests {
             seen.push(label);
             assert!(it::translate(label).is_some_and(|t| !t.is_empty()), "missing Italian: {label}");
         }
+        // A screen may repeat a label (shared or another screen's) only with the same Italian:
+        // two translations of one English text would show differently from screen to screen.
+        let mut italian: Vec<(&str, &str)> = LABELS.iter().filter_map(|l| it::translate(l).map(|t| (*l, t))).collect();
         for (en, itx) in crate::module_labels() {
             assert!(!en.is_empty() && !itx.is_empty(), "empty row {en:?} {itx:?}");
-            assert!(!seen.contains(&en), "label {en} declared twice (shared table or another screen)");
-            seen.push(en);
+            if let Some((_, other)) = italian.iter().find(|(e, _)| *e == en) {
+                assert_eq!(*other, itx, "label {en} translated two ways");
+            } else {
+                italian.push((en, itx));
+            }
         }
         for c in remotecraft_engine::COMMANDS {
             assert!(it::translate(c.label).is_some_and(|t| !t.is_empty()), "missing Italian for command label: {}", c.label);

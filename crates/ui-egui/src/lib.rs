@@ -7,8 +7,11 @@
 
 mod chrome;
 pub mod customers;
+pub mod derived;
 pub mod devices;
+pub mod erase;
 pub mod format;
+pub mod forms;
 pub mod i18n;
 pub mod icons;
 pub mod interventions;
@@ -96,7 +99,36 @@ pub enum Intent {
     Reports(reports::Intent),
     Settings(settings::Intent),
     Timer(timer::Intent),
+    Erase(erase::Intent),
 }
+
+/// A record to open as soon as it appears in the data (a remote desk answers a command before
+/// the snapshot that holds the new record).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingOpen {
+    pub screen: Screen,
+    pub id: u64,
+    pub since: Instant,
+}
+
+/// The keyboard shortcuts (key, what), for the help window.
+pub const SHORTCUTS: &[(&str, &str)] = &[
+    ("/", "Search"),
+    ("s", "Start intervention on the selection"),
+    ("x", "Stop my running intervention"),
+    ("n", "New record on this screen"),
+    ("l", "Log past work"),
+    ("e", "Edit the open record"),
+    ("c", "Connect to the open PC"),
+    ("p", "Record consent for the open customer"),
+    ("j / k", "Next / previous row"),
+    ("Esc", "Close the card, the form or the pane"),
+    ("1 … 5", "Customers, Devices, Interventions, Privacy, Reports"),
+    ("Ctrl+,", "Settings"),
+    ("Ctrl+R", "Reload this screen's data"),
+    ("Ctrl+Enter", "Save the form, or start on the PC found by the search"),
+    ("?", "This help"),
+];
 
 /// A question before an action that cannot be undone: `DeskApp::ask(Confirm { .. })`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,8 +190,16 @@ pub struct DeskApp {
     pub reports: reports::State,
     pub settings: settings::State,
     pub timer: timer::State,
+    pub erase: erase::State,
     /// Findings of the last privacy review (the badge in the navigation).
     pub privacy_findings: usize,
+    /// What the screens read every frame: privacy states, counts, timers, findings.
+    pub derived: derived::Derived,
+    /// A record to open as soon as the data holds it.
+    pub pending_open: Option<PendingOpen>,
+    pub shortcuts_open: bool,
+    /// Bumped by `Ctrl+R`: the screens' cached commands run again.
+    pub refresh_serial: u64,
     /// Settings opened only because the desk was empty: leave it once it is set up.
     auto_settings: bool,
     last_revision: Option<u64>,
@@ -255,7 +295,12 @@ impl DeskApp {
             reports: reports::State::default(),
             settings: settings::State::default(),
             timer: timer::State::default(),
+            erase: erase::State::default(),
             privacy_findings: 0,
+            derived: derived::Derived::default(),
+            pending_open: None,
+            shortcuts_open: false,
+            refresh_serial: 0,
             auto_settings: empty,
             last_revision: None,
         }
@@ -299,10 +344,44 @@ impl DeskApp {
             Screen::Interventions => self.selected_intervention.and_then(|id| d.intervention(id)).map(|i| customer_name(d, i.customer_id)),
             _ => None,
         };
+        let actor = self.session.actor();
+        let running = d.interventions.iter().filter(|i| i.running() && i.technician == actor).map(|i| i.started_at.as_str()).max();
+        let timer = running.map(|s| format!("(⏱ {}) ", format::elapsed_short(s, self.now()))).unwrap_or_default();
         match what.filter(|w| !w.is_empty()) {
-            Some(w) => format!("{w} – RemoteCraft"),
-            None => "RemoteCraft".into(),
+            Some(w) => format!("{timer}{w} – RemoteCraft"),
+            None => format!("{timer}RemoteCraft"),
         }
+    }
+
+    /// Opens `screen` on `id` now when the data holds it, else as soon as it does.
+    pub fn open_when_ready(&mut self, screen: Screen, id: u64) {
+        let d = self.session.data();
+        let present = match screen {
+            Screen::Customers | Screen::Privacy => d.customer(id).is_some(),
+            Screen::Devices => d.device(id).is_some(),
+            Screen::Interventions => d.intervention(id).is_some(),
+            _ => true,
+        };
+        if present {
+            self.open_on(screen, id);
+        } else {
+            self.pending_open = Some(PendingOpen { screen, id, since: Instant::now() });
+        }
+    }
+
+    fn open_on(&mut self, screen: Screen, id: u64) {
+        match screen {
+            Screen::Customers | Screen::Privacy => self.open_customer(id),
+            Screen::Devices => self.open_device(id),
+            Screen::Interventions => self.open_intervention(id),
+            _ => {}
+        }
+    }
+
+    /// Goes to the privacy review.
+    pub fn privacy_review(&mut self) {
+        self.privacy.tab = privacy::Tab::Review;
+        self.go(Screen::Privacy);
     }
 
     pub fn toast(&mut self, text: String) {
@@ -353,7 +432,7 @@ impl DeskApp {
                     if let Ok(v) = &c.result {
                         let data = serde_json::to_vec_pretty(v).unwrap_or_default();
                         self.requests.push(Request::SaveFile { name, data });
-                        self.toast(self.tr("Exported").to_string());
+                        self.toast(self.tr("Export saved (recorded in the audit log)").to_string());
                     }
                 }
                 Intent::Customers(i) => customers::on_result(self, i, &c),
@@ -363,10 +442,32 @@ impl DeskApp {
                 Intent::Reports(i) => reports::on_result(self, i, &c),
                 Intent::Settings(i) => settings::on_result(self, i, &c),
                 Intent::Timer(i) => timer::on_result(self, i, &c),
+                Intent::Erase(i) => erase::on_result(self, i, &c),
+            }
+        }
+        let rev = self.session.revision();
+        if self.derived.stale(rev) {
+            let defaults = self.session.rustdesk_defaults();
+            let actor = self.session.actor().to_string();
+            self.derived = derived::build(self.session.data(), self.now(), rev, &defaults, &actor);
+            self.privacy_findings = self.derived.findings.len();
+        }
+        if let Some(p) = self.pending_open.clone() {
+            let d = self.session.data();
+            let present = match p.screen {
+                Screen::Customers | Screen::Privacy => d.customer(p.id).is_some(),
+                Screen::Devices => d.device(p.id).is_some(),
+                Screen::Interventions => d.intervention(p.id).is_some(),
+                _ => true,
+            };
+            if present {
+                self.pending_open = None;
+                self.open_on(p.screen, p.id);
+            } else if p.since.elapsed().as_secs() > 10 {
+                self.pending_open = None;
             }
         }
         // The data changed (here or on the server): drop selections that no longer exist.
-        let rev = self.session.revision();
         if self.last_revision != Some(rev) {
             self.last_revision = Some(rev);
             let d = self.session.data();
@@ -412,19 +513,39 @@ impl DeskApp {
         self.go(Screen::Interventions);
     }
 
-    /// The main action: the start-intervention card (for the selected customer or device).
+    /// The main action (`s`, the nav button): the fast path on the selected PC or customer
+    /// (`timer::start_now`), else the start card.
     pub fn start_intervention(&mut self) {
+        let d = self.session.data();
         let customer = match self.screen {
-            Screen::Customers => self.selected_customer,
-            Screen::Devices => self.selected_device.and_then(|d| self.session.data().device(d)).map(|d| d.customer_id),
+            Screen::Customers | Screen::Privacy => self.selected_customer,
+            Screen::Devices => self.selected_device.and_then(|x| d.device(x)).map(|x| x.customer_id),
+            Screen::Interventions => self.selected_intervention.and_then(|x| d.intervention(x)).map(|i| i.customer_id),
             _ => None,
         };
-        let device = if self.screen == Screen::Devices { self.selected_device } else { None };
-        timer::open_start(self, customer, device);
+        let device = match self.screen {
+            Screen::Devices => self.selected_device,
+            Screen::Interventions => self.selected_intervention.and_then(|x| d.intervention(x)).and_then(|i| i.device_id),
+            _ => None,
+        };
+        match device {
+            Some(x) if self.session.data().device(x).is_some_and(|d| !d.rustdesk_id.is_empty()) => timer::start_now(self, x),
+            _ => timer::open_start(self, customer, device),
+        }
     }
 
-    /// Opens the RustDesk client on a device (`device.connect`, which audits it).
+    /// Opens the RustDesk client on a device: the link goes out in this frame (browsers only
+    /// open custom schemes on a click), `device.connect` records it and reports the consent.
     pub fn connect(&mut self, device: u64) {
+        if let Some(d) = self.session.data().device(device)
+            && !d.rustdesk_id.is_empty()
+        {
+            self.requests.push(Request::OpenUrl(core::rustdesk::connect_uri(&d.rustdesk_id)));
+            self.status = self.language.fill(
+                "Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}",
+                &[("command", &core::rustdesk::connect_command(&d.rustdesk_id))],
+            );
+        }
         self.run_as("device.connect", json!({"device": device}), Intent::Devices(devices::Intent::Connect));
     }
 
@@ -458,6 +579,39 @@ impl DeskApp {
         }
     }
 
+    /// `Cmd+Enter` in the search box: starts the timer on the PC the RustDesk ID names.
+    pub fn search_start(&mut self) {
+        let q = self.search.trim().to_string();
+        let d = self.session.data();
+        if let Some(id) = derived::rustdesk_query(&q)
+            && let Some(dev) = d.devices.iter().find(|x| x.rustdesk_id == id && !x.retired)
+        {
+            let device = dev.id;
+            timer::start_now(self, device);
+        }
+    }
+
+    /// The customer the open record belongs to (for `p`, `l`).
+    fn open_customer_id(&self) -> Option<u64> {
+        let d = self.session.data();
+        match self.screen {
+            Screen::Customers | Screen::Privacy => self.selected_customer,
+            Screen::Devices => self.selected_device.and_then(|x| d.device(x)).map(|x| x.customer_id),
+            Screen::Interventions => self.selected_intervention.and_then(|x| d.intervention(x)).map(|i| i.customer_id),
+            _ => None,
+        }
+    }
+
+    /// The PC the open record belongs to (for `c`).
+    fn open_device_id(&self) -> Option<u64> {
+        let d = self.session.data();
+        match self.screen {
+            Screen::Devices => self.selected_device,
+            Screen::Interventions => self.selected_intervention.and_then(|x| d.intervention(x)).and_then(|i| i.device_id),
+            _ => None,
+        }
+    }
+
     /// Keyboard shortcuts (outside text fields).
     fn keyboard(&mut self, ui: &egui::Ui) {
         use egui::{Key, Modifiers};
@@ -473,10 +627,20 @@ impl DeskApp {
             }
             return;
         }
+        if self.shortcuts_open {
+            if pressed(Modifiers::NONE, Key::Escape) {
+                self.shortcuts_open = false;
+            }
+            return;
+        }
         if pressed(Modifiers::NONE, Key::Slash) {
             self.search_focus = true;
         } else if pressed(Modifiers::COMMAND, Key::Comma) {
             self.go(Screen::Settings);
+        } else if pressed(Modifiers::COMMAND, Key::R) {
+            self.refresh_serial = self.refresh_serial.wrapping_add(1);
+        } else if pressed(Modifiers::SHIFT, Key::Slash) || pressed(Modifiers::NONE, Key::Questionmark) {
+            self.shortcuts_open = true;
         } else if pressed(Modifiers::NONE, Key::Escape) {
             if !self.close_open_form() {
                 if self.screen == Screen::Settings {
@@ -487,8 +651,23 @@ impl DeskApp {
             }
         } else if pressed(Modifiers::NONE, Key::S) {
             self.start_intervention();
+        } else if pressed(Modifiers::NONE, Key::X) {
+            self.stop_mine();
         } else if pressed(Modifiers::NONE, Key::N) {
             self.new_record();
+        } else if pressed(Modifiers::NONE, Key::L) {
+            let (c, d) = (self.open_customer_id(), self.open_device_id());
+            interventions::open_log(self, c, d);
+        } else if pressed(Modifiers::NONE, Key::E) {
+            self.edit_record();
+        } else if pressed(Modifiers::NONE, Key::C) {
+            if let Some(d) = self.open_device_id() {
+                self.connect(d);
+            }
+        } else if pressed(Modifiers::NONE, Key::P) {
+            if let Some(c) = self.open_customer_id() {
+                privacy::open_consent(self, c, &["remote_assistance"]);
+            }
         } else if pressed(Modifiers::NONE, Key::J) || pressed(Modifiers::NONE, Key::ArrowDown) {
             self.step(1);
         } else if pressed(Modifiers::NONE, Key::K) || pressed(Modifiers::NONE, Key::ArrowUp) {
@@ -527,6 +706,37 @@ impl DeskApp {
             Screen::Customers => self.selected_customer = None,
             Screen::Devices => self.selected_device = None,
             Screen::Interventions => self.selected_intervention = None,
+            _ => {}
+        }
+    }
+
+    /// Opens the stop form of my newest running intervention (`x`).
+    pub fn stop_mine(&mut self) {
+        let actor = self.session.actor().to_string();
+        let mine = self.derived.running.iter().copied().find(|id| self.session.data().intervention(*id).is_some_and(|i| i.technician == actor));
+        if let Some(id) = mine {
+            timer::open_running(self, id, true);
+        }
+    }
+
+    /// Opens the edit form of the open record (`e`).
+    pub fn edit_record(&mut self) {
+        match self.screen {
+            Screen::Customers | Screen::Privacy => {
+                if let Some(id) = self.selected_customer {
+                    customers::open_edit(self, id);
+                }
+            }
+            Screen::Devices => {
+                if let Some(id) = self.selected_device {
+                    devices::open_edit(self, id);
+                }
+            }
+            Screen::Interventions => {
+                if let Some(id) = self.selected_intervention {
+                    interventions::open_edit(self, id);
+                }
+            }
             _ => {}
         }
     }
@@ -590,6 +800,7 @@ impl DeskApp {
         }
         timer::show(self, ui, &tokens);
         chrome::confirm(self, ui, &tokens);
+        chrome::shortcuts_help(self, ui, &tokens);
         chrome::toast(self, ui, &tokens);
     }
 }
@@ -679,6 +890,25 @@ mod tests {
         app.search = "nothing".into();
         app.search_submit();
         assert_eq!(app.screen, Screen::Devices);
+    }
+
+    #[test]
+    fn pending_open_resolves_when_the_record_appears() {
+        let mut app = DeskApp::demo();
+        app.open_when_ready(Screen::Customers, 999);
+        assert!(app.pending_open.is_some());
+        frame(&mut app);
+        assert!(app.pending_open.is_some());
+        app.run("customer.add", json!({"name": "Quarto"}));
+        frame(&mut app);
+        assert!(app.pending_open.is_some(), "another id: still waiting");
+        app.pending_open = None;
+        app.open_when_ready(Screen::Customers, 4);
+        assert_eq!(app.selected_customer, Some(4));
+        assert!(app.derived.customer(4).is_some() || app.derived.stale(app.session.revision()));
+        frame(&mut app);
+        assert!(app.derived.customer(4).is_some());
+        assert!(app.window_title().contains("Quarto"));
     }
 
     #[test]

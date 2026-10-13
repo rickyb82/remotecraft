@@ -99,6 +99,34 @@ pub fn month_bounds(now: DateTime<Utc>, months_ago: u32) -> (String, String) {
     (format!("{y:04}-{:02}-01", m0 + 1), format!("{ny:04}-{:02}-01", nm0 + 1))
 }
 
+/// `h:mm:ss` from a stamp to `now` (`0:00:00` when unreadable or in the future).
+pub fn elapsed(started_at: &str, now: DateTime<Utc>) -> String {
+    let secs = time::parse_stamp(started_at).map(|s| now.signed_duration_since(s).num_seconds().max(0)).unwrap_or(0);
+    format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+}
+
+/// `h:mm` from a stamp to `now`, for rows.
+pub fn elapsed_short(started_at: &str, now: DateTime<Utc>) -> String {
+    let secs = time::parse_stamp(started_at).map(|s| now.signed_duration_since(s).num_seconds().max(0)).unwrap_or(0);
+    format!("{}:{:02}", secs / 3600, (secs / 60) % 60)
+}
+
+/// The bounds of the month of a stamp (local), as form inputs: `(first day, first day of the
+/// next month)`.
+pub fn month_of(stamp: &str) -> Option<(String, String)> {
+    let t = local(stamp)?;
+    Some(month_bounds(t.with_timezone(&Utc), 0))
+}
+
+/// Joins CSV fields with `;`, quoting what needs it.
+pub fn csv_line(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|f| if f.contains([';', '"', '\n', '\r']) { format!("\"{}\"", f.replace('"', "\"\"")) } else { f.clone() })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// Clips a name for a chip.
 pub fn clipped(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -153,6 +181,13 @@ mod tests {
         assert_eq!(clipped("abc", 4), "abc");
         assert_eq!(input("bad"), "");
         assert!(stamp_from_input("09:30", now).is_some_and(|s| s.ends_with('Z')));
+        assert_eq!(elapsed("2026-10-13T10:58:30Z", now), "1:01:30");
+        assert_eq!(elapsed("2026-10-13T13:00:00Z", now), "0:00:00");
+        assert_eq!(elapsed("bad", now), "0:00:00");
+        assert_eq!(elapsed_short("2026-10-13T10:58:30Z", now), "1:01");
+        assert!(month_of("2026-10-13T12:00:00Z").is_some_and(|(a, b)| a.starts_with("2026-10-01") && b.starts_with("2026-11-01")));
+        assert!(month_of("x").is_none());
+        assert_eq!(csv_line(&["a".into(), "b;c".into()]), "a;\"b;c\"");
         assert!(stamp_from_input("ieri", now).is_none());
     }
 }

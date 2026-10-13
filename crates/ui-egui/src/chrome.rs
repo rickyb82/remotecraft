@@ -102,13 +102,28 @@ pub fn top_bar(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                     for l in Language::ALL {
                         if ui.selectable_label(app.language == l, l.name()).clicked() {
                             app.language = l;
-                            app.run("prefs.set", json!({"language": l.code()}));
                             ui.close();
                         }
                     }
                 });
                 if app.session.jobs_pending() > 0 {
                     ui.add(egui::Spinner::new().size(18.0).color(t.accent));
+                }
+                let findings = app.derived.findings.len();
+                if findings > 0 {
+                    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 32.0), Sense::click());
+                    let p = ui.painter();
+                    if resp.hovered() {
+                        p.rect_filled(rect, 8.0, t.hover);
+                    }
+                    let (fill, color) = crate::widgets::tone_colors(t, crate::widgets::Tone::Bad);
+                    icons::paint(p, Rect::from_center_size(rect.center() - vec2(3.0, 0.0), vec2(19.0, 19.0)), Icon::Privacy, color);
+                    let disc = pos2(rect.right() - 8.0, rect.top() + 8.0);
+                    p.circle_filled(disc, 8.0, color);
+                    p.text(disc, egui::Align2::CENTER_CENTER, findings.min(99).to_string(), FontId::proportional(10.0), fill);
+                    if resp.on_hover_text(app.language.fill("Privacy review: {n} findings", &[("n", &findings.to_string())])).clicked() {
+                        app.privacy_review();
+                    }
                 }
                 app.timer_chip(ui, t);
             });
@@ -221,5 +236,36 @@ pub fn confirm(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         }
         Some(false) => app.confirm = None,
         None => {}
+    }
+}
+
+/// The keyboard shortcuts, in a window (`?`).
+pub fn shortcuts_help(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
+    if !app.shortcuts_open {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new(app.tr("Keyboard shortcuts"))
+        .id(egui::Id::new("shortcuts"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_width(440.0);
+            egui::Grid::new("shortcuts-grid").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
+                for (key, what) in crate::SHORTCUTS {
+                    ui.label(RichText::new(*key).font(FontId::monospace(13.0)).color(t.accent));
+                    ui.label(RichText::new(app.tr(what)).color(t.ui_text));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
+            if ui.button(app.tr("Close")).clicked() {
+                app.shortcuts_open = false;
+            }
+        });
+    if !open || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.shortcuts_open = false;
     }
 }

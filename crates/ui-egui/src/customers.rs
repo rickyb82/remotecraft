@@ -36,3 +36,19 @@ pub fn new(_app: &mut DeskApp) {}
 
 /// Moves the selection by `delta` rows.
 pub fn step(_app: &mut DeskApp, _delta: i32) {}
+
+/// Opens the new-customer form with `name` prefilled.
+pub fn open_new(app: &mut DeskApp, name: &str) {
+    let _ = (app, name);
+}
+
+/// Opens the edit form of a customer.
+pub fn open_edit(app: &mut DeskApp, id: u64) {
+    let _ = (app, id);
+}
+
+/// A customer row (in lists and pickers); `show_hover` adds the hover actions.
+pub fn row(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, id: u64, show_hover: bool) -> egui::Response {
+    let _ = (app, t, id, show_hover);
+    ui.label("")
+}

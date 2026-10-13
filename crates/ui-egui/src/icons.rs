@@ -55,6 +55,8 @@ pub enum Icon {
     Server,
     Copy,
     Erase,
+    Lock,
+    Euro,
 }
 
 /// Points on a circular arc, angles in degrees (0 = right, clockwise on screen).
@@ -342,6 +344,18 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             rrect(8.0, 8.0, 20.0, 20.5, 1.5);
             line(&[(5.5, 15.5), (4.0, 15.5), (4.0, 3.5), (16.0, 3.5), (16.0, 5.5)]);
         }
+        Icon::Lock => {
+            rrect(5.0, 10.5, 19.0, 20.5, 1.5);
+            p.add(Shape::line(arc(at(12.0, 10.0), 4.5 * s, 180.0, 360.0, 12), st));
+            line(&[(7.5, 10.0), (7.5, 10.5)]);
+            line(&[(16.5, 10.0), (16.5, 10.5)]);
+            dot(12.0, 15.5, 1.3);
+        }
+        Icon::Euro => {
+            p.add(Shape::line(arc(at(13.5, 12.0), 6.5 * s, 50.0, 310.0, 16), st));
+            line(&[(4.5, 10.0), (14.0, 10.0)]);
+            line(&[(4.5, 14.0), (14.0, 14.0)]);
+        }
     }
 }
 
@@ -349,7 +363,7 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 51] = [
+    const ALL: [Icon; 53] = [
         Icon::Logo,
         Icon::Customers,
         Icon::Customer,
@@ -401,6 +415,8 @@ mod tests {
         Icon::Server,
         Icon::Copy,
         Icon::Erase,
+        Icon::Lock,
+        Icon::Euro,
     ];
 
     #[test]

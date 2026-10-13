@@ -364,7 +364,9 @@ fn handle(mut stream: TcpStream, hub: &Hub) {
         match (req.method.as_str(), &hub.static_dir) {
             ("GET", Some(dir)) => serve_static(&mut stream, dir, &req.path, origin),
             ("GET", None) if req.path == "/" => respond_bytes(&mut stream, "200 OK", "text/plain; charset=utf-8", WELCOME.as_bytes(), origin),
-            ("GET", None) => respond(&mut stream, "404 Not Found", &json!({"error": "RemoteCraft API: see /api/health, POST /api/cmd, GET /api/commands"}), origin),
+            ("GET", None) => {
+                respond(&mut stream, "404 Not Found", &json!({"error": "RemoteCraft API: see /api/health, POST /api/cmd, GET /api/commands"}), origin)
+            }
             _ => respond(&mut stream, "405 Method Not Allowed", &json!({"error": "method not allowed"}), origin),
         }
         return;

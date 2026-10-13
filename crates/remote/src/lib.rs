@@ -16,9 +16,16 @@ enum Incoming {
     Snapshot(Box<Snapshot>),
     Unchanged,
     /// A command's answer.
-    Answer { job: u64, command: String, result: Result<Value, String> },
+    Answer {
+        job: u64,
+        command: String,
+        result: Result<Value, String>,
+    },
     /// The server could not be reached, or answered nonsense.
-    Failed { job: Option<(u64, String)>, error: String },
+    Failed {
+        job: Option<(u64, String)>,
+        error: String,
+    },
 }
 
 type Inbox = Arc<Mutex<Vec<Incoming>>>;

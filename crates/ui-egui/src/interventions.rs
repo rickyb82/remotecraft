@@ -1247,31 +1247,7 @@ fn state_word(app: &DeskApp, state: PurposeState) -> String {
 /// the line under it (long labels would push the pane wider); the tone's bar is as tall as the
 /// banner. Answers the index of the action clicked.
 fn banner(ui: &mut egui::Ui, t: &Tokens, tone: Tone, icon: Icon, text: &str, actions: &[&str]) -> Option<usize> {
-    let (fill, color) = widgets::tone_colors(t, tone);
-    let mut clicked = None;
-    let out = egui::Frame::NONE.fill(fill).corner_radius(8).inner_margin(egui::Margin { left: 14, right: 10, top: 8, bottom: 8 }).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-            icons::paint(ui.painter(), r, icon, color);
-            ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
-        });
-        if !actions.is_empty() {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(22.0);
-                for (i, a) in actions.iter().enumerate() {
-                    if ui.small_button(*a).clicked() {
-                        clicked = Some(i);
-                    }
-                }
-            });
-        }
-    });
-    let r = out.response.rect;
-    ui.painter().rect_filled(Rect::from_min_max(pos2(r.left() + 4.0, r.top() + 7.0), pos2(r.left() + 7.0, r.bottom() - 7.0)), 1.5, color);
-    ui.add_space(6.0);
-    clicked
+    widgets::banner(ui, t, tone, icon, text, actions)
 }
 
 /// The Minutes row: ticked, the minutes worked instead of the span (pauses); unticked, the span

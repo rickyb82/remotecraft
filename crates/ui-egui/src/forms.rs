@@ -133,8 +133,11 @@ pub fn time_field(
     ui.label(RichText::new(label).color(t.muted));
     let mut out = None;
     ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(value).hint_text("13/10/2026 09:30").desired_width(180.0));
+        // The box takes the column's width (at most 220 px); the quick buttons wrap under it
+        // when the pane is narrow, so the field never widens the pane.
+        ui.horizontal_wrapped(|ui| {
+            let room = ui.max_rect().right() - ui.cursor().left();
+            ui.add(egui::TextEdit::singleline(value).hint_text("13/10/2026 09:30").desired_width(room.clamp(120.0, 220.0)));
             if ui.small_button(app.tr("Now")).clicked() {
                 *value = format::input(&remotecraft_engine::core::time::stamp(now));
             }

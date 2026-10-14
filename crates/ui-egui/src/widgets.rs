@@ -1,6 +1,6 @@
 //! RemoteCraft's widgets: icon buttons, the accent button, chips, form rows, empty states.
 
-use egui::{Color32, FontId, Rect, Response, RichText, Sense, Ui, vec2};
+use egui::{Align, Color32, FontId, Layout, Rect, Response, RichText, Sense, Ui, pos2, vec2};
 
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
@@ -233,33 +233,49 @@ pub fn truncate(painter: &egui::Painter, text: &str, font: FontId, color: Color3
     painter.layout_job(job)
 }
 
-/// A warning or a note across a pane: the tone's fill, a bar in the tone's colour, an icon,
-/// wrapped text and small action buttons at the right; answers the index of the action clicked.
-pub fn banner(ui: &mut Ui, t: &Tokens, tone: Tone, icon: Icon, text: &str, actions: &[&str]) -> Option<usize> {
+/// A warning or a note across a pane: the tone's fill, a bar in the tone's colour bounded to the
+/// banner, an icon, the text wrapped before the actions (on their own line when they would squeeze
+/// it), so it never widens the pane; answers the index of the action clicked.
+pub fn banner(ui: &mut egui::Ui, t: &Tokens, tone: Tone, icon: Icon, text: &str, actions: &[&str]) -> Option<usize> {
     let (fill, color) = tone_colors(t, tone);
     let mut clicked = None;
-    egui::Frame::NONE.fill(fill).corner_radius(8).inner_margin(egui::Margin { left: 12, right: 10, top: 8, bottom: 8 }).show(ui, |ui| {
+    let out = egui::Frame::NONE.fill(fill).corner_radius(8).inner_margin(egui::Margin { left: 14, right: 10, top: 8, bottom: 8 }).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let left = ui.max_rect().left() - 10.0;
-        ui.painter().rect_filled(
-            Rect::from_min_max(egui::pos2(left, ui.max_rect().top() - 6.0), egui::pos2(left + 3.0, ui.max_rect().bottom() + 6.0)),
-            2.0,
-            color,
-        );
-        ui.horizontal(|ui| {
+        let actions_w: f32 =
+            actions.iter().map(|a| ui.painter().layout_no_wrap(a.to_string(), FontId::proportional(14.0), color).size().x + 24.0).sum();
+        // Actions that would squeeze the text go on their own line under it.
+        let below = actions_w > ui.available_width() * 0.4;
+        ui.horizontal_top(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
             icons::paint(ui.painter(), r, icon, color);
-            let actions_w = actions.iter().map(|a| a.chars().count() as f32 * 7.5 + 24.0).sum::<f32>();
-            ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap()).on_hover_text(text);
-            ui.allocate_ui_with_layout(vec2(actions_w.max(10.0), 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (i, a) in actions.iter().enumerate().rev() {
+            let text_w = if below { ui.available_width() } else { (ui.available_width() - actions_w - 8.0).max(80.0) };
+            ui.allocate_ui_with_layout(vec2(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_max_width(text_w);
+                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
+            });
+            if !below && !actions.is_empty() {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    for (i, a) in actions.iter().enumerate().rev() {
+                        if ui.small_button(*a).clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                });
+            }
+        });
+        if below {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(26.0);
+                for (i, a) in actions.iter().enumerate() {
                     if ui.small_button(*a).clicked() {
                         clicked = Some(i);
                     }
                 }
             });
-        });
+        }
     });
+    let r = out.response.rect;
+    ui.painter().rect_filled(Rect::from_min_max(r.min, pos2(r.left() + 3.0, r.bottom())), egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, color);
     ui.add_space(6.0);
     clicked
 }

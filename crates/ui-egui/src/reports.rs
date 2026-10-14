@@ -976,7 +976,8 @@ mod tests {
         let job = app.run_as("report.time", json!({"group_by": "bogus"}), AppIntent::Reports(Intent::Load));
         app.reports.pending = Some((job, "k".into()));
         frame(&mut app);
-        assert!(app.reports.error.contains("group_by"), "{}", app.reports.error);
+        // The demo desk speaks Italian: the engine's refusal arrives translated.
+        assert!(app.reports.error.contains("group_by") || app.reports.error.contains("raggruppamento"), "{}", app.reports.error);
         assert!(app.reports.pending.is_none());
         assert_eq!(app.reports.loaded_key.as_deref(), Some("k"));
         assert!(app.reports.report.is_none());

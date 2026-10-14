@@ -64,12 +64,15 @@ impl Language {
         if self == Self::En {
             return text.to_string();
         }
-        for (en, itx) in it::MESSAGES {
-            if let Some(rest) = text.strip_prefix(en) {
-                return format!("{itx}{rest}");
+        let mut out =
+            it::MESSAGES.iter().find_map(|(en, itx)| text.strip_prefix(en).map(|rest| format!("{itx}{rest}"))).unwrap_or_else(|| text.to_string());
+        // Phrases after a name or a number (`x` is not a time, intervention 5 is already closed).
+        for (en, itx) in it::INFIX {
+            if out.contains(en) {
+                out = out.replace(en, itx);
             }
         }
-        text.to_string()
+        out
     }
 }
 
@@ -189,6 +192,15 @@ mod tests {
         assert_eq!(Language::En.tr("Customers"), "Customers");
         assert_eq!(Language::It.fill("{n} customers", &[("n", "3")]), "3 clienti");
         assert_eq!(Language::It.tr_message("no customer 7"), "nessun cliente 7");
+        assert_eq!(Language::It.tr_message("`ieri` is not a time: use 2026-10-13 09:30"), "`ieri` non è un orario: use 2026-10-13 09:30");
+        assert!(
+            Language::It.tr_message("intervention 5 is already closed (intervention.update to change it)").starts_with("intervento 5 è già chiuso (")
+        );
+        assert_eq!(
+            Language::It.tr_message("the customer's remote_assistance consent is missing: record it first (privacy.consent), or give consent_override with the reason (e.g. the person agreed on the phone)"),
+            "il consenso del cliente all'assistenza remota è mancante: registralo prima, oppure indica il motivo per procedere (e.g. the person agreed on the phone)"
+        );
+        assert_eq!(Language::En.tr_message("intervention 5 is already closed"), "intervention 5 is already closed");
         assert_eq!(Language::parse("it-IT"), Some(Language::It));
         assert_eq!(Language::parse("de"), None);
     }

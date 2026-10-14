@@ -60,7 +60,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     // The privacy strip of a customer card.
     ("Notice {version} delivered on {date} ({method})", "Informativa {version} consegnata il {date} ({method})"),
     ("Received notice {old}, current is {new}", "Ha ricevuto l'informativa {old}, l'attuale è la {new}"),
-    ("History ({n} events)", "Storico ({n} eventi)"),
+    ("History ({n})", "Storico ({n})"),
     ("Recorded by {who} on {date}", "Registrato da {who} il {date}"),
     ("Notice delivered", "Informativa consegnata"),
     ("Consent given", "Consenso dato"),
@@ -1330,7 +1330,7 @@ pub fn strip(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, customer: u64) {
                 act = Some(StripAct::Consent(None));
             }
             if info.privacy_events > 0 {
-                let text = view.language.fill("History ({n} events)", &[("n", &info.privacy_events.to_string())]);
+                let text = view.language.fill("History ({n})", &[("n", &info.privacy_events.to_string())]);
                 let open = view.privacy.history_open == Some(customer);
                 let icon = if open { Icon::Chevron } else { Icon::History };
                 if widgets::icon_text_button(ui, t, icon, &text, true).clicked() {

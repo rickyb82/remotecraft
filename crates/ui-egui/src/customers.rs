@@ -580,47 +580,7 @@ fn submit(app: &mut DeskApp, mut f: Form) {
 /// icon, wrapped text, small actions at the right; answers the action clicked) but with the bar
 /// bounded to the banner and the text wrapped before the actions, so it never widens the pane.
 pub(crate) fn banner(ui: &mut egui::Ui, t: &Tokens, tone: Tone, icon: Icon, text: &str, actions: &[&str]) -> Option<usize> {
-    let (fill, color) = widgets::tone_colors(t, tone);
-    let mut clicked = None;
-    let out = egui::Frame::NONE.fill(fill).corner_radius(8).inner_margin(egui::Margin { left: 14, right: 10, top: 8, bottom: 8 }).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        let actions_w: f32 =
-            actions.iter().map(|a| ui.painter().layout_no_wrap(a.to_string(), FontId::proportional(14.0), color).size().x + 24.0).sum();
-        // Actions that would squeeze the text go on their own line under it.
-        let below = actions_w > ui.available_width() * 0.4;
-        ui.horizontal_top(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-            icons::paint(ui.painter(), r, icon, color);
-            let text_w = if below { ui.available_width() } else { (ui.available_width() - actions_w - 8.0).max(80.0) };
-            ui.allocate_ui_with_layout(vec2(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_max_width(text_w);
-                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
-            });
-            if !below && !actions.is_empty() {
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    for (i, a) in actions.iter().enumerate().rev() {
-                        if ui.small_button(*a).clicked() {
-                            clicked = Some(i);
-                        }
-                    }
-                });
-            }
-        });
-        if below {
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(26.0);
-                for (i, a) in actions.iter().enumerate() {
-                    if ui.small_button(*a).clicked() {
-                        clicked = Some(i);
-                    }
-                }
-            });
-        }
-    });
-    let r = out.response.rect;
-    ui.painter().rect_filled(Rect::from_min_max(r.min, pos2(r.left() + 3.0, r.bottom())), egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, color);
-    ui.add_space(6.0);
-    clicked
+    widgets::banner(ui, t, tone, icon, text, actions)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1105,10 +1065,7 @@ fn action_bar(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &Customer, in
         Some(CardAct::Unarchive) => unarchive(app, id),
         Some(CardAct::Delete) => ask_delete(app, id),
         Some(CardAct::Erase) => erase::open(app, id),
-        Some(CardAct::Audit) => {
-            app.privacy.tab = privacy::Tab::Audit;
-            app.go(Screen::Privacy);
-        }
+        Some(CardAct::Audit) => privacy::open_audit(app, Some(id), None, None),
         Some(CardAct::Close) => app.selected_customer = None,
         None => {}
     }

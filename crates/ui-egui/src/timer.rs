@@ -835,8 +835,9 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
         },
         Intent::Log { customer } => match &c.result {
             Ok(v) => {
-                // The card that sent it closes; one opened since (another form) stays.
-                if sent_by_card {
+                // The card that sent it closes, if it still shows that entry; one opened since
+                // (another form, a running intervention picked from the chip) stays.
+                if sent_by_card && app.timer.card.as_ref().is_some_and(|c| c.mode == Mode::Log) {
                     app.timer.card = None;
                 }
                 app.selected_intervention = v["intervention"]["id"].as_u64();
@@ -871,8 +872,9 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
         },
         Intent::Consent { customer } => match &c.result {
             Ok(_) => {
-                // Sent again only while the card still targets the customer who agreed.
-                let mode = app.timer.card.as_mut().filter(|card| card.target.customer == Some(customer)).map(|card| {
+                // Sent again only by the card that asked, while it still targets the customer who
+                // agreed.
+                let mode = app.timer.card.as_mut().filter(|card| sent_by_card && card.target.customer == Some(customer)).map(|card| {
                     card.refusal = None;
                     card.mode
                 });
@@ -1196,6 +1198,12 @@ pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
 
 fn apply(app: &mut DeskApp, action: Action) {
     let mode = app.timer.card.as_ref().map(|c| c.mode);
+    // While the card waits for its command, nothing sends another (Ctrl+Enter in a field, a
+    // double click): one start, one entry, one stop.
+    let waiting = app.timer.card.as_ref().is_some_and(|c| c.busy);
+    if waiting && matches!(action, Action::Submit | Action::Anyway | Action::Consent) {
+        return;
+    }
     match action {
         Action::Submit => match mode {
             Some(Mode::Start) => submit_start(app, false),
@@ -2099,6 +2107,42 @@ mod tests {
         fn server(&self) -> String {
             "http://slow.test".into()
         }
+    }
+
+    #[test]
+    fn a_card_waiting_for_its_answer_sends_nothing_more_and_keeps_what_it_shows() {
+        let release = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut app = DeskApp::new(Box::new(Slow { desk: crate::Session::demo(), held: Vec::new(), release: release.clone() }));
+        app.language = Language::En;
+        // A start sent from the card, then sent again (Ctrl+Enter, a double click) before the
+        // slow answer: one timer.
+        open_start(&mut app, Some(2), Some(4));
+        edit(&mut app, |c| c.summary = "Cassa bloccata".into());
+        apply(&mut app, Action::Submit);
+        apply(&mut app, Action::Submit);
+        apply(&mut app, Action::Anyway);
+        release.set(true);
+        frame(&mut app);
+        let running: Vec<u64> = app.data().interventions.iter().filter(|i| i.running()).map(|i| i.id).collect();
+        assert_eq!(running, vec![11], "one start only");
+        assert_eq!(card(&app).mode, Mode::Running);
+        // A past-work entry answered after the card moved on to the running intervention (the
+        // chip): the card stays on it with the notes typed meanwhile.
+        open_log(&mut app, Some(1), Some(1));
+        edit(&mut app, |c| {
+            c.summary = "Backup".into();
+            c.started_at = "09:00".into();
+            c.minutes = "30".into();
+        });
+        release.set(false);
+        apply(&mut app, Action::Submit);
+        open_running(&mut app, 11, false);
+        edit(&mut app, |c| c.notes = "Rullo sostituito".into());
+        release.set(true);
+        frame(&mut app);
+        assert!(app.data().interventions.iter().any(|i| i.summary == "Backup"), "the entry is saved");
+        let c = card(&app);
+        assert_eq!((c.mode, c.running.as_ref().map(|r| r.id), c.notes.as_str()), (Mode::Running, Some(11), "Rullo sostituito"));
     }
 
     #[test]

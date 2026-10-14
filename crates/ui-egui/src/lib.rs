@@ -689,7 +689,7 @@ impl DeskApp {
         }
     }
 
-    /// Keyboard shortcuts (outside text fields).
+    /// Keyboard shortcuts: outside text fields, except Ctrl+R (reload the screen's data).
     fn keyboard(&mut self, ui: &egui::Ui) {
         use egui::{Key, Modifiers};
         if self.confirm.is_some() {

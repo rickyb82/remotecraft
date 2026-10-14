@@ -25,6 +25,21 @@ lettura sugli stessi comandi: i parametri della query string diventano `params`.
 | `GET /api/review` | `gdpr.review` |
 | `GET /api/status`, `GET /api/commands` | `app.status`, `app.commands` |
 
+## Richieste e risposte
+
+- `POST /api/cmd` vuole `Content-Type: application/json` (altrimenti **415**) e un corpo di
+  al massimo 1 MiB (altrimenti **413**). Il corpo viene letto solo dopo aver controllato il
+  token.
+- Token mancante o sbagliato: **401**, dopo una breve attesa (250 ms) che rende inutili i
+  tentativi a raffica. Il token di servizio deve avere almeno 32 caratteri.
+- Senza token di servizio: **403** alle richieste con un `Host` che non è questa macchina, alle
+  pagine di altri siti non elencate in `--allow-origin` e a `/api/users` (vedi
+  [deploy.md](deploy.md)).
+- Riga della richiesta e intestazioni vanno inviate entro 10 secondi e in al massimo 16 KiB
+  (altrimenti **408** o **431**). Il server serve al massimo 64 connessioni insieme: oltre,
+  risponde subito **503** (riprova dopo un secondo).
+- Nei percorsi `+` è un più (`/api/customers/Rossi+Figli`); nella query string è uno spazio.
+
 ## Riferimenti
 
 Dove un comando chiede `customer`, vanno bene l'id (`12`, `"#12"`), il nome, l'e-mail, la P.IVA

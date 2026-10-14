@@ -17,10 +17,16 @@ use crate::core::chrono::Local;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::widgets::{self, Tone};
-use crate::{Completed, DeskApp, Intent as AppIntent, Language};
+use crate::{Completed, DeskApp, Intent as AppIntent, Language, Request};
 
 /// The labels this screen shows: `(English, Italian)`.
 pub const LABELS_IT: &[(&str, &str)] = &[
+    (
+        "This browser keeps the token that opens the desk. On a shared or lost PC, forget it: the page reloads without it, and the framework's link brings you back.",
+        "Questo browser conserva il token che apre il gestionale. Su un PC condiviso o smarrito, dimenticalo: la pagina si ricarica senza token e il link del framework ti riporta qui.",
+    ),
+    ("Forget the token on this browser", "Dimentica il token su questo browser"),
+    ("Forget and reload", "Dimentica e ricarica"),
     ("Setup guide", "Guida iniziale"),
     ("Three things to set before the first call", "Tre cose da impostare prima della prima chiamata"),
     ("Your company", "La tua azienda"),
@@ -329,6 +335,8 @@ pub struct State {
     setup_rev: Option<u64>,
     setup_job: Option<u64>,
     pub setup_error: String,
+    /// "Forget the token" was pressed once and waits for the second, confirming press.
+    pub forget_armed: bool,
 }
 
 impl State {
@@ -854,11 +862,12 @@ fn appearance_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
 fn shortcuts_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     widgets::section(ui, t, app.tr("Keyboard shortcuts"));
     let lang = app.language;
+    let os = ui.ctx().os();
     widgets::card(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
         egui::Grid::new("settings-shortcuts").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            for (key, action) in shortcut_rows(lang) {
-                key_chip(ui, t, key);
+            for (key, action) in shortcut_rows(lang, os) {
+                key_chip(ui, t, &key);
                 ui.label(RichText::new(action).color(t.ui_text));
                 ui.end_row();
             }
@@ -868,9 +877,10 @@ fn shortcuts_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     });
 }
 
-/// The rows of the shortcuts table: [`crate::SHORTCUTS`], the descriptions translated.
-fn shortcut_rows(lang: Language) -> impl Iterator<Item = (&'static str, &'static str)> {
-    crate::SHORTCUTS.iter().map(move |(key, what)| (*key, lang.tr(what)))
+/// The rows of the shortcuts table: [`crate::SHORTCUTS`], the keys as `os` names them (Cmd on
+/// a Mac, like the `?` window), the descriptions translated.
+fn shortcut_rows(lang: Language, os: egui::os::OperatingSystem) -> impl Iterator<Item = (std::borrow::Cow<'static, str>, &'static str)> {
+    crate::SHORTCUTS.iter().map(move |(key, what)| (crate::shortcut_key(os, key), lang.tr(what)))
 }
 
 /// The status card's counts, `1 customer` in the singular.
@@ -914,6 +924,40 @@ fn status_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             banner(ui, t, Tone::Warn, &all);
         }
     });
+    if !server.is_empty() {
+        browser_card(app, ui, t);
+    }
+}
+
+/// On a remote desk: forget the token this browser keeps (a shared or lost PC), in two presses.
+fn browser_card(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
+    ui.add_space(8.0);
+    widgets::card(t).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let text = app.tr(
+            "This browser keeps the token that opens the desk. On a shared or lost PC, forget it: the page reloads without it, and the framework's link brings you back.",
+        );
+        ui.label(RichText::new(text).color(t.muted));
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if app.settings.forget_armed {
+                if widgets::danger_button(ui, t, app.tr("Forget and reload")).clicked() {
+                    forget_token(app);
+                }
+                if ui.button(app.tr("Cancel")).clicked() {
+                    app.settings.forget_armed = false;
+                }
+            } else if ui.button(app.tr("Forget the token on this browser")).clicked() {
+                app.settings.forget_armed = true;
+            }
+        });
+    });
+}
+
+/// Asks the host to drop the browser's server and token and reload.
+fn forget_token(app: &mut DeskApp) {
+    app.settings.forget_armed = false;
+    app.requests.push(Request::ForgetToken);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1267,6 +1311,59 @@ mod tests {
         assert!(!close(&mut app));
     }
 
+    /// The demo desk as if served: only a remote desk has a token to forget.
+    struct Served(Session);
+
+    impl DeskSession for Served {
+        fn data(&self) -> &Data {
+            self.0.data()
+        }
+        fn actor(&self) -> &str {
+            self.0.actor()
+        }
+        fn now(&self) -> crate::core::chrono::DateTime<crate::core::chrono::Utc> {
+            self.0.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.0.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            self.0.pump()
+        }
+        fn jobs_pending(&self) -> usize {
+            self.0.jobs_pending()
+        }
+        fn revision(&self) -> u64 {
+            self.0.revision()
+        }
+        fn server(&self) -> String {
+            "https://assistenza.example.it".into()
+        }
+    }
+
+    #[test]
+    fn a_remote_desk_offers_to_forget_the_browser_s_token_in_two_presses() {
+        // A local desk: nothing to forget.
+        let mut local = DeskApp::new(Box::new(Session::demo()));
+        local.go(Screen::Settings);
+        let label = local.tr("Forget the token on this browser").to_string();
+        let texts = crate::privacy::tests::texts_in(&mut local, 1200.0, 4000.0);
+        assert!(crate::privacy::tests::find(&texts, &label).is_none());
+        // A served desk: the card, then the confirming press, then the request to the host.
+        let mut app = DeskApp::new(Box::new(Served(Session::demo())));
+        app.go(Screen::Settings);
+        let texts = crate::privacy::tests::texts_in(&mut app, 1200.0, 4000.0);
+        assert!(crate::privacy::tests::find(&texts, &label).is_some_and(crate::privacy::tests::whole), "{label}");
+        assert!(app.requests.is_empty());
+        app.settings.forget_armed = true;
+        let texts = crate::privacy::tests::texts_in(&mut app, 1200.0, 4000.0);
+        assert!(crate::privacy::tests::find(&texts, app.tr("Forget and reload")).is_some());
+        assert!(app.requests.is_empty(), "arming asks nothing of the host");
+        forget_token(&mut app);
+        assert_eq!(app.requests, vec![Request::ForgetToken]);
+        assert!(!app.settings.forget_armed);
+    }
+
     /// A desk seen through a mirror, as from a server: a command's answer arrives before the
     /// snapshot with its effect, which comes only when `snapshot` is set.
     struct Mirrored {
@@ -1345,6 +1442,11 @@ mod tests {
 
     /// The texts painted in one frame at `w`×`h`, each with whether it was cut short.
     fn texts_at(app: &mut DeskApp, w: f32, h: f32) -> Vec<(String, bool)> {
+        texts_on(app, w, h, egui::os::OperatingSystem::Nix)
+    }
+
+    /// [`texts_at`] on a context that runs on `os` (the shortcut keys depend on it).
+    fn texts_on(app: &mut DeskApp, w: f32, h: f32, os: egui::os::OperatingSystem) -> Vec<(String, bool)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, bool)>) {
             match shape {
                 egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.elided)),
@@ -1353,6 +1455,7 @@ mod tests {
             }
         }
         let ctx = egui::Context::default();
+        ctx.set_os(os);
         let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))), ..Default::default() };
         let mut out = Vec::new();
         // Two frames: the client setup answers after the first.
@@ -1394,19 +1497,30 @@ mod tests {
 
     #[test]
     fn the_shortcuts_are_the_help_windows_and_the_counts_say_one() {
-        let rows: Vec<_> = shortcut_rows(Language::It).collect();
+        use egui::os::OperatingSystem;
+        let rows: Vec<_> = shortcut_rows(Language::It, OperatingSystem::Windows).collect();
         assert_eq!(rows.len(), crate::SHORTCUTS.len());
         for ((key, it), (en_key, en)) in rows.iter().zip(crate::SHORTCUTS) {
             assert_eq!(key, en_key);
             assert_ne!(it, en, "untranslated shortcut: {en}");
         }
-        assert!(rows.contains(&("Ctrl+,", "Impostazioni")), "{rows:?}");
+        assert!(rows.iter().any(|(k, a)| k == "Ctrl+," && *a == "Impostazioni"), "{rows:?}");
+        // On a Mac the shortcuts listen for Cmd: the table says so (the plain keys stay).
+        let mac: Vec<_> = shortcut_rows(Language::It, OperatingSystem::Mac).collect();
+        for key in ["Cmd+,", "Cmd+R", "Cmd+Enter", "/", "?", "Esc"] {
+            assert!(mac.iter().any(|(k, _)| k == key), "{key} in {mac:?}");
+        }
+        assert!(!mac.iter().any(|(k, _)| k.contains("Ctrl")), "{mac:?}");
+        assert!(shortcut_rows(Language::En, OperatingSystem::IOS).any(|(k, a)| k == "Cmd+," && a == "Settings"));
         let mut app = DeskApp::demo();
         app.language = Language::It;
         app.go(Screen::Settings);
         let texts: Vec<String> = texts_at(&mut app, 1100.0, 3200.0).into_iter().map(|(t, _)| t).collect();
         assert!(texts.iter().any(|t| t == "Ctrl+,") && texts.iter().any(|t| t == "?"), "{texts:?}");
         assert!(!texts.iter().any(|t| t.contains("Comma")), "{texts:?}");
+        let texts: Vec<String> = texts_on(&mut app, 1100.0, 3200.0, OperatingSystem::Mac).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "Cmd+,") && texts.iter().any(|t| t == "Cmd+Enter"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("Ctrl+")), "{texts:?}");
         // The counts of the status card.
         assert_eq!(counts_line(Language::It, 1, 1, 1), "1 cliente · 1 PC · 1 intervento");
         assert_eq!(counts_line(Language::It, 3, 0, 12), "3 clienti · 0 PC · 12 interventi");

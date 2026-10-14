@@ -6,7 +6,8 @@
 //! through `intervention.start`, `intervention.stop`, `intervention.add`, `intervention.update`
 //! (the summary and Billable typed in a card that is closed) and `privacy.consent`; the card
 //! never touches the data itself and reads the elapsed time from the desk's clock. The notes
-//! typed in a closed card wait in `State::drafts` for the stop.
+//! typed in a closed card (and a summary it could not save yet) wait in `State::drafts` for the
+//! stop.
 
 use egui::{Align, FontId, Key, Layout, Modifiers, Rect, Response, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::{Value, json};
@@ -75,6 +76,9 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Who agreed", "Chi acconsente"),
     ("Evidence or note", "Prova o nota"),
     ("Record verbal consent and start", "Registra il consenso verbale e avvia"),
+    ("Not started for {customer}: {error}", "Non avviato per {customer}: {error}"),
+    ("Timer started for {customer}", "Timer avviato per {customer}"),
+    ("Not saved for {customer}: {error}", "Non salvato per {customer}: {error}"),
 ];
 
 /// The card's width.
@@ -257,16 +261,35 @@ impl Card {
     }
 }
 
-/// This screen's own state: the card, when open, and the notes typed for running
-/// interventions whose card was closed (appended when they stop).
+/// What was typed for a running intervention whose card was closed: the notes, appended when it
+/// stops, and the summary and Billable typed over the stored ones when they could not be saved
+/// yet (the card closed before the mirror held the intervention).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Draft {
+    pub notes: String,
+    pub summary: Option<String>,
+    pub billable: Option<bool>,
+}
+
+impl Draft {
+    fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.summary.is_none() && self.billable.is_none()
+    }
+}
+
+/// This screen's own state: the card, when open, and what was typed for running interventions
+/// whose card was closed (kept for the stop, or the card reopened).
 #[derive(Default)]
 pub struct State {
     pub card: Option<Card>,
-    pub drafts: std::collections::BTreeMap<u64, String>,
+    pub drafts: std::collections::BTreeMap<u64, Draft>,
 }
 
-/// How long a remote mirror may lack an intervention the engine said it started.
-const MIRROR_LAG: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a remote mirror may lack an intervention the engine said it started while the
+/// server answers. Above the worst lag of a mirror that answers: the poll out when the start
+/// went through may take its whole window (up to a minute) and answer without it, and the next
+/// one as long again, a poll interval later; a server slower than that has a problem shown.
+const MIRROR_LAG: std::time::Duration = std::time::Duration::from_secs(125);
 /// How many closed cards' notes are kept.
 const MAX_DRAFTS: usize = 64;
 
@@ -347,10 +370,13 @@ pub fn open_running(app: &mut DeskApp, id: u64, stop: bool) {
     let fresh = Card::new(app, Mode::Running, target.clone());
     let mut card = app.timer.card.take().unwrap_or(fresh);
     if !same {
+        // What was typed in its closed card comes back; a summary and Billable not saved yet
+        // are saved when this card lets it go (they differ from the stored ones).
+        let draft = app.timer.drafts.remove(&id).unwrap_or_default();
         card.saved = (summary.clone(), billable);
-        card.summary = summary;
-        card.notes = app.timer.drafts.remove(&id).unwrap_or_default();
-        card.billable = billable;
+        card.summary = draft.summary.unwrap_or(summary);
+        card.notes = draft.notes;
+        card.billable = draft.billable.unwrap_or(billable);
         card.warnings.clear();
     }
     card.running = Some(running);
@@ -396,7 +422,14 @@ pub fn stop_mine(app: &mut DeskApp) {
     let Some(id) = mine_running(app.data(), app.session.actor()).first().map(|m| m.0) else { return };
     let ended = time::stamp(app.now());
     let mut params = json!({"id": id, "ended_at": ended});
-    let mut notes = app.timer.drafts.get(&id).cloned().unwrap_or_default();
+    let draft = app.timer.drafts.get(&id).cloned().unwrap_or_default();
+    let mut notes = draft.notes;
+    if let Some(s) = draft.summary.filter(|s| !s.trim().is_empty()) {
+        params["summary"] = json!(s.trim());
+    }
+    if let Some(b) = draft.billable {
+        params["billable"] = json!(b);
+    }
     if let Some(c) = app.timer.card.as_mut()
         && c.running.as_ref().is_some_and(|r| r.id == id)
     {
@@ -469,15 +502,32 @@ fn release(app: &mut DeskApp) {
         return;
     }
     let Some(id) = c.running.as_ref().map(|r| r.id) else { return };
-    let notes = c.notes.trim().to_string();
-    if notes.is_empty() {
+    let draft = Draft { notes: c.notes.trim().to_string(), ..Draft::default() };
+    keep_draft(app, id, draft);
+}
+
+/// Everything typed in a card that follows a running intervention and cannot be saved now: the
+/// notes, and the summary and Billable typed over the stored ones.
+fn typed_draft(c: &Card) -> Draft {
+    let summary = c.summary.trim();
+    Draft {
+        notes: c.notes.trim().to_string(),
+        summary: (!summary.is_empty() && summary != c.saved.0).then(|| summary.to_string()),
+        billable: (c.billable != c.saved.1).then_some(c.billable),
+    }
+}
+
+/// Keeps what was typed for running intervention `id` (an empty draft forgets it), at most
+/// [`MAX_DRAFTS`] of them.
+fn keep_draft(app: &mut DeskApp, id: u64, draft: Draft) {
+    if draft.is_empty() {
         app.timer.drafts.remove(&id);
         return;
     }
     if !app.timer.drafts.contains_key(&id) && app.timer.drafts.len() >= MAX_DRAFTS {
         app.timer.drafts.pop_first();
     }
-    app.timer.drafts.insert(id, notes);
+    app.timer.drafts.insert(id, draft);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -500,19 +550,34 @@ fn consent_ready(data: &Data, customer: u64, now: DateTime<Utc>) -> bool {
         || privacy::purpose_state(&data.privacy, customer, "remote_assistance", now, prefs.consent_validity_months).0 == PurposeState::Given
 }
 
-/// Opens the RustDesk link on `device` now when it has an ID and the consent is fine; answers
-/// whether it did.
+/// Opens the RustDesk link on `device` now when it has a valid ID and the consent is fine;
+/// answers whether it did.
 fn open_link_now(app: &mut DeskApp, customer: u64, device: u64) -> bool {
     let now = app.now();
     let uri = {
         let d = app.data();
         match d.device(device) {
-            Some(dev) if !dev.rustdesk_id.is_empty() && consent_ready(d, customer, now) => rustdesk::connect_uri(&dev.rustdesk_id),
-            _ => return false,
+            Some(dev) if consent_ready(d, customer, now) => crate::connect_link(&dev.rustdesk_id),
+            _ => None,
         }
     };
+    let Some(uri) = uri else { return false };
     app.requests.push(Request::OpenUrl(uri));
     true
+}
+
+/// Opens the RustDesk link on the PC of a started intervention, built from the PC in the desk
+/// (never from the link an answer carries); an ID that is not valid opens nothing and the status
+/// bar says why.
+fn open_link_of(app: &mut DeskApp, device: Option<u64>) {
+    let id = device.and_then(|d| app.data().device(d)).map(|d| d.rustdesk_id.clone()).unwrap_or_default();
+    if id.is_empty() {
+        return;
+    }
+    match crate::connect_link(&id) {
+        Some(uri) => app.requests.push(Request::OpenUrl(uri)),
+        None => app.status = app.tr(crate::BAD_RUSTDESK_ID).to_string(),
+    }
 }
 
 /// The actor's running interventions, newest first: `(id, customer, device, started_at)`.
@@ -741,12 +806,14 @@ fn submit_consent(app: &mut DeskApp) {
 
 /// Applies a finished command of the card.
 pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
+    // Whether the card itself sent this (a row's start finds it idle).
+    let sent_by_card = app.timer.card.as_ref().is_some_and(|card| card.busy);
     if let Some(card) = app.timer.card.as_mut() {
         card.busy = false;
     }
     match intent {
         Intent::Start { customer, device, opened } => match &c.result {
-            Ok(v) => started(app, v, opened),
+            Ok(v) => started(app, v, opened, sent_by_card),
             Err(e) => refused(app, &e.to_string(), customer, device, Mode::Start),
         },
         Intent::Log { customer } => match &c.result {
@@ -806,7 +873,7 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
 }
 
 /// A start succeeded: the card follows the intervention in Running mode.
-fn started(app: &mut DeskApp, v: &Value, opened: bool) {
+fn started(app: &mut DeskApp, v: &Value, opened: bool, sent_by_card: bool) {
     let i = &v["intervention"];
     let text = |key: &str| i[key].as_str().unwrap_or_default().to_string();
     let running = Running {
@@ -819,10 +886,20 @@ fn started(app: &mut DeskApp, v: &Value, opened: bool) {
     };
     let warnings: Vec<String> =
         v["warnings"].as_array().map(|a| a.iter().filter_map(|w| w.as_str()).map(|w| app.language.tr_message(w)).collect()).unwrap_or_default();
-    if !opened && let Some(uri) = v["connect"]["uri"].as_str() {
-        app.requests.push(Request::OpenUrl(uri.to_string()));
+    // The engine's `connect` says the work is remote on a PC with an ID; the link itself comes
+    // from that PC in the desk, never from the answer as given (a hostile server's `https://…`).
+    if !opened && v["connect"].is_object() {
+        open_link_of(app, running.device_id);
     }
     let target = Target { customer: Some(running.customer_id), device: running.device_id, text: String::new() };
+    // A start from a row (the card did not send it) while the card is a form holding what was
+    // typed: the form stays, the timer runs in the top-bar chip, and the toast says for whom.
+    if !sent_by_card && app.timer.card.as_ref().is_some_and(unsent_typing) {
+        let name =
+            if running.customer_name.is_empty() { crate::customer_name(app.data(), running.customer_id) } else { running.customer_name.clone() };
+        app.toast(app.language.fill("Timer started for {customer}", &[("customer", &name)]));
+        return;
+    }
     if app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id != running.id)) {
         // The card followed another intervention: keep what was typed in it.
         release(app);
@@ -847,12 +924,38 @@ fn started(app: &mut DeskApp, v: &Value, opened: bool) {
     app.toast(app.tr("Timer started").to_string());
 }
 
+/// Whether a card is a form not sent yet (Start, Log) holding something the technician typed.
+fn unsent_typing(c: &Card) -> bool {
+    matches!(c.mode, Mode::Start | Mode::Log)
+        && c.running.is_none()
+        && [&c.summary, &c.notes, &c.reference, &c.ended_at, &c.minutes].iter().any(|s| !s.trim().is_empty())
+}
+
 /// A start or a log failed: the consent refusal panel, or the message under the form. A card
 /// opens on the refused target when none shows it (the fast path from a row, or a card busy
-/// with another intervention or customer), so the technician sees why.
+/// with another intervention or customer), so the technician sees why; an unsent form holding
+/// what was typed for another customer stays, and the refusal shows as a toast instead.
 fn refused(app: &mut DeskApp, message: &str, customer: Option<u64>, device: Option<u64>, mode: Mode) {
     let customer = device.and_then(|d| app.data().device(d)).map(|d| d.customer_id).or(customer);
     let shown = app.timer.card.as_ref().is_some_and(|c| matches!(c.mode, Mode::Start | Mode::Log) && c.target.customer == customer);
+    if !shown && app.timer.card.as_ref().is_some_and(unsent_typing) {
+        // The status bar has the engine's message (`pump`); the toast names the customer.
+        let error = if message.contains("remote_assistance consent is") {
+            let state = app.tr(&refused_state(message)).to_string();
+            app.language.fill("Remote-assistance consent is {state}", &[("state", &state)])
+        } else {
+            app.language.tr_message(message)
+        };
+        let name = customer.map(|id| crate::customer_name(app.data(), id)).unwrap_or_default();
+        let text = if name.is_empty() {
+            error
+        } else {
+            let template = if mode == Mode::Log { "Not saved for {customer}: {error}" } else { "Not started for {customer}: {error}" };
+            app.language.fill(template, &[("customer", &name), ("error", &error)])
+        };
+        app.toast(text);
+        return;
+    }
     if !shown {
         release(app);
         let offset = app.timer.card.as_ref().map(|c| c.offset).unwrap_or_default();
@@ -874,10 +977,11 @@ fn refused(app: &mut DeskApp, message: &str, customer: Option<u64>, device: Opti
 }
 
 /// Drops a card that follows an intervention the desk no longer runs (stopped from the CLI,
-/// another technician, deleted), and the notes kept for interventions no longer running. A
+/// another technician, deleted), and the drafts kept for interventions no longer running. A
 /// remote mirror may lag behind the answer that started an intervention: there it is gone once
 /// the mirror held it and no longer does, or after [`MIRROR_LAG`] without it while the server
-/// answers.
+/// answers. That last close may still be lag: what was typed in the card is kept as its draft,
+/// back when the card is opened again on it.
 fn sync(app: &mut DeskApp) {
     let local = app.session.server().is_empty();
     let answering = app.session.problem().is_none();
@@ -894,22 +998,29 @@ fn sync(app: &mut DeskApp) {
     };
     let held = followed.map(|id| app.data().intervention(id).map(|i| i.running()));
     let Some(c) = app.timer.card.as_mut() else { return };
-    let gone = match held {
-        None => true,
+    // Gone for sure (stopped, deleted), or maybe only lagging.
+    let (gone, lagging) = match held {
+        None => (true, false),
         Some(Some(running)) => {
             c.seen = true;
             c.missing_since = None;
-            !running
+            (!running, false)
         }
         Some(None) => {
             let since = *c.missing_since.get_or_insert_with(Instant::now);
-            local || c.seen || (answering && since.elapsed() > MIRROR_LAG)
+            let lagging = !local && !c.seen && answering && since.elapsed() > MIRROR_LAG;
+            (local || c.seen || lagging, lagging)
         }
     };
     if gone {
-        app.timer.card = None;
+        let card = app.timer.card.take();
         if let Some(id) = followed {
-            app.timer.drafts.remove(&id);
+            match card.filter(|_| lagging) {
+                Some(c) => keep_draft(app, id, typed_draft(&c)),
+                None => {
+                    app.timer.drafts.remove(&id);
+                }
+            }
         }
     }
 }
@@ -1971,8 +2082,7 @@ mod tests {
         frame(&mut app);
         assert!(app.timer.card.is_some(), "may still be lag");
         assert!(card(&app).missing_since.is_some());
-        let past = Instant::now().checked_sub(MIRROR_LAG + std::time::Duration::from_secs(1)).expect("an instant in the past");
-        edit(&mut app, |c| c.missing_since = Some(past));
+        edit(&mut app, |c| c.missing_since = Some(beyond_the_lag()));
         frame(&mut app);
         assert!(app.timer.card.is_none(), "missing for longer than the lag");
         // The local desk cannot lag: closed at once (and the record is present meanwhile).
@@ -2003,7 +2113,7 @@ mod tests {
         // Escape again closes: the notes are kept for the stop.
         assert!(close(&mut app));
         assert!(app.timer.card.is_none());
-        assert_eq!(app.timer.drafts.get(&11).map(String::as_str), Some("Driver reinstallato"));
+        assert_eq!(app.timer.drafts.get(&11).map(|d| d.notes.as_str()), Some("Driver reinstallato"));
         // Reopened from the chip: the stored summary and the kept notes.
         open_running(&mut app, 11, false);
         assert_eq!(card(&app).summary, "Stampante bloccata");
@@ -2023,7 +2133,7 @@ mod tests {
         open_log(&mut app, Some(1), None);
         frame(&mut app);
         assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some("Stampante sbloccata"));
-        assert_eq!(app.timer.drafts.get(&11).map(String::as_str), Some("Driver reinstallato e testato"));
+        assert_eq!(app.timer.drafts.get(&11).map(|d| d.notes.as_str()), Some("Driver reinstallato e testato"));
         // Stopped with `x`: the kept notes go with it, and are forgotten.
         app.timer.card = None;
         stop_mine(&mut app);
@@ -2113,6 +2223,237 @@ mod tests {
         assert_eq!(app.data().privacy.len(), events, "no notice delivery recorded");
         assert!(crate::privacy::form_customer(&app).is_some(), "the form stays open");
         assert_eq!(card(&app).mode, Mode::Stop, "the card got the shortcut");
+    }
+
+    /// An instant older than [`MIRROR_LAG`]: the mirror has lacked the intervention too long.
+    fn beyond_the_lag() -> Instant {
+        Instant::now().checked_sub(MIRROR_LAG + std::time::Duration::from_secs(1)).expect("an instant in the past")
+    }
+
+    #[test]
+    fn a_card_closed_by_a_lagging_mirror_keeps_what_was_typed() {
+        let (mut app, hold) = mirrored();
+        hold.set(true);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        edit(&mut app, |c| {
+            c.summary = "Stampante bloccata".into();
+            c.notes = "Driver reinstallato".into();
+            c.billable = false;
+        });
+        frame(&mut app);
+        assert!(app.timer.card.is_some(), "a lagging mirror does not close the card at once");
+        // Still missing after the lag while the server answers: closed, but nothing typed is lost.
+        edit(&mut app, |c| c.missing_since = Some(beyond_the_lag()));
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        let kept = Draft { notes: "Driver reinstallato".into(), summary: Some("Stampante bloccata".into()), billable: Some(false) };
+        assert_eq!(app.timer.drafts.get(&11), Some(&kept));
+        // The snapshot arrives: it runs with nothing saved yet, and the draft waits for it.
+        hold.set(false);
+        frame(&mut app);
+        assert!(app.data().intervention(11).is_some_and(|i| i.running() && i.summary.is_empty() && i.billable));
+        assert!(app.timer.drafts.contains_key(&11));
+        // Reopened from the chip: everything typed is back, and closing saves the summary.
+        open_running(&mut app, 11, false);
+        let c = card(&app);
+        assert_eq!((c.summary.as_str(), c.notes.as_str(), c.billable), ("Stampante bloccata", "Driver reinstallato", false));
+        assert!(app.timer.drafts.is_empty());
+        apply(&mut app, Action::Close);
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("running");
+        assert_eq!((i.summary.as_str(), i.billable), ("Stampante bloccata", false));
+        assert_eq!(app.timer.drafts.get(&11).map(|d| d.notes.as_str()), Some("Driver reinstallato"));
+        // Or stopped with `x` without reopening it: the draft goes with the stop.
+        let (mut app, hold) = mirrored();
+        hold.set(true);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        edit(&mut app, |c| {
+            c.summary = "Rete lenta".into();
+            c.notes = "Switch sostituito".into();
+            c.billable = false;
+            c.missing_since = Some(beyond_the_lag());
+        });
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        hold.set(false);
+        frame(&mut app);
+        stop_mine(&mut app);
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("stopped");
+        assert!(!i.running());
+        assert_eq!((i.summary.as_str(), i.billable), ("Rete lenta", false));
+        assert!(i.notes.contains("Switch sostituito"), "{}", i.notes);
+        assert!(app.timer.drafts.is_empty());
+        // Deleted once the mirror held it: closed, and nothing is kept for it.
+        let (mut app, _hold) = mirrored();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        frame(&mut app);
+        edit(&mut app, |c| c.notes = "Da buttare".into());
+        app.session.execute("intervention.remove", &json!({"id": 11}));
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        assert!(app.timer.drafts.is_empty());
+    }
+
+    #[test]
+    fn a_row_start_keeps_an_unsent_form_and_runs_in_the_chip() {
+        // A past-work entry for Lunaria (1) is half typed; the PC of Ferramenta Corvo (2, PC 4)
+        // is started from its row.
+        let mut app = demo_en();
+        open_log(&mut app, Some(1), Some(1));
+        edit(&mut app, |c| {
+            c.summary = "Backup NAS".into();
+            c.notes = "Dischi verificati".into();
+        });
+        start_now(&mut app, 4);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer), (Mode::Log, Some(1)), "the form stays");
+        assert_eq!((c.summary.as_str(), c.notes.as_str()), ("Backup NAS", "Dischi verificati"));
+        // The timer runs all the same, for the PC started.
+        let running: Vec<_> = app.data().interventions.iter().filter(|i| i.running() && i.device_id == Some(4)).collect();
+        assert_eq!(running.len(), 1);
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started for Ferramenta Corvo"));
+        // A form with nothing typed becomes the running card, as before.
+        let mut app = demo_en();
+        open_log(&mut app, Some(1), Some(1));
+        start_now(&mut app, 4);
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Running);
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started"));
+    }
+
+    #[test]
+    fn a_refused_row_start_keeps_an_unsent_form_for_another_customer() {
+        // Lunaria (1) has the consent; Elio Brina (3, PC 5) has not.
+        for lang in Language::ALL {
+            let mut app = DeskApp::demo();
+            app.language = lang;
+            open_log(&mut app, Some(1), Some(1));
+            edit(&mut app, |c| {
+                c.summary = "Backup NAS".into();
+                c.notes = "Dischi verificati".into();
+            });
+            start_now(&mut app, 5);
+            frame(&mut app);
+            let c = card(&app);
+            assert_eq!((c.mode, c.target.customer), (Mode::Log, Some(1)), "the form stays");
+            assert_eq!((c.summary.as_str(), c.notes.as_str()), ("Backup NAS", "Dischi verificati"));
+            assert!(c.refusal.is_none() && c.error.is_empty(), "no panel for the wrong customer");
+            let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            let expected = match lang {
+                Language::En => "Not started for Elio Brina: Remote-assistance consent is missing",
+                Language::It => "Non avviato per Elio Brina: Il consenso all'assistenza remota è mancante",
+            };
+            assert_eq!(toast, expected);
+            assert!(app.data().intervention(11).is_none());
+            // The form still saves.
+            edit(&mut app, |c| c.minutes = "30".into());
+            submit_log(&mut app, false);
+            frame(&mut app);
+            assert!(app.timer.card.is_none());
+            assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some("Backup NAS"));
+        }
+        // A form with nothing typed gives way to the refusal (nothing is lost).
+        let mut app = demo_en();
+        open_start(&mut app, Some(1), Some(1));
+        start_now(&mut app, 5);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer), (Mode::Start, Some(3)));
+        assert!(c.refusal.is_some());
+    }
+
+    /// The demo desk behind a hostile server: its answers to `intervention.start` carry a link of
+    /// the server's own, and the data it shows may differ from the desk's (`shown`).
+    struct Hostile {
+        desk: crate::Session,
+        shown: Option<Data>,
+    }
+
+    impl crate::DeskSession for Hostile {
+        fn data(&self) -> &Data {
+            self.shown.as_ref().unwrap_or_else(|| self.desk.data())
+        }
+        fn actor(&self) -> &str {
+            self.desk.actor()
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.desk.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.desk.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            let mut done = self.desk.pump();
+            for c in &mut done {
+                if c.command == "intervention.start"
+                    && let Ok(v) = c.result.as_mut()
+                {
+                    v["connect"]["uri"] = json!("https://evil.test/phish");
+                }
+            }
+            done
+        }
+        fn jobs_pending(&self) -> usize {
+            0
+        }
+        fn revision(&self) -> u64 {
+            self.desk.revision()
+        }
+        fn server(&self) -> String {
+            "https://hostile.test".into()
+        }
+    }
+
+    #[test]
+    fn the_link_of_a_start_comes_from_the_desk_never_from_the_answer() {
+        let mut app = DeskApp::new(Box::new(Hostile { desk: crate::Session::demo(), shown: None }));
+        app.language = Language::En;
+        // Elio Brina (3) has no consent: the link waits for the answer of the start anyway.
+        start_now(&mut app, 5);
+        frame(&mut app);
+        assert!(app.requests.is_empty());
+        edit_refusal(&mut app, |r| r.reason = "agreed on the phone".into());
+        submit_start(&mut app, true);
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Running);
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/300400500".into())], "the PC's own link");
+    }
+
+    #[test]
+    fn a_rustdesk_id_that_is_not_valid_opens_nothing() {
+        // A desk file edited by hand: PC 4's ID would run commands in a Windows shell.
+        use crate::DeskSession;
+        let desk = crate::Session::demo();
+        let mut shown = desk.data().clone();
+        for d in shown.devices.iter_mut().filter(|d| d.id == 4) {
+            d.rustdesk_id = "123456&calc.exe&rem".into();
+        }
+        let mut app = DeskApp::new(Box::new(Hostile { desk, shown: Some(shown) }));
+        app.language = Language::It;
+        let warning = "L'ID RustDesk di questo PC non è valido: correggilo nella scheda del PC";
+        // The fast path from a row: no link in the click's frame, nor from the start's answer.
+        start_now(&mut app, 4);
+        assert!(app.requests.is_empty());
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Running);
+        assert!(app.requests.is_empty(), "{:?}", app.requests);
+        assert_eq!(app.status, warning);
+        // Connect again (the card's button, `c`): nothing opened, no access recorded.
+        app.status.clear();
+        let jobs = app.jobs.len();
+        apply(&mut app, Action::Connect(4));
+        assert!(app.requests.is_empty(), "{:?}", app.requests);
+        assert_eq!(app.jobs.len(), jobs, "no device.connect");
+        assert_eq!(app.status, warning);
+        frame(&mut app);
+        // A valid ID still opens.
+        app.connect(1);
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/100200300".into())]);
     }
 
     #[test]

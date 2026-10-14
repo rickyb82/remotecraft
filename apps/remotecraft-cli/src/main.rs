@@ -1,7 +1,7 @@
 //! RemoteCraft headless.
 //!
 //! ```text
-//! remotecraft-cli serve [--bind 127.0.0.1:7979] [--token SECRET] [--static DIR]   # HTTP API (and the web app)
+//! remotecraft-cli serve [--bind 127.0.0.1:7979] [--static DIR] [--allow-origin URL,…]   # HTTP API (and the web app)
 //! remotecraft-cli mcp                                                # MCP server on stdio (local desk)
 //! remotecraft-cli mcp --server URL --token USER_TOKEN                # MCP for one technician of a server
 //! remotecraft-cli customers [QUERY]                                  # find customers
@@ -18,7 +18,9 @@
 //! remotecraft-cli commands                                           # every command and its parameters
 //! ```
 //! `--home DIR` (or `REMOTECRAFT_HOME`) selects the data directory, `--as NAME` (or
-//! `REMOTECRAFT_USER`) the technician, `--demo` the built-in demo desk (in memory).
+//! `REMOTECRAFT_USER`) the technician, `--demo` the built-in demo desk (in memory). `serve`
+//! takes its service token from `REMOTECRAFT_TOKEN` (or `--token`, visible to other users in
+//! the process list): at least 32 characters, e.g. `openssl rand -hex 32`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod serve;
@@ -32,7 +34,7 @@ use remotecraft_mcp::{Runner, Server};
 use serde_json::{Value, json};
 
 const USAGE: &str = "Usage:
-  remotecraft-cli serve [--bind 127.0.0.1:7979] [--token SECRET] [--static DIR]
+  remotecraft-cli serve [--bind 127.0.0.1:7979] [--token SECRET] [--static DIR] [--allow-origin URL,...]
   remotecraft-cli mcp [--as NAME]
   remotecraft-cli mcp --server URL --token USER_TOKEN
   remotecraft-cli customers [QUERY]
@@ -48,7 +50,7 @@ const USAGE: &str = "Usage:
   remotecraft-cli run COMMAND [JSON]
   remotecraft-cli commands
 Options: --home DIR (data directory), --as NAME (technician), --demo (the built-in demo desk)
-Environment: REMOTECRAFT_HOME, REMOTECRAFT_USER, REMOTECRAFT_TOKEN, REMOTECRAFT_BIND,\n  REMOTECRAFT_RUSTDESK_HOST, REMOTECRAFT_RUSTDESK_KEY_FILE, REMOTECRAFT_RUSTDESK_CHECK_HOST";
+Environment: REMOTECRAFT_HOME, REMOTECRAFT_USER, REMOTECRAFT_TOKEN (better than --token: at least 32 characters,\n  openssl rand -hex 32), REMOTECRAFT_BIND, REMOTECRAFT_STATIC, REMOTECRAFT_ALLOW_ORIGIN, REMOTECRAFT_RUSTDESK_HOST,\n  REMOTECRAFT_RUSTDESK_KEY_FILE, REMOTECRAFT_RUSTDESK_CHECK_HOST";
 
 struct Opts {
     args: Vec<String>,
@@ -228,6 +230,7 @@ fn run(raw: Vec<String>) -> Result<(), String> {
                 token: flag(&rest, "--token").or_else(|| env("REMOTECRAFT_TOKEN")).unwrap_or_default(),
                 tokens_dir: d.paths().map(|p| p.dir.clone()),
                 static_dir: flag(&rest, "--static").or_else(|| env("REMOTECRAFT_STATIC")).map(PathBuf::from),
+                allow_origins: serve::parse_origins(&flag(&rest, "--allow-origin").or_else(|| env("REMOTECRAFT_ALLOW_ORIGIN")).unwrap_or_default()),
             };
             serve::run_server(d, opts)
         }
@@ -426,6 +429,36 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    /// A service token long enough for the server.
+    const SVC: &str = "test-service-token-0123456789abcdef";
+
+    fn server_options() -> serve::Options {
+        serve::Options { bind: "127.0.0.1:0".into(), token: SVC.into(), tokens_dir: None, static_dir: None, allow_origins: Vec::new() }
+    }
+
+    #[test]
+    fn a_rustdesk_id_that_is_not_one_is_cleared_on_load() {
+        // `123456&calc.exe&rem` in desk.json used to load without a word and come back in
+        // `rustdesk://connection/new/123456&calc.exe&rem`, which the desktop app hands to
+        // the system to open.
+        let dir = std::env::temp_dir().join(format!("remotecraft-cli-badid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("desk.json"),
+            r#"{"customers":[{"id":1,"name":"Rossi"}],"devices":[{"id":1,"customer_id":1,"name":"PC","rustdesk_id":"123456&calc.exe&rem"}]}"#,
+        )
+        .unwrap();
+        let mut desk = Desk::open(remotecraft_engine::Paths::under(&dir)).unwrap();
+        let status = desk.execute("app.status", &json!({})).unwrap();
+        assert_eq!(status["problems"], json!(["device 1: invalid RustDesk ID cleared"]));
+        let device = desk.execute("device.get", &json!({"device": 1})).unwrap();
+        assert_eq!(device["device"]["rustdesk_id"], "");
+        assert!(device["device"].get("connect_uri").is_none(), "{device}");
+        assert!(!device.to_string().contains("calc.exe"), "{device}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn options_and_positionals() {
         let raw: Vec<String> =
@@ -442,7 +475,7 @@ mod tests {
     fn remote_desk_mirrors_the_server() {
         use remotecraft_engine::{Completed, DeskSession};
         use remotecraft_remote::RemoteDesk;
-        let opts = serve::Options { bind: "127.0.0.1:0".into(), token: "svc".into(), tokens_dir: None, static_dir: None };
+        let opts = server_options();
         let listener = serve::bind(&opts).unwrap();
         let addr = listener.local_addr().unwrap();
         let mut desk = Desk::demo();
@@ -459,7 +492,7 @@ mod tests {
             }
             false
         }
-        let mut r = RemoteDesk::new(&format!("http://{addr}"), "svc");
+        let mut r = RemoteDesk::new(&format!("http://{addr}"), SVC);
         let mut done = Vec::new();
         assert!(pump_until(&mut r, &mut done, &|r, _| r.problem().is_none() && !r.data().customers.is_empty()), "{:?}", r.problem());
         assert_eq!(r.data().customers.len(), 3);
@@ -486,17 +519,17 @@ mod tests {
 
     #[test]
     fn mcp_over_http_reaches_the_server() {
-        let opts = serve::Options { bind: "127.0.0.1:0".into(), token: "svc".into(), tokens_dir: None, static_dir: None };
+        let opts = server_options();
         let listener = serve::bind(&opts).unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || serve::serve(listener, Desk::demo(), opts));
-        let mut r = RemoteRunner::new(&format!("http://{addr}"), "svc");
+        let mut r = RemoteRunner::new(&format!("http://{addr}"), SVC);
         let v = r.run("device.find", json!({"rustdesk_id": "200300400"})).unwrap();
         assert_eq!(v["devices"][0]["customer"]["name"], "Ferramenta Corvo");
         assert!(r.run("customer.get", json!({"customer": 999})).unwrap_err().contains("no customer"));
         let mut bad = RemoteRunner::new(&format!("http://{addr}"), "wrong");
         assert!(bad.run("app.status", json!({})).unwrap_err().contains("token"));
-        let mut s = Server::new(RemoteRunner::new(&format!("http://{addr}"), "svc"));
+        let mut s = Server::new(RemoteRunner::new(&format!("http://{addr}"), SVC));
         let out = s
             .handle(
                 &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "find_customers", "arguments": {"query": "lunaria"}}}),

@@ -129,6 +129,7 @@ pub const LABELS: &[&str] = &[
     "Privacy review: 1 finding",
     "Privacy review: {n} findings",
     "Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}",
+    crate::BAD_RUSTDESK_ID,
     "Privacy notice not delivered",
     "Privacy notice outdated",
     "Remote assistance consent missing",
@@ -224,6 +225,9 @@ mod tests {
             "il consenso del cliente all'assistenza remota è mancante: registralo prima, oppure indica il motivo per procedere (ad esempio la persona ha acconsentito al telefono)"
         );
         assert_eq!(Language::En.tr_message("intervention 5 is already closed"), "intervention 5 is already closed");
+        assert_eq!(Language::It.tr_message("device 3: invalid RustDesk ID cleared"), "il PC 3: ID RustDesk non valido, cancellato");
+        assert_eq!(Language::It.tr_message("the server is busy, try again"), "il server è occupato, riprova");
+        assert_eq!(Language::It.tr_message("the request is larger than 1048576 bytes"), "la richiesta supera 1048576 bytes");
         // The audit log's details: the reason typed stays as typed.
         assert_eq!(Language::It.tr_message("erasure: richiesta"), "cancellazione: richiesta");
         assert_eq!(Language::It.tr_message("consent override: contract expired, missing form"), "consenso forzato: contract expired, missing form");

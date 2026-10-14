@@ -265,7 +265,9 @@ impl Data {
     }
 
     /// Checks that ids are unique and references point somewhere, and moves the counters past
-    /// the highest ids (a file edited by hand must not make the next record reuse an id).
+    /// the highest ids (a file edited by hand must not make the next record reuse an id). A
+    /// RustDesk ID that is not one (`123456&calc.exe`: it ends up in links and command lines)
+    /// is cleared and reported; a valid one is kept in its canonical form.
     pub fn repair(&mut self) -> Vec<String> {
         let mut problems = Vec::new();
         let max = |ids: &mut dyn Iterator<Item = u64>| ids.max().unwrap_or(0);
@@ -282,6 +284,15 @@ impl Data {
             }
             fresh
         });
+        for d in &mut self.devices {
+            match crate::rustdesk::normalize(&d.rustdesk_id) {
+                Ok(id) => d.rustdesk_id = id,
+                Err(_) => {
+                    d.rustdesk_id.clear();
+                    problems.push(format!("device {}: invalid RustDesk ID cleared", d.id));
+                }
+            }
+        }
         let customers: std::collections::HashSet<u64> = self.customers.iter().map(|c| c.id).collect();
         for d in &self.devices {
             if !customers.contains(&d.customer_id) {
@@ -332,6 +343,24 @@ mod tests {
         d.customers.push(Customer { id: 0, ..Customer::default() });
         d.repair();
         assert_eq!(d.customers.len(), 1);
+    }
+
+    #[test]
+    fn repair_clears_rustdesk_ids_that_are_not_ids() {
+        // Edited by hand (a synced folder, a restored backup): the ID ends up in a
+        // `rustdesk://` link the desktop app opens and in `rustdesk --connect`.
+        let text = r#"{"customers":[{"id":1,"name":"X"}],"devices":[
+            {"id":1,"customer_id":1,"rustdesk_id":"123456&calc.exe&rem"},
+            {"id":2,"customer_id":1,"rustdesk_id":"123 456 789"},
+            {"id":3,"customer_id":1,"rustdesk_id":"\"x\" & y"},
+            {"id":4,"customer_id":1,"rustdesk_id":""}]}"#;
+        let mut d: Data = serde_json::from_str(text).unwrap();
+        let problems = d.repair();
+        assert_eq!(problems, vec!["device 1: invalid RustDesk ID cleared", "device 3: invalid RustDesk ID cleared"]);
+        let ids: Vec<&str> = d.devices.iter().map(|d| d.rustdesk_id.as_str()).collect();
+        assert_eq!(ids, ["", "123456789", "", ""]);
+        // Repaired data has nothing left to report.
+        assert!(d.repair().is_empty());
     }
 
     #[test]

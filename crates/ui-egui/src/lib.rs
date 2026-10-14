@@ -76,11 +76,14 @@ impl Screen {
 /// Something only the host app can do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
-    /// Open a link: `rustdesk://connection/new/<id>` in the RustDesk client, `https://…` in
-    /// the browser.
+    /// Open a link in the RustDesk client: `rustdesk://connection/new/<id>`, the only link the
+    /// interface opens, built by [`connect_link`] from a valid ID.
     OpenUrl(String),
     /// Save bytes somewhere (a GDPR export).
     SaveFile { name: String, data: Vec<u8> },
+    /// Forget the server and token this browser keeps and reload without them (Settings, on a
+    /// remote desk: a shared or lost PC). Nothing to do for a local desk.
+    ForgetToken,
 }
 
 /// What a queued command was for: how its outcome is applied when it completes.
@@ -140,6 +143,12 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Enter", "Save the form, or start on the PC found by the search"),
     ("?", "This help"),
 ];
+
+/// A key of [`SHORTCUTS`] as this platform's keyboard says it: the shortcuts listen for
+/// `Modifiers::COMMAND`, which is Cmd on a Mac (or an iPad), so `Ctrl+` reads `Cmd+` there.
+pub fn shortcut_key(os: egui::os::OperatingSystem, key: &str) -> std::borrow::Cow<'_, str> {
+    if os.is_mac() { key.replace("Ctrl+", "Cmd+").into() } else { key.into() }
+}
 
 /// A question before an action that cannot be undone: `DeskApp::ask(Confirm { .. })`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,6 +228,19 @@ pub struct DeskApp {
     auto_settings: bool,
     last_revision: Option<u64>,
 }
+
+/// The link that opens the RustDesk client on a PC with this ID, only when the ID is already in
+/// its canonical form (`core::rustdesk::normalize` gives it back unchanged): an ID read from a
+/// hostile desk file or server (`123456&calc.exe`) never reaches the host's opener.
+pub fn connect_link(rustdesk_id: &str) -> Option<String> {
+    match core::rustdesk::normalize(rustdesk_id) {
+        Ok(id) if !id.is_empty() && id == rustdesk_id => Some(core::rustdesk::connect_uri(&id)),
+        _ => None,
+    }
+}
+
+/// What the status bar says instead of opening a link to a PC whose RustDesk ID is not valid.
+pub const BAD_RUSTDESK_ID: &str = "This PC's RustDesk ID is not valid: correct it in the PC's details";
 
 /// The name of a customer, for rows and chips.
 pub fn customer_name(data: &Data, id: u64) -> String {
@@ -568,16 +590,20 @@ impl DeskApp {
     }
 
     /// Opens the RustDesk client on a device: the link goes out in this frame (browsers only
-    /// open custom schemes on a click), `device.connect` records it and reports the consent.
+    /// open custom schemes on a click), `device.connect` records it and reports the consent. An
+    /// ID that is not valid opens nothing and records nothing: the status bar says why.
     pub fn connect(&mut self, device: u64) {
         if let Some(d) = self.session.data().device(device)
             && !d.rustdesk_id.is_empty()
         {
-            self.requests.push(Request::OpenUrl(core::rustdesk::connect_uri(&d.rustdesk_id)));
-            self.status = self.language.fill(
-                "Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}",
-                &[("command", &core::rustdesk::connect_command(&d.rustdesk_id))],
-            );
+            let Some(uri) = connect_link(&d.rustdesk_id) else {
+                self.status = self.tr(BAD_RUSTDESK_ID).to_string();
+                return;
+            };
+            let command = core::rustdesk::connect_command(&d.rustdesk_id);
+            self.requests.push(Request::OpenUrl(uri));
+            self.status =
+                self.language.fill("Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}", &[("command", &command)]);
         }
         self.run_as("device.connect", json!({"device": device}), Intent::Devices(devices::Intent::Connect));
     }
@@ -1027,6 +1053,32 @@ mod tests {
         frame(&mut app);
         assert_eq!(app.session.revision(), rev, "a read does not move the revision");
         assert_eq!(connects(&app), before + 1, "the new access is listed");
+    }
+
+    #[test]
+    fn a_link_is_built_only_from_a_canonical_rustdesk_id() {
+        assert_eq!(connect_link("100200300").as_deref(), Some("rustdesk://connection/new/100200300"));
+        assert_eq!(connect_link("studio_PC-01").as_deref(), Some("rustdesk://connection/new/studio_PC-01"));
+        for bad in ["", "123456&calc.exe&rem", "123456\"&calc", "100 200 300", "100-200-300", "12345", "https://evil.test", "1234567890123456789"] {
+            assert_eq!(connect_link(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_period_to_the_last_day_of_9999_reports_every_intervention() {
+        // `9999-12-31`, a common "no end": the report counts everything, without an error.
+        let mut app = DeskApp::demo();
+        app.work_filter.from = "2000-01-01".into();
+        app.work_filter.to = "9999-12-31".into();
+        app.go(Screen::Reports);
+        frame(&mut app);
+        frame(&mut app);
+        assert!(app.reports.error.is_empty(), "{}", app.reports.error);
+        let report = app.reports.report.clone().unwrap_or_default();
+        assert!(report["to"].as_str().is_some_and(|t| t.starts_with("9999-12-31T")), "{report}");
+        let counted: u64 = report["rows"].as_array().into_iter().flatten().filter_map(|r| r["interventions"].as_u64()).sum();
+        let closed = app.data().interventions.iter().filter(|i| !i.running()).count();
+        assert!(closed > 0 && counted == closed as u64, "{counted} of {closed}");
     }
 
     #[test]

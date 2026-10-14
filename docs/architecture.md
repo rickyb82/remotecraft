@@ -39,14 +39,41 @@ of a file another process wrote. Results are routed back to the screen that aske
   desk's lock; the CLI and the MCP server simply wait. Every `pump` also calls `Desk::refresh`
   (a stat of the desk file), and the desktop app repaints at least every 2 s, so what the MCP
   server or the CLI writes shows in an idle window.
-- **Remote session.** Polls are timed on a monotonic clock (`web_time::Instant`); a poll still
-  unanswered after 30 s (the browser's fetch has no timeout) is given up and another goes out,
-  and the late answer of a given-up poll is ignored (each carries its poll number).
-  `problem()` is `connecting` until the first answer, then `None` or a stable prefix and the
-  detail: `unauthorized: ` (401/403, a revoked token), `incompatible: ` (an answer the client
-  cannot read: not a RemoteCraft server, another version, too large) or `unreachable: ` (no
-  connection, no answer, 5xx from a proxy). Only a poll that succeeds clears it; command
+- **Remote session.** Polls are timed on a monotonic clock (`web_time::Instant`). A poll still
+  unanswered after its window (30 s; the browser's fetch has no timeout) is given up and
+  another goes out with the window doubled, up to 60 s, back to 30 s on the next answer; the
+  late answer of a given-up poll still counts unless a newer one was already applied (each
+  carries its poll number), so a slow download of a large desk is not thrown away. Answers are
+  streamed and cut off past 64 MiB (an early `Content-Length` check first), so a hostile
+  server cannot fill the client's memory. `problem()` is `connecting` until the first answer,
+  then `None` or a stable prefix and the detail: `unauthorized: ` (401/403, a revoked token, or
+  a token withheld from plain `http://` to another machine), `incompatible: ` (an answer the
+  client cannot read: not a RemoteCraft server, another version, too large) or `unreachable: `
+  (no connection, no answer, 5xx from a proxy). Only a poll that succeeds clears it; command
   answers do not.
+- **Hosts.** The interface asks the apps to open only `rustdesk://connection/new/<ID>` built
+  from an ID `rustdesk::normalize` accepts (`connect_link`), never a link from an answer; the
+  apps check it again (the desktop opens it without a shell: `explorer.exe` on Windows, never
+  `cmd /C start`). The web app reads `token`, `server` and `lang` from the URL fragment first
+  (`#token=…` never reaches the server or a proxy's logs), removes the token from the address
+  bar, keeps the server and the token as one pair (a saved token goes only to its own server;
+  the page's own origin comes before a saved server) and can forget them from Settings.
+
+## Server
+
+`remotecraft-cli serve` is a small thread-per-connection HTTP server; its defences are in
+`apps/remotecraft-cli/src/serve.rs`. At most 64 connections live at once (more get 503), the
+request head must arrive whole within 10 s and 16 KiB (100 headers), and the caller is
+authenticated from the head before any body is read (bodies up to 1 MiB, `POST /api/cmd` only,
+`Content-Type: application/json` or 415). A failed token waits 250 ms; tokens are compared in
+constant time and the service token needs 32 characters. Without a service token the server
+binds only to loopback and answers only to a loopback `Host` (no DNS rebinding) and to loopback
+origins or those given with `--allow-origin`; with one, the API is bearer-only and any origin
+may call it. Static files (`--static`, the web app) are served only from inside their
+directory: the decoded path must be plain components, the canonical file must lie under the
+canonical directory, and only regular files up to 64 MiB are streamed (hashed bundles cached as
+immutable, `index.html` never). Every answer carries `Referrer-Policy: no-referrer` and
+`X-Content-Type-Options: nosniff`.
 
 ## Commands
 

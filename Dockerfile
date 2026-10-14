@@ -20,10 +20,16 @@ RUN RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" cargo build --release -
  && cd apps/remotecraft-web && RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" trunk build --release
 
 FROM debian:bookworm-slim
+# Two users with fixed ids (the owners of the bind-mounted directories on the host):
+# remotecraft (10001) runs the desk API and alone owns /data/desk; rustdesk (10002) runs hbbs
+# and hbbr, which face the internet, and owns /data/rustdesk.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --home-dir /data --shell /usr/sbin/nologin remotecraft
+ && groupadd --system --gid 10001 remotecraft \
+ && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /data/desk --shell /usr/sbin/nologin remotecraft \
+ && groupadd --system --gid 10002 rustdesk \
+ && useradd --system --uid 10002 --gid 10002 --no-create-home --home-dir /data/rustdesk --shell /usr/sbin/nologin rustdesk
 COPY --from=rustdesk /usr/bin/hbbs /usr/bin/hbbr /usr/local/bin/
 COPY --from=build /src/target/release/remotecraft-cli /usr/local/bin/remotecraft-cli
 COPY --from=build /src/dist/web /app/web

@@ -1,10 +1,13 @@
 # RemoteCraft: RustDesk Server OSS (hbbs + hbbr) and the support desk, in one container.
 #
-#   REMOTECRAFT_TOKEN=un-segreto-lungo RUSTDESK_HOST=rustdesk.siriustec.it docker compose up -d
-#   (or put the variables in a .env file next to this one)
+#   echo "REMOTECRAFT_TOKEN=$(openssl rand -hex 32)" >> .env      # once: a new random token
+#   echo "RUSTDESK_HOST=rustdesk.siriustec.it" >> .env
+#   docker compose up -d
 #
-# ./data keeps the RustDesk key pair, as in the previous setup: existing clients keep working.
-# ./desk keeps customers, PCs, interventions, the GDPR record and the audit log.
+# ./data keeps the RustDesk key pair, as in the previous setup: existing clients keep working
+# (owned by uid 10002, the user running hbbs and hbbr).
+# ./desk keeps customers, PCs, interventions, the GDPR record and the audit log (owned by uid
+# 10001, the user running the desk API).
 # Back up both directories.
 
 services:
@@ -23,7 +26,7 @@ services:
       - "21117:21117"           # TCP: relay, when the direct connection fails
       - "127.0.0.1:7979:7979"   # the desk API and web app: only for the framework / reverse proxy on this machine
     environment:
-      REMOTECRAFT_TOKEN: ${REMOTECRAFT_TOKEN:?set the service token for the desk API}
+      REMOTECRAFT_TOKEN: ${REMOTECRAFT_TOKEN:?set the service token for the desk API (openssl rand -hex 32)}
       RUSTDESK_HOST: ${RUSTDESK_HOST:-}
       TZ: ${TZ:-Europe/Rome}
     volumes:

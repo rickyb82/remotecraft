@@ -66,6 +66,18 @@ pub(super) const MESSAGES: &[(&str, &str)] = &[
     ("bad answer: ", "risposta non valida: "),
     ("the answer is too large", "la risposta è troppo grande"),
     ("server answered ", "il server ha risposto "),
+    ("the server does not answer", "il server non risponde"),
+    ("the server sent no answer", "il server non ha inviato risposta"),
+    ("the token is sent only to an https:// address or to this computer", "il token viene inviato solo a un indirizzo https:// o a questo computer"),
+    (
+        "without a token the server answers only to this machine (Host: 127.0.0.1 or localhost)",
+        "senza token il server risponde solo a questo computer (Host: 127.0.0.1 o localhost)",
+    ),
+    ("origin not allowed (start the server with --allow-origin ORIGIN)", "origine non consentita (avvia il server con --allow-origin ORIGINE)"),
+    ("user tokens need a server with a service token (--token)", "i token dei tecnici richiedono un server con un token di servizio (--token)"),
+    ("send the command as Content-Type: application/json", "invia il comando come Content-Type: application/json"),
+    ("the request is larger than ", "la richiesta supera "),
+    ("the server is busy, try again", "il server è occupato, riprova"),
 ];
 
 /// Engine phrases found inside a message (after a name or a number), replaced wherever they
@@ -88,6 +100,7 @@ pub(super) const INFIX: &[(&str, &str)] = &[
         "ha l'accesso non presidiato ma il consenso del cliente all'accesso non presidiato è ",
     ),
     ("` of ", "` di "),
+    (": invalid RustDesk ID cleared", ": ID RustDesk non valido, cancellato"),
     (": update or retire that one first", ": aggiorna o dismetti prima quel PC"),
     (": retire that one first", ": dismetti prima quel PC"),
     ("(e.g. the person agreed on the phone)", "(ad esempio la persona ha acconsentito al telefono)"),
@@ -151,6 +164,9 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Privacy review: {n} findings" => "Revisione privacy: {n} segnalazioni",
         "Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}" => {
             "Apro RustDesk… Se non succede niente, installa il client RustDesk oppure esegui: {command}"
+        }
+        "This PC's RustDesk ID is not valid: correct it in the PC's details" => {
+            "L'ID RustDesk di questo PC non è valido: correggilo nella scheda del PC"
         }
         "Privacy notice not delivered" => "Informativa non consegnata",
         "Privacy notice outdated" => "Informativa non aggiornata",

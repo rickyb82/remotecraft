@@ -16,7 +16,7 @@ impl App {
         for request in std::mem::take(&mut self.0.requests) {
             match request {
                 Request::OpenUrl(url) => {
-                    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("rustdesk://") {
+                    if is_rustdesk_link(&url) {
                         open_with_system(&url);
                     }
                 }
@@ -28,6 +28,8 @@ impl App {
                         }
                     }
                 }
+                // A local desk keeps no token.
+                Request::ForgetToken => {}
             }
         }
     }
@@ -49,17 +51,28 @@ fn probe(host: &str, port: u16) -> Result<u64, String> {
     Err(last)
 }
 
-/// Opens a URL with the system's default application (the RustDesk client for `rustdesk://`).
-fn open_with_system(target: &str) {
-    let _ = std::process::Command::new(if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(windows) {
-        "cmd"
-    } else {
-        "xdg-open"
-    })
-    .args(if cfg!(windows) { vec!["/C", "start", "", target] } else { vec![target] })
-    .spawn();
+/// Whether `url` is a link the app opens: exactly `rustdesk://connection/new/<ID>` with an ID
+/// RustDesk accepts as it is (what the interface builds). Anything else (`http(s)`, an ID read
+/// from a tampered desk file with `&`, quotes or spaces) is not handed to the system.
+fn is_rustdesk_link(url: &str) -> bool {
+    url.strip_prefix("rustdesk://connection/new/")
+        .is_some_and(|id| remotecraft_ui_egui::core::rustdesk::normalize(id).is_ok_and(|n| !n.is_empty() && n == id))
+}
+
+/// Opens a `rustdesk://` link with the system's handler (the RustDesk client), with the link as
+/// one argument and no shell in between (on Windows `cmd /C start` would parse it again).
+fn open_with_system(url: &str) {
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let program = "xdg-open";
+    if let Ok(mut child) = std::process::Command::new(program).arg(url).spawn() {
+        // Reaped off the interface's thread, so no zombie is left behind (`Builder` does not
+        // panic when the system refuses a thread).
+        let _ = std::thread::Builder::new().name("open".into()).spawn(move || child.wait());
+    }
 }
 
 impl eframe::App for App {
@@ -131,4 +144,37 @@ fn main() -> Result<(), String> {
         }),
     )
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_rustdesk_connection_links_reach_the_system() {
+        assert!(is_rustdesk_link("rustdesk://connection/new/123456789"));
+        assert!(is_rustdesk_link("rustdesk://connection/new/ufficio-pc_2"));
+        // An ID from a tampered desk file, shell syntax, anything but the exact link.
+        for bad in [
+            "rustdesk://connection/new/123456&calc.exe&rem",
+            "rustdesk://connection/new/123456\"&calc.exe",
+            "rustdesk://connection/new/123456|calc",
+            "rustdesk://connection/new/123456^&calc",
+            "rustdesk://connection/new/123456%26calc",
+            "rustdesk://connection/new/123 456 789",
+            "rustdesk://connection/new/123-456-789",
+            "rustdesk://connection/new/",
+            "rustdesk://connection/new/12345",
+            "rustdesk://connection/new/12345678901234567",
+            "rustdesk://connection/new/123456789,/select",
+            "rustdesk://connection/new/123456789 /x",
+            "RUSTDESK://connection/new/123456789",
+            "https://example.com",
+            "http://example.com",
+            "file:///etc/passwd",
+            "",
+        ] {
+            assert!(!is_rustdesk_link(bad), "{bad}");
+        }
+    }
 }

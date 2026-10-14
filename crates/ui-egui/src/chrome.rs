@@ -291,9 +291,10 @@ pub fn shortcuts_help(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .show(ui.ctx(), |ui| {
             ui.set_width(440.0);
+            let os = ui.ctx().os();
             egui::Grid::new("shortcuts-grid").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
                 for (key, what) in crate::SHORTCUTS {
-                    ui.label(RichText::new(*key).font(FontId::monospace(13.0)).color(t.accent));
+                    ui.label(RichText::new(crate::shortcut_key(os, key)).font(FontId::monospace(13.0)).color(t.accent));
                     ui.label(RichText::new(app.tr(what)).color(t.ui_text));
                     ui.end_row();
                 }
@@ -357,6 +358,36 @@ mod tests {
         output.textures_delta.clear();
     }
 
+    /// The texts one frame paints, on a context set to `os`.
+    fn texts_on(app: &mut DeskApp, os: egui::os::OperatingSystem) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        ctx.set_os(os);
+        let input =
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))), ..Default::default() };
+        let mut out = Vec::new();
+        // Two frames: a window sizes itself in the first.
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input.clone(), |ui| app.ui(ui));
+            output.textures_delta.clear();
+            out.clear();
+            for c in &output.shapes {
+                walk(&c.shape, &mut out);
+            }
+        }
+        out
+    }
+
+    fn texts_of(app: &mut DeskApp) -> Vec<String> {
+        texts_on(app, egui::os::OperatingSystem::Nix)
+    }
+
     #[test]
     fn a_remote_problem_gives_the_advice_of_its_class() {
         let it = Language::It;
@@ -372,6 +403,9 @@ mod tests {
             down.contains("Server non raggiungibile (https://desk.test): connection refused") && down.contains("remotecraft-cli serve"),
             "{down}"
         );
+        // A poll given up after its window (the connection dropped while the PC slept).
+        let silent = problem_text(it, url, "unreachable: the server does not answer");
+        assert_eq!(silent, "Server non raggiungibile (https://desk.test): il server non risponde. Avvialo con: remotecraft-cli serve");
         let other = problem_text(Language::En, url, "no intervention 7");
         assert_eq!(other, "Server problem (https://desk.test): no intervention 7");
         // The status bar draws each, and "connecting" as the spinner.
@@ -379,6 +413,29 @@ mod tests {
             let mut app = DeskApp::new(Box::new(Served(Session::demo(), Some(p))));
             frame(&mut app);
         }
+        // The status bar of an Italian web app whose server went silent reads all in Italian.
+        let mut app = DeskApp::new(Box::new(Served(Session::demo(), Some("unreachable: the server does not answer"))));
+        app.language = Language::It;
+        let texts = texts_of(&mut app);
+        assert!(texts.iter().any(|t| t.contains("il server non risponde")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("does not answer")), "{texts:?}");
+    }
+
+    #[test]
+    fn the_help_window_names_the_platforms_modifier() {
+        use egui::os::OperatingSystem;
+        let mut app = DeskApp::demo();
+        app.language = Language::It;
+        app.shortcuts_open = true;
+        let texts = texts_on(&mut app, OperatingSystem::Windows);
+        assert!(texts.iter().any(|t| t == "Ctrl+,") && texts.iter().any(|t| t == "Ctrl+Enter"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Scorciatoie da tastiera"), "{texts:?}");
+        // A Mac listens for Cmd (`Modifiers::COMMAND`): the window says Cmd, never Ctrl.
+        let texts = texts_on(&mut app, OperatingSystem::Mac);
+        assert!(texts.iter().any(|t| t == "Cmd+,") && texts.iter().any(|t| t == "Cmd+R"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("Ctrl+")), "{texts:?}");
+        assert_eq!(crate::shortcut_key(OperatingSystem::Mac, "j / k"), "j / k");
+        assert_eq!(crate::shortcut_key(OperatingSystem::Nix, "Ctrl+R"), "Ctrl+R");
     }
 
     #[test]

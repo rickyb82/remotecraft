@@ -86,8 +86,12 @@ pub fn input(stamp: &str) -> String {
 /// read in this machine's time zone (the browser's on the web), so what the technician types is
 /// what is saved whatever zone the server runs in. `None` when unreadable.
 pub fn stamp_from_input(text: &str, now: DateTime<Utc>) -> Option<String> {
-    time::input_stamp(text, now).ok()
+    // Past year 9999 a stamp is written `+10000-…`: no longer RFC 3339, nor in the stamps' order.
+    time::input_stamp(text, now).ok().filter(|s| time::parse_stamp(s).is_some())
 }
+
+/// The last moment a stamp can hold (stamps are four-digit years).
+const LAST_STAMP: &str = "9999-12-31T23:59:59Z";
 
 /// The end of a period typed in a form (`To`, included) as the stamp the engine compares with,
 /// which is excluded: a date alone (`2026-10-31`, `31/10/2026`) counts the whole day, so it
@@ -98,8 +102,16 @@ pub fn end_stamp_from_input(text: &str, now: DateTime<Utc>) -> Option<String> {
     // The date-only forms `core::time::parse_input` reads (at local midnight).
     for f in ["%Y-%m-%d", "%d/%m/%Y"] {
         if let Ok(day) = NaiveDate::parse_from_str(t, f) {
-            let next = day.succ_opt()?;
-            return stamp_from_input(&next.format("%Y-%m-%d").to_string(), now);
+            if day.year() > 9999 {
+                return None;
+            }
+            let next = day.succ_opt().filter(|d| d.year() <= 9999).and_then(|d| stamp_from_input(&d.format("%Y-%m-%d").to_string(), now));
+            // The last day stamps can hold (`9999-12-31`, a common "no end"): up to its last
+            // second, or to the last stamp when that second is already past it in UTC.
+            return next.or_else(|| {
+                (day.year() == 9999)
+                    .then(|| stamp_from_input(&format!("{} 23:59:59", day.format("%Y-%m-%d")), now).unwrap_or_else(|| LAST_STAMP.to_string()))
+            });
         }
     }
     stamp_from_input(t, now)
@@ -196,8 +208,11 @@ mod tests {
         assert!(short("2026-10-13T11:00:00Z", now, true).contains(':'));
         let this_year = short("2026-03-02T11:00:00Z", now, true);
         assert!(this_year.ends_with("mar"), "{this_year}");
-        assert_eq!(short("2025-03-02T11:00:00Z", now, false), "2025-03-02");
-        assert!(long("2026-03-02T11:00:00Z", false).starts_with("2 Mar 2026, "));
+        // Another year shows the local date (the 2nd or the 3rd, depending on the zone).
+        let other_year = short("2025-03-02T11:00:00Z", now, false);
+        assert!(other_year == "2025-03-02" || other_year == "2025-03-03", "{other_year}");
+        let day = long("2026-03-02T11:00:00Z", false);
+        assert!(day.starts_with("2 Mar 2026, ") || day.starts_with("3 Mar 2026, "), "{day}");
         assert_eq!(duration(45), "45 min");
         assert_eq!(duration(90), "1:30");
         assert_eq!(duration(600), "10:00");
@@ -242,6 +257,24 @@ mod tests {
         assert_eq!(end_stamp_from_input("2026-10-31 18:00", now), stamp_from_input("2026-10-31 18:00", now));
         assert_eq!(end_stamp_from_input("ieri", now), None);
         assert_eq!(end_stamp_from_input("9999-99-99", now), None);
+        // `9999-12-31`, a common "no end": up to its last second, a stamp that still reads and
+        // sorts as one (never `+10000-01-01…`), in either form.
+        for to in ["9999-12-31", "31/12/9999"] {
+            let end = end_stamp_from_input(to, now).unwrap_or_default();
+            assert!(end.starts_with("9999-12-31T") && time::parse_stamp(&end).is_some(), "{to}: {end}");
+            assert!("2026-10-13T12:00:00Z" < end.as_str(), "{end}");
+            assert!(!end_text(&end, false).is_empty(), "{end}");
+        }
+        assert!(end_stamp_from_input("9999-12-30", now).is_some_and(|e| e.starts_with("9999-12-3")));
+        // Past year 9999: a stamp that reads as one (east of UTC, the first hours of 10000 are
+        // still 9999 in UTC), or nothing; a whole day past 9999 is nothing.
+        for typed in ["10000-01-01", "+10000-01-01", "10000-01-01 10:00", "+10000-06-01T10:00:00Z", "99999-01-01"] {
+            for got in [end_stamp_from_input(typed, now), stamp_from_input(typed, now)] {
+                assert!(got.as_deref().is_none_or(|s| time::parse_stamp(s).is_some()), "{typed}: {got:?}");
+            }
+        }
+        assert_eq!(end_stamp_from_input("10000-01-01", now), None);
+        assert_eq!(end_stamp_from_input("01/01/10000", now), None);
         assert_eq!(end_stamp_from_input("", now), Some(time::stamp(now)), "as stamp_from_input: callers skip an empty bound");
         // Shown back as the day it was typed as.
         let shown = end_text(&next_day.unwrap_or_default(), false);

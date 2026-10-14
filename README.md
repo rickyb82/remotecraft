@@ -97,8 +97,8 @@ Sul server, al posto dei due container hbbs/hbbr di prima:
 ```sh
 git clone https://github.com/rickyb82/remotecraft
 cd remotecraft
-cat > .env <<'EOF'
-REMOTECRAFT_TOKEN=un-segreto-lungo-e-casuale
+cat > .env <<EOF
+REMOTECRAFT_TOKEN=$(openssl rand -hex 32)
 RUSTDESK_HOST=rustdesk.siriustec.it
 EOF
 docker compose up -d --build
@@ -125,7 +125,7 @@ Il primo comando mostra server, chiave, stringa di configurazione e nome dell'in
 verifica le porte. Usa sempre `-u remotecraft` con `exec`, così i file restano del servizio.
 
 L'**app web** è su `http://127.0.0.1:7979/` (dietro il proxy HTTPS o il framework): la si apre
-con il token del tecnico, `https://assistenza.example.it/?token=<token>&lang=it` (vedi
+con il token del tecnico, `https://assistenza.example.it/#token=<token>&lang=it` (vedi
 [docs/deploy.md](docs/deploy.md)). L'**app desktop** lavora sul gestionale locale:
 `cargo install --path apps/remotecraft` e poi `remotecraft --as riccardo`, oppure
 `remotecraft --demo` per provarla.

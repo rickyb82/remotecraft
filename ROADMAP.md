@@ -54,3 +54,16 @@
   running card saving its summary when closed, inclusive report periods, singular counts,
   narrow layouts from 1240 px, dark-theme contrast, and `views::review` grouped by customer
   (one pass instead of customers × records).
+- 2026-10-14: verification of those fixes (all 37 confirmed) and a second security review of the
+  server, the remote session and the apps; 6 regressions and 13 findings fixed. The server
+  answers a tokenless caller only on a loopback `Host` and origin (`--allow-origin` for
+  others), requires JSON for commands, authenticates before reading a body (1 MiB), caps
+  connections (64) and the request head (10 s, 16 KiB), streams static files with cache
+  headers, sends `Referrer-Policy: no-referrer`, needs a 32-character service token and waits
+  after a wrong one; `Data::repair` clears RustDesk IDs that are not IDs; the Docker relays run
+  as their own user without the desk's token; private files are created 0600. The web app takes
+  the token from `#token=`, strips it from the address bar, pairs it with its server, never
+  sends it over plain http to another machine, and can forget it from Settings; hosts open only
+  valid `rustdesk://` links (no shell on Windows); answers are streamed with a 64 MiB cap and a
+  slow snapshot is no longer thrown away. The running card keeps its text when the mirror lags,
+  and a start from a row no longer discards an unsent form.

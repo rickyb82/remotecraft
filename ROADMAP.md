@@ -80,3 +80,11 @@
   form takes over the form instead of starting a second timer; Ctrl+R works from text fields
   too; the running card waits for its own command by job, so a stop answered after it moved
   on no longer leaves it stuck.
+- 2026-10-14: quick connection: `device.connect {rustdesk_id}` (and `connect_device` in MCP)
+  opens RustDesk on an ID the desk does not know, recording nothing (digits only; a retired
+  PC's ID connects as that PC, with its customer's consent); *Connect now* where the search
+  finds no PC with that ID, and `Ctrl+Enter`, never for a customer's phone or VAT number. The customer field of the
+  forms keeps its matches listed until one is picked (a click took the focus away and the
+  match with it, so a customer could not be picked with the mouse), picks the only customer a
+  name typed in full finds, and in the PC form offers *Create the customer "…"*; the PC form
+  says what is missing while Save is off.

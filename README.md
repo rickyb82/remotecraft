@@ -37,7 +37,8 @@ scorciatoie da tastiera (`/` cerca, `s` avvia, `x` chiude, `n` nuovo, `?` aiuto)
 
 - **Telefonata in arrivo**: digiti l'ID RustDesk che il cliente legge, `Ctrl+Invio` nella
   ricerca avvia il cronometro e apre il client RustDesk sul suo PC; a fine lavoro scrivi le note
-  e chiudi. Se chiudi o riduci la scheda di un intervento in corso, oggetto e fatturabilità
+  e chiudi. Se l'ID non è nel gestionale, **Collegati subito** (o `Ctrl+Invio`) apre RustDesk su
+  quell'ID senza registrare niente: la password te la detta il cliente e la scrivi in RustDesk. Se chiudi o riduci la scheda di un intervento in corso, oggetto e fatturabilità
   vengono salvati subito; le note restano nella scheda fino allo stop. Nei moduli `Ctrl+Invio`
   salva solo se il cursore è in uno dei loro campi.
 - **Privacy a colpo d'occhio**: ogni cliente ha un indicatore (consenso dato, da sistemare,
@@ -188,6 +189,18 @@ In basso nella finestra principale deve comparire **Pronto**.
    `remotecraft-cli start --device "123 456 789"`; in MCP: `find_device`, `start_intervention`).
    Se manca il consenso all'assistenza remota, l'avvio viene rifiutato finché non lo registri o
    indichi il motivo.
+
+   **Connessione rapida**, per un PC che il gestionale non conosce (un cliente occasionale): la
+   ricerca dice *Nessun PC ha l'ID RustDesk …* e propone **Collegati subito**; `Ctrl+Invio` fa
+   lo stesso. Vale solo per gli ID di sole cifre che nessun PC ha (un PC dismesso si collega
+   dalla sua scheda, con il consenso del suo cliente) e che non sono il telefono o la partita IVA
+   di un cliente. Si apre RustDesk su quell'ID, la password la scrivi in RustDesk
+   e nel gestionale non viene salvato niente: nessun cliente, PC o intervento, e nessun
+   consenso viene controllato (la barra di stato lo ricorda). Dalla riga di comando:
+   `remotecraft-cli run device.connect '{"rustdesk_id": "987 654 321"}'`; in MCP:
+   `connect_device` con `rustdesk_id`. Se poi vuoi tenerne traccia, *Aggiungi un PC con questo
+   ID*: nel campo *Cliente* scegli dall'elenco, oppure **Crea il cliente "…"** con il nome
+   scritto; finché il cliente non è scelto, sotto il modulo compare cosa manca per salvare.
 3. A fine lavoro scrivi le note nella scheda dell'intervento e chiudi (`remotecraft-cli stop
    --notes "cosa ho fatto"`).
 

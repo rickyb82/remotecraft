@@ -38,7 +38,9 @@ fn pick_row(ui: &mut egui::Ui, t: &Tokens, title: &str, sub: &str) -> Response {
     if resp.hovered() {
         p.rect_filled(rect, 6.0, t.hover);
     }
-    let name = widgets::truncate(p, title, FontId::proportional(14.0), t.ui_text, rect.width() * 0.55);
+    // Without a second column the title takes the row.
+    let room = if sub.is_empty() { rect.width() - 16.0 } else { rect.width() * 0.55 };
+    let name = widgets::truncate(p, title, FontId::proportional(14.0), t.ui_text, room);
     p.galley(egui::pos2(rect.left() + 8.0, rect.center().y - name.size().y / 2.0), name, t.ui_text);
     let sub = widgets::truncate(p, sub, FontId::proportional(12.0), t.muted, rect.width() * 0.4);
     p.galley(egui::pos2(rect.right() - 8.0 - sub.size().x, rect.center().y - sub.size().y / 2.0), sub, t.muted);
@@ -46,39 +48,77 @@ fn pick_row(ui: &mut egui::Ui, t: &Tokens, title: &str, sub: &str) -> Response {
 }
 
 /// A form row picking a customer by name, tax id, e-mail or contact. `locked` shows the name
-/// without a field (the customer is fixed). Call inside a two-column `Grid`; ends the row.
-pub fn customer_picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str, p: &mut Picker, locked: bool) {
+/// without a field (the customer is fixed). The matches stay listed until one is picked (a
+/// click takes the focus from the field, so they cannot follow it), and a name typed exactly as
+/// the only customer it finds picks that customer. With `create`, a name no customer has offers
+/// a row that creates it: answers that name when the row is clicked. Call inside a two-column
+/// `Grid`; ends the row.
+pub fn customer_picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str, p: &mut Picker, locked: bool, create: bool) -> Option<String> {
     ui.label(RichText::new(label).color(t.muted));
     if locked {
         ui.label(RichText::new(&p.text).color(t.ui_text));
         ui.end_row();
-        return;
+        return None;
     }
+    let mut created = None;
     ui.vertical(|ui| {
         let r = ui.add(egui::TextEdit::singleline(&mut p.text).hint_text(app.tr("Type a name…")).desired_width(f32::INFINITY));
-        if r.changed() {
-            p.id = None;
-        }
         let fq = fold(p.text.trim());
-        if p.id.is_none() && r.has_focus() && fq.chars().count() >= 2 {
-            let rid = crate::derived::rustdesk_query(&p.text);
-            let data = app.data();
+        let data = app.data();
+        let pickable = |c: &&remotecraft_engine::core::Customer| !c.archived && c.erased_at.is_none();
+        let rid = crate::derived::rustdesk_query(&p.text);
+        if r.changed() {
+            // Only the one customer the text finds, so `Rossi` never picks itself while
+            // `Rossi Mario` is being typed.
+            let mut found =
+                data.customers.iter().filter(pickable).filter(|c| !fq.is_empty() && crate::derived::customer_filter(data, c, &fq, rid.as_deref()));
+            p.id = match (found.next(), found.next()) {
+                (Some(c), None) if fold(&c.name) == fq => Some(c.id),
+                _ => None,
+            };
+        }
+        if p.id.is_none() && fq.chars().count() >= 2 {
             let hits: Vec<(u64, String, String)> = data
                 .customers
                 .iter()
-                .filter(|c| !c.archived && c.erased_at.is_none() && crate::derived::customer_filter(data, c, &fq, rid.as_deref()))
+                .filter(pickable)
+                .filter(|c| crate::derived::customer_filter(data, c, &fq, rid.as_deref()))
                 .take(MATCHES)
                 .map(|c| (c.id, c.name.clone(), if c.tax_id.is_empty() { c.email.clone() } else { c.tax_id.clone() }))
                 .collect();
+            let none = hits.is_empty();
             for (id, name, sub) in hits {
                 if pick_row(ui, t, &name, &sub).clicked() {
                     p.id = Some(id);
                     p.text = name;
                 }
             }
+            // A name the desk already has (an archived customer too) is not offered: the
+            // engine would refuse it as a duplicate.
+            let taken = data.customers.iter().any(|c| c.erased_at.is_none() && fold(&c.name) == fq);
+            let archived = data.customers.iter().any(|c| c.archived && c.erased_at.is_none() && fold(&c.name) == fq);
+            let name = p.text.trim();
+            let shown = format::clipped(name, 60);
+            if create && !taken {
+                let title = app.language.fill("Create the customer \"{name}\"", &[("name", name)]);
+                if pick_row(ui, t, &format!("+ {title}"), "").clicked() {
+                    // As the engine stores it (a pasted tab becomes a space), so the answer
+                    // finds the field still naming it.
+                    let clean = remotecraft_engine::core::line(name);
+                    p.text = clean.clone();
+                    created = Some(clean);
+                }
+            } else if archived {
+                let text = app.language.fill("The customer \"{name}\" is archived: restore it to pick it", &[("name", &shown)]);
+                ui.label(RichText::new(text).small().color(t.muted));
+            } else if none {
+                let text = app.language.fill("No customer matches \"{query}\"", &[("query", &shown)]);
+                ui.label(RichText::new(text).small().color(t.muted));
+            }
         }
     });
     ui.end_row();
+    created
 }
 
 /// A form row picking a PC by name, host name or RustDesk ID, among `customer`'s PCs when
@@ -91,7 +131,8 @@ pub fn device_picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str, 
             p.id = None;
         }
         let fq = fold(p.text.trim());
-        if p.id.is_none() && r.has_focus() && (fq.chars().count() >= 2 || allow_none) {
+        // The matches stay listed until one is picked: a click takes the focus from the field.
+        if p.id.is_none() && (fq.chars().count() >= 2 || (allow_none && r.has_focus())) {
             let data = app.data();
             if allow_none && pick_row(ui, t, app.tr("No PC"), "").clicked() {
                 p.id = None;

@@ -85,7 +85,7 @@ pub const COMMANDS: &[Command] = &[
         "device.connect",
         "Connect",
         "Devices › Connect with RustDesk",
-        "{device} → rustdesk:// link, command line, consent state and warnings (audited)",
+        "{device} or {rustdesk_id} (a quick connection: a PC the desk does not know gets the link only) → rustdesk:// link, command line, consent state and warnings (audited)",
         R,
         W,
     ),
@@ -773,6 +773,33 @@ fn connect_info(d: &Device) -> Value {
 }
 
 fn device_connect(data: &Data, ctx: &mut Ctx, p: &Value) -> CoreResult<Value> {
+    // A quick connection: the RustDesk ID a customer reads out. A PC the desk knows (in service
+    // first, as `device_ref` picks) is the same as naming it; for any other, only the digits
+    // RustDesk hands out get the link, tied to no customer, with no consent to check.
+    if first(p, &["device", "device_id", "id"]).is_none()
+        && let Some(raw) = text(p, "rustdesk_id")?
+    {
+        let rid = rustdesk::normalize(&raw)?;
+        if rid.is_empty() {
+            return Err(invalid("name the `device`, or give its `rustdesk_id`"));
+        }
+        if let Some(known) = data.devices.iter().filter(|d| d.rustdesk_id == rid).min_by_key(|d| d.retired) {
+            return device_connect(data, ctx, &json!({"device": known.id}));
+        }
+        if !rid.chars().all(|c| c.is_ascii_digit()) {
+            return Err(invalid(format!(
+                "no PC has the RustDesk ID `{rid}`: a quick connection takes the digits RustDesk shows; name the `device` for a PC in the desk"
+            )));
+        }
+        let display = rustdesk::display(&rid);
+        return Ok(json!({
+            "device": Value::Null,
+            "customer": "",
+            "connect": {"rustdesk_id": rid, "display": display, "uri": rustdesk::connect_uri(&rid), "command": rustdesk::connect_command(&rid), "unattended": false},
+            "consent_ok": Value::Null,
+            "warnings": [format!("RustDesk ID {display} is not in the desk: the connection is tied to no customer and no consent is checked")],
+        }));
+    }
     let id = device_of(data, p, None)?;
     let d = data.device(id).ok_or_else(|| Error::NotFound(format!("no device {id}")))?;
     if d.rustdesk_id.is_empty() {

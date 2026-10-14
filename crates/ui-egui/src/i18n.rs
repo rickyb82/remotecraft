@@ -170,8 +170,12 @@ pub const LABELS: &[&str] = &[
     "Close the card, the form or the pane",
     "Customers, Devices, Interventions, Privacy, Reports",
     "Reload this screen's data",
-    "Save the form, or start on the PC found by the search",
+    "Save the form, start on the PC found by the search, or connect to an ID the desk does not know",
     "This help",
+    "Connect now",
+    crate::NOT_A_RUSTDESK_ID,
+    "Create the customer \"{name}\"",
+    "The customer \"{name}\" is archived: restore it to pick it",
 ];
 
 #[cfg(test)]

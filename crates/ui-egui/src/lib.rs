@@ -141,7 +141,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("1 … 5", "Customers, Devices, Interventions, Privacy, Reports"),
     ("Ctrl+,", "Settings"),
     ("Ctrl+R", "Reload this screen's data"),
-    ("Ctrl+Enter", "Save the form, or start on the PC found by the search"),
+    ("Ctrl+Enter", "Save the form, start on the PC found by the search, or connect to an ID the desk does not know"),
     ("?", "This help"),
 ];
 
@@ -235,6 +235,9 @@ pub struct DeskApp {
     /// Settings opened only because the desk was empty: leave it once it is set up.
     auto_settings: bool,
     last_revision: Option<u64>,
+    /// The quick connection the search offers, by desk revision and search text: working it out
+    /// reads every customer.
+    quick_offer: Option<(u64, String, Option<String>)>,
 }
 
 /// The link that opens the RustDesk client on a PC with this ID, only when the ID is already in
@@ -249,6 +252,29 @@ pub fn connect_link(rustdesk_id: &str) -> Option<String> {
 
 /// What the status bar says instead of opening a link to a PC whose RustDesk ID is not valid.
 pub const BAD_RUSTDESK_ID: &str = "This PC's RustDesk ID is not valid: correct it in the PC's details";
+
+/// What the status bar says when a quick connection is asked for something that is not an ID.
+pub const NOT_A_RUSTDESK_ID: &str = "That is not a RustDesk ID";
+
+/// The RustDesk ID a quick connection is offered for, from what the search holds: only the
+/// digits RustDesk hands out (`Lunaria` reads as an ID too), held by no PC (a retired one
+/// included: that one connects as itself, with its customer's consent) and found in no
+/// customer's details (a phone number or a VAT number is digits too).
+pub fn quick_connect_offer(data: &Data, search: &str) -> Option<String> {
+    let id = derived::rustdesk_query(search).filter(|id| all_digits(id))?;
+    let fq = core::fold(search.trim());
+    let digits = |text: &str| text.chars().filter(char::is_ascii_digit).collect::<String>();
+    let in_customer = |c: &core::Customer| {
+        engine::views::customer_matches(c, &fq)
+            || [&c.tax_id, &c.phone].into_iter().chain(c.contacts.iter().map(|k| &k.phone)).any(|f| digits(f).contains(id.as_str()))
+    };
+    let taken = data.devices.iter().any(|d| d.rustdesk_id == id) || data.customers.iter().any(|c| c.erased_at.is_none() && in_customer(c));
+    (!taken).then_some(id)
+}
+
+fn all_digits(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_digit())
+}
 
 /// The name of a customer, for rows and chips.
 pub fn customer_name(data: &Data, id: u64) -> String {
@@ -348,6 +374,7 @@ impl DeskApp {
             refresh_serial: 0,
             auto_settings: empty,
             last_revision: None,
+            quick_offer: None,
         }
     }
 
@@ -626,6 +653,36 @@ impl DeskApp {
         self.run_as("device.connect", json!({"device": device}), Intent::Devices(devices::Intent::Connect));
     }
 
+    /// A quick connection: RustDesk opens on the ID the customer reads out (the password too is
+    /// typed in RustDesk), with no record in the desk. The engine says so in its warning.
+    pub fn quick_connect(&mut self, rustdesk_id: &str) {
+        let id = core::rustdesk::normalize(rustdesk_id).unwrap_or_default();
+        let Some(uri) = connect_link(&id).filter(|_| all_digits(&id)) else {
+            self.status = self.tr(NOT_A_RUSTDESK_ID).to_string();
+            return;
+        };
+        let command = core::rustdesk::connect_command(&id);
+        self.requests.push(Request::OpenUrl(uri));
+        self.status =
+            self.language.fill("Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}", &[("command", &command)]);
+        self.run_as("device.connect", json!({"rustdesk_id": id}), Intent::Devices(devices::Intent::Connect));
+    }
+
+    /// [`quick_connect_offer`] for what the search box holds, worked out once per desk revision
+    /// and search text (the screens ask every frame).
+    pub fn search_quick_offer(&mut self) -> Option<String> {
+        let revision = self.session.revision();
+        if let Some((r, s, offer)) = &self.quick_offer
+            && *r == revision
+            && *s == self.search
+        {
+            return offer.clone();
+        }
+        let offer = quick_connect_offer(self.session.data(), &self.search);
+        self.quick_offer = Some((revision, self.search.clone(), offer.clone()));
+        offer
+    }
+
     /// The running interventions chip in the top bar.
     fn timer_chip(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
         timer::chip(self, ui, t);
@@ -656,7 +713,8 @@ impl DeskApp {
         }
     }
 
-    /// `Cmd+Enter` in the search box: starts the timer on the PC the RustDesk ID names.
+    /// `Cmd+Enter` in the search box: starts the timer on the PC the RustDesk ID names, or
+    /// connects to a numeric ID no PC has (a quick connection).
     pub fn search_start(&mut self) {
         let q = self.search.trim().to_string();
         let d = self.session.data();
@@ -665,6 +723,9 @@ impl DeskApp {
         {
             let device = dev.id;
             timer::start_now(self, device);
+        } else if let Some(id) = self.search_quick_offer() {
+            // A PC the desk does not know: a quick connection, nothing recorded.
+            self.quick_connect(&id);
         }
     }
 
@@ -1027,6 +1088,59 @@ mod tests {
         assert_eq!(app.timer.card.as_ref().map(|c| c.mode), Some(timer::Mode::Running));
         assert_eq!(app.data().privacy.len(), events, "the open privacy form is not saved");
         assert!(privacy::form_customer(&app).is_some());
+    }
+
+    #[test]
+    fn ctrl_enter_on_an_unknown_id_connects_and_records_nothing() {
+        let mut app = DeskApp::demo();
+        let ctx = egui::Context::default();
+        let before = app.data().clone();
+        let ctrl_enter = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE },
+        };
+        app.search = "555 666 777".into();
+        app.search_focus = true;
+        frame_in(&ctx, &mut app, Vec::new());
+        frame_in(&ctx, &mut app, Vec::new());
+        frame_in(&ctx, &mut app, vec![ctrl_enter()]);
+        frame_in(&ctx, &mut app, Vec::new());
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/555666777".into())]);
+        assert_eq!(*app.data(), before, "no customer, PC or intervention recorded");
+        assert!(app.timer.card.is_none());
+        assert!(app.status.contains("555 666 777"), "the warning says the ID is not in the desk: {}", app.status);
+        // Nor the ID of a retired PC: that one connects as itself, from its card.
+        app.requests.clear();
+        app.run("device.retire", json!({"device": 1}));
+        frame_in(&ctx, &mut app, Vec::new());
+        app.search = "100 200 300".into();
+        app.search_start();
+        assert!(app.requests.is_empty(), "{:?}", app.requests);
+        // A name typed in the search never dials, even one that reads as a RustDesk ID.
+        app.requests.clear();
+        app.search = "Ferramenta".into();
+        app.search_focus = true;
+        frame_in(&ctx, &mut app, Vec::new());
+        frame_in(&ctx, &mut app, Vec::new());
+        frame_in(&ctx, &mut app, vec![ctrl_enter()]);
+        frame_in(&ctx, &mut app, Vec::new());
+        assert!(app.requests.is_empty(), "{:?}", app.requests);
+    }
+
+    #[test]
+    fn a_quick_connection_refuses_what_is_not_an_id() {
+        let mut app = DeskApp::demo();
+        app.language = Language::It;
+        for bad in ["", "12", "<script>", "123 456 789 012 345 678"] {
+            app.quick_connect(bad);
+            assert!(app.requests.is_empty(), "{bad:?}");
+            assert_eq!(app.status, "Questo non è un ID RustDesk", "{bad:?}");
+        }
+        app.quick_connect("123-456-789");
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/123456789".into())]);
     }
 
     #[test]

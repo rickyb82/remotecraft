@@ -1,0 +1,18 @@
+[package]
+name = "remotecraft-cli"
+description = "RemoteCraft headless: CLI, HTTP API server and MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+remotecraft-engine = { workspace = true }
+remotecraft-mcp = { workspace = true }
+remotecraft-remote = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+
+[lints]
+workspace = true

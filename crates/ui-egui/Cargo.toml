@@ -1,0 +1,23 @@
+[package]
+name = "remotecraft-ui-egui"
+description = "RemoteCraft's egui front end: customers, PCs, interventions and the GDPR record, MailCraft-style"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+remotecraft-engine = { workspace = true }
+egui = { workspace = true }
+serde_json = { workspace = true }
+sys-locale = { workspace = true }
+
+[dependencies.web-time]
+workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+png = "0.18"

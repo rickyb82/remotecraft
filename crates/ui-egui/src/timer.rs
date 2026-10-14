@@ -1,0 +1,2799 @@
+//! The Work card and the running-timer chip: MailCraft's compose card, for work instead of
+//! mail. One card docked at the bottom right (dragged by its title bar, minimised to the bar)
+//! starts a timer on a customer or a PC, follows the running intervention while the technician
+//! types the summary and the notes, stops it with notes and times, and logs past work. A pill
+//! in the top bar ticks while one of the technician's interventions runs. Everything goes
+//! through `intervention.start`, `intervention.stop`, `intervention.add`, `intervention.update`
+//! (the summary and Billable typed in a card that is closed) and `privacy.consent`; the card
+//! never touches the data itself and reads the elapsed time from the desk's clock. The notes
+//! typed in a closed card (and a summary it could not save yet) wait in `State::drafts` for the
+//! stop.
+
+use egui::{Align, FontId, Key, Layout, Modifiers, Rect, Response, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
+use serde_json::{Value, json};
+use web_time::Instant;
+
+use crate::core::chrono::{DateTime, Duration, Utc};
+use crate::core::privacy::{self, PurposeState};
+use crate::core::{self, Data, rustdesk, time};
+use crate::engine::views;
+use crate::icons::{self, Icon};
+use crate::theme::Tokens;
+use crate::widgets::{self, Tone, icon_button};
+use crate::{Completed, DeskApp, Request, format};
+
+/// The labels this screen shows: `(English, Italian)`.
+pub const LABELS_IT: &[(&str, &str)] = &[
+    ("Start timer", "Avvia timer"),
+    ("Log past work", "Registra lavoro svolto"),
+    ("Minimize", "Riduci"),
+    ("Choose a customer or a PC", "Scegli un cliente o un PC"),
+    ("Type a name or a RustDesk ID", "Scrivi un nome o un ID RustDesk"),
+    ("No match", "Nessun risultato"),
+    ("Change", "Cambia"),
+    // `Kind` and `Technician` are declared by the Reports screen (one owner per label).
+    ("Remote", "Remoto"),
+    ("On site", "In sede"),
+    ("Phone", "Telefono"),
+    ("Lab", "Laboratorio"),
+    ("Other", "Altro"),
+    ("Summary", "Oggetto"),
+    ("What is the request?", "Qual è la richiesta?"),
+    ("Summary is required", "L'oggetto è obbligatorio"),
+    ("Notes", "Note"),
+    ("What was done, found, left to do", "Cosa è stato fatto, trovato, lasciato da fare"),
+    ("Reference", "Riferimento"),
+    ("Ticket or job number", "Numero di ticket o commessa"),
+    ("Billable", "Fatturabile"),
+    ("Started at", "Inizio"),
+    ("Ended at", "Fine"),
+    ("Minutes", "Minuti"),
+    ("Leave empty to use the elapsed time", "Lascia vuoto per usare il tempo trascorso"),
+    ("Minutes must be a number", "I minuti devono essere un numero"),
+    ("Give the end time or the minutes", "Indica la fine o i minuti"),
+    ("The end is before the start", "La fine è prima dell'inizio"),
+    ("Not a time: use 2026-10-13 09:30, 13/10/2026 09:30 or 09:30", "Non è un orario: usa 2026-10-13 09:30, 13/10/2026 09:30 o 09:30"),
+    ("now", "adesso"),
+    ("Now", "Adesso"),
+    ("−15 min", "−15 min"),
+    ("−30 min", "−30 min"),
+    ("−1 h", "−1 h"),
+    ("Start", "Avvia"),
+    ("Stop", "Ferma"),
+    ("Connect again", "Collegati di nuovo"),
+    ("Timer started", "Timer avviato"),
+    ("Stopped · {duration} · {customer}", "Chiuso · {duration} · {customer}"),
+    ("Intervention saved", "Intervento salvato"),
+    ("Remote-assistance consent is {state}", "Il consenso all'assistenza remota è {state}"),
+    ("missing", "mancante"),
+    ("expired", "scaduto"),
+    ("withdrawn", "revocato"),
+    ("Reason to proceed without consent", "Motivo per procedere senza consenso"),
+    ("The person agreed on the phone", "La persona ha acconsentito al telefono"),
+    ("Start anyway", "Avvia comunque"),
+    ("Log anyway", "Registra comunque"),
+    ("Record consent first", "Registra prima il consenso"),
+    ("Who agreed", "Chi acconsente"),
+    ("Evidence or note", "Prova o nota"),
+    ("Record verbal consent and start", "Registra il consenso verbale e avvia"),
+    ("Not started for {customer}: {error}", "Non avviato per {customer}: {error}"),
+    ("Timer started for {customer}", "Timer avviato per {customer}"),
+    ("Not saved for {customer}: {error}", "Non salvato per {customer}: {error}"),
+];
+
+/// The card's width.
+const CARD_W: f32 = 420.0;
+/// The width of a field's label in the card.
+const LABEL_W: f32 = 96.0;
+/// How many PCs and how many customers the target picker lists.
+const PICKER_ROWS: usize = 5;
+/// The kinds of work: the engine's word, the label and the glyph.
+const KINDS: [(&str, &str, Icon); 5] = [
+    ("remote", "Remote", Icon::Remote),
+    ("onsite", "On site", Icon::Onsite),
+    ("phone", "Phone", Icon::Phone),
+    ("lab", "Lab", Icon::Lab),
+    ("other", "Other", Icon::More),
+];
+
+/// What a command queued by this screen was for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Intent {
+    /// `intervention.start`, from the card or straight from a row; `opened` says the RustDesk
+    /// link was already opened in the click's frame. Whether the card sent it is never guessed:
+    /// the card keeps the job of its own command (`Card::waiting`), and a row's start can be
+    /// answered while the card waits for that.
+    Start { customer: Option<u64>, device: Option<u64>, opened: bool },
+    /// `intervention.stop {id}`.
+    Stop { id: u64 },
+    /// `intervention.add` from the Log mode, for this customer.
+    Log { customer: Option<u64> },
+    /// `privacy.consent` recorded from the refusal panel for this customer: the refused start
+    /// is sent again (when the card still targets that customer).
+    Consent { customer: u64 },
+}
+
+/// What the card is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Pick the target and start the timer.
+    #[default]
+    Start,
+    /// Follow a running intervention: summary and notes typed while working.
+    Running,
+    /// Stop it: notes, end time, minutes.
+    Stop,
+    /// Log work done earlier.
+    Log,
+}
+
+/// Who the work is for: the customer, and the PC when known. `text` is what the picker holds
+/// while nothing is picked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Target {
+    pub customer: Option<u64>,
+    pub device: Option<u64>,
+    pub text: String,
+}
+
+/// The running intervention the card follows, as the engine answered it: the mirror of a
+/// remote desk may not hold it yet when the answer arrives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Running {
+    pub id: u64,
+    pub customer_id: u64,
+    pub device_id: Option<u64>,
+    pub started_at: String,
+    pub customer_name: String,
+    pub device_name: String,
+}
+
+/// The panel shown when a start was refused for lack of the remote-assistance consent: a
+/// reason to go ahead anyway, or a verbal consent to record first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Refusal {
+    /// The customer the refused start (or log) was for: the panel acts only while the card
+    /// still targets it.
+    pub customer: Option<u64>,
+    /// `missing`, `expired` or `withdrawn`, as the engine said.
+    pub state: String,
+    pub reason: String,
+    /// The inline consent form is open.
+    pub record: bool,
+    pub signer: String,
+    pub note: String,
+    pub error: String,
+}
+
+/// The fields a text box of the card can be: each has a stable egui id, so the card knows
+/// when one of its own boxes has the focus (Ctrl+Enter) and which one to focus next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    Target,
+    Summary,
+    Notes,
+    Reference,
+    Started,
+    Ended,
+    Minutes,
+    Technician,
+    Reason,
+    Signer,
+    Note,
+}
+
+impl Field {
+    const ALL: [Self; 11] = [
+        Self::Target,
+        Self::Summary,
+        Self::Notes,
+        Self::Reference,
+        Self::Started,
+        Self::Ended,
+        Self::Minutes,
+        Self::Technician,
+        Self::Reason,
+        Self::Signer,
+        Self::Note,
+    ];
+
+    fn id(self) -> egui::Id {
+        egui::Id::new(("work-card", self as u8))
+    }
+}
+
+/// The card: one form shared by the modes, plus where it is and what it waits for.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Card {
+    pub mode: Mode,
+    pub target: Target,
+    /// `remote`, `onsite`, `phone`, `lab` or `other`.
+    pub kind: String,
+    /// The technician picked the kind: the default rule no longer applies.
+    pub kind_touched: bool,
+    pub summary: String,
+    /// Notes to append when stopping (or the notes of past work).
+    pub notes: String,
+    pub reference: String,
+    pub billable: bool,
+    /// Form text; empty = now.
+    pub started_at: String,
+    /// Form text; empty = now (Stop) or not given (Log).
+    pub ended_at: String,
+    /// Form text; empty = the span between start and end.
+    pub minutes: String,
+    pub technician: String,
+    /// The intervention followed in Running and Stop mode.
+    pub running: Option<Running>,
+    /// The summary and Billable of the followed intervention as last known on the desk: what
+    /// the technician typed over them is saved when the card lets it go.
+    pub saved: (String, bool),
+    /// The mirror has held the followed intervention: once it no longer does, it was deleted.
+    pub seen: bool,
+    /// Since when the mirror lacks the followed intervention (a remote mirror lags behind the
+    /// answer that started it).
+    pub missing_since: Option<Instant>,
+    /// The engine's warnings of the last start, translated.
+    pub warnings: Vec<String>,
+    pub error: String,
+    pub refusal: Option<Refusal>,
+    /// A command of the card is in flight: `busy`, and its job (`waiting`). A result is the
+    /// card's own only when its job is the one the card waits for, whatever the card shows now.
+    pub busy: bool,
+    pub waiting: Option<u64>,
+    pub minimized: bool,
+    /// Where the technician dragged the card (from its bottom-right home).
+    pub offset: egui::Vec2,
+    /// The field to focus on the next quiet frame.
+    pub refocus: Option<Field>,
+}
+
+impl Card {
+    /// A card in `mode` for `target`, with the defaults of the desk.
+    fn new(app: &DeskApp, mode: Mode, target: Target) -> Self {
+        let now = app.now();
+        Self {
+            mode,
+            kind: kind_default(app.data(), &target).to_string(),
+            billable: true,
+            started_at: if mode == Mode::Log { format::input(&time::stamp(now)) } else { String::new() },
+            technician: app.session.actor().to_string(),
+            refocus: Some(if target.customer.is_some() { Field::Summary } else { Field::Target }),
+            target,
+            ..Self::default()
+        }
+    }
+}
+
+/// What was typed for a running intervention whose card was closed: the notes, appended when it
+/// stops, and the summary and Billable typed over the stored ones when they could not be saved
+/// yet (the card closed before the mirror held the intervention).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Draft {
+    pub notes: String,
+    pub summary: Option<String>,
+    pub billable: Option<bool>,
+}
+
+impl Draft {
+    fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.summary.is_none() && self.billable.is_none()
+    }
+}
+
+/// This screen's own state: the card, when open, and what was typed for running interventions
+/// whose card was closed (kept for the stop, or the card reopened).
+#[derive(Default)]
+pub struct State {
+    pub card: Option<Card>,
+    pub drafts: std::collections::BTreeMap<u64, Draft>,
+}
+
+/// How long a remote mirror may lack an intervention the engine said it started while the
+/// server answers. Above the worst lag of a mirror that answers: the poll out when the start
+/// went through may take its whole window (up to a minute) and answer without it, and the next
+/// one as long again, a poll interval later; a server slower than that has a problem shown.
+const MIRROR_LAG: std::time::Duration = std::time::Duration::from_secs(125);
+/// How many closed cards' notes are kept.
+const MAX_DRAFTS: usize = 64;
+
+/// What the card's buttons asked for this frame; applied once the card is written back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    /// The main button of the mode (or Ctrl+Enter).
+    Submit,
+    /// Start (or log) with the reason given in the refusal panel.
+    Anyway,
+    /// Record the verbal consent from the refusal panel.
+    Consent,
+    /// Cancel the form (Start, Log) or go back to Running (Stop).
+    Cancel,
+    /// Close the card (the timer keeps running).
+    Close,
+    /// Go to Stop mode for this intervention.
+    Stop(u64),
+    /// Follow this intervention (several of mine running).
+    Follow(u64),
+    /// Open the RustDesk client on this PC again.
+    Connect(u64),
+}
+
+// ---------------------------------------------------------------------------------------------
+// Opening the card
+
+/// Opens the card in Start mode for a customer and/or a device (the target picker when
+/// neither is given). An open card is reused and un-minimised.
+pub fn open_start(app: &mut DeskApp, customer: Option<u64>, device: Option<u64>) {
+    open_form(app, Mode::Start, customer, device);
+}
+
+/// Opens the card in Log mode (work done earlier) for a customer and/or a device.
+pub fn open_log(app: &mut DeskApp, customer: Option<u64>, device: Option<u64>) {
+    open_form(app, Mode::Log, customer, device);
+}
+
+fn open_form(app: &mut DeskApp, mode: Mode, customer: Option<u64>, device: Option<u64>) {
+    release(app);
+    let customer = device.and_then(|d| app.data().device(d)).map(|d| d.customer_id).or(customer);
+    let target = Target { customer, device, text: String::new() };
+    let mut card = Card::new(app, mode, target);
+    if let Some(old) = app.timer.card.take() {
+        card.offset = old.offset;
+    }
+    app.timer.card = Some(card);
+}
+
+/// Opens the card on a running intervention of the actor: in Running mode, or straight in Stop
+/// mode with the notes focused. When the mirror does not hold it (a remote desk before the
+/// snapshot, or deleted elsewhere), only the card that already follows it switches mode, from
+/// its own copy; nothing happens otherwise.
+pub fn open_running(app: &mut DeskApp, id: u64, stop: bool) {
+    let same = app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id));
+    if app.data().intervention(id).is_none() {
+        if same && let Some(card) = app.timer.card.as_mut() {
+            follow_mode(card, stop);
+        }
+        return;
+    }
+    if !same {
+        // The card followed another intervention: keep what was typed in it.
+        release(app);
+    }
+    let d = app.data();
+    let Some(i) = d.intervention(id) else { return };
+    let running = Running {
+        id,
+        customer_id: i.customer_id,
+        device_id: i.device_id,
+        started_at: i.started_at.clone(),
+        customer_name: crate::customer_name(d, i.customer_id),
+        device_name: crate::device_name(d, i.device_id),
+    };
+    let (summary, billable) = (i.summary.clone(), i.billable);
+    let target = Target { customer: Some(i.customer_id), device: i.device_id, text: String::new() };
+    let fresh = Card::new(app, Mode::Running, target.clone());
+    let mut card = app.timer.card.take().unwrap_or(fresh);
+    if !same {
+        // What was typed in its closed card comes back; a summary and Billable not saved yet
+        // are saved when this card lets it go (they differ from the stored ones).
+        let draft = app.timer.drafts.remove(&id).unwrap_or_default();
+        card.saved = (summary.clone(), billable);
+        card.summary = draft.summary.unwrap_or(summary);
+        card.notes = draft.notes;
+        card.billable = draft.billable.unwrap_or(billable);
+        card.warnings.clear();
+    }
+    card.running = Some(running);
+    card.seen = true;
+    card.missing_since = None;
+    card.target = target;
+    follow_mode(&mut card, stop);
+    app.timer.card = Some(card);
+}
+
+/// Puts a card that follows a running intervention in Running mode, or in Stop mode with the
+/// end time and the minutes cleared; expanded, the notes focused.
+fn follow_mode(card: &mut Card, stop: bool) {
+    card.mode = if stop { Mode::Stop } else { Mode::Running };
+    if stop {
+        card.ended_at.clear();
+        card.minutes.clear();
+    }
+    card.minimized = false;
+    card.error.clear();
+    card.refusal = None;
+    card.refocus = Some(Field::Notes);
+}
+
+/// The fast path from a row: starts the timer on a PC at once (`intervention.start {device}`,
+/// the summary is typed later in the card). When the mirror says the remote-assistance consent
+/// is fine, the RustDesk link is opened in this very frame: a browser only opens it within the
+/// click's gesture. The card opens when the engine answers.
+pub fn start_now(app: &mut DeskApp, device: u64) {
+    let Some(customer) = app.data().device(device).map(|d| d.customer_id) else { return };
+    let opened = open_link_now(app, customer, device);
+    app.run_as(
+        "intervention.start",
+        json!({"device": device}),
+        crate::Intent::Timer(Intent::Start { customer: Some(customer), device: Some(device), opened }),
+    );
+}
+
+/// Stops the actor's most recent running intervention right now: `intervention.stop {id}`,
+/// with the summary, Billable and notes typed in the card that follows it (or the notes kept
+/// from its closed card). Nothing happens when none runs.
+pub fn stop_mine(app: &mut DeskApp) {
+    let Some(id) = mine_running(app.data(), app.session.actor()).first().map(|m| m.0) else { return };
+    let ended = time::stamp(app.now());
+    let mut params = json!({"id": id, "ended_at": ended});
+    let draft = app.timer.drafts.get(&id).cloned().unwrap_or_default();
+    let mut notes = draft.notes;
+    if let Some(s) = draft.summary.filter(|s| !s.trim().is_empty()) {
+        params["summary"] = json!(s.trim());
+    }
+    if let Some(b) = draft.billable {
+        params["billable"] = json!(b);
+    }
+    let from_card = app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id));
+    if let Some(c) = app.timer.card.as_mut()
+        && from_card
+    {
+        notes = c.notes.trim().to_string();
+        if !c.summary.trim().is_empty() {
+            params["summary"] = json!(c.summary.trim());
+        }
+        params["billable"] = json!(c.billable);
+    }
+    if !notes.trim().is_empty() {
+        params["notes"] = json!(notes.trim());
+    }
+    let job = app.run_as("intervention.stop", params, crate::Intent::Timer(Intent::Stop { id }));
+    if from_card {
+        wait_for(app, job);
+    }
+}
+
+/// The card waits for its own command `job`.
+fn wait_for(app: &mut DeskApp, job: u64) {
+    if let Some(card) = app.timer.card.as_mut() {
+        card.busy = true;
+        card.waiting = Some(job);
+    }
+}
+
+/// Closes an open card: minimises it when expanded, closes it when minimised (Escape, like
+/// MailCraft's compose card). Answers whether a card was open.
+pub fn close(app: &mut DeskApp) -> bool {
+    match app.timer.card.as_mut() {
+        None => false,
+        Some(c) if !c.minimized => {
+            c.minimized = true;
+            save_typed(app);
+            true
+        }
+        Some(_) => {
+            release(app);
+            app.timer.card = None;
+            true
+        }
+    }
+}
+
+/// Saves the summary and Billable typed in the card over the followed running intervention's
+/// (`intervention.update`), so they survive the card and other technicians see them. An empty
+/// summary is never sent (it would wipe the stored one), like the stop does.
+fn save_typed(app: &mut DeskApp) {
+    let Some(c) = app.timer.card.as_ref() else { return };
+    if !matches!(c.mode, Mode::Running | Mode::Stop) || c.busy {
+        return;
+    }
+    let Some(id) = c.running.as_ref().map(|r| r.id) else { return };
+    if app.data().intervention(id).is_some_and(|i| !i.running()) {
+        return;
+    }
+    let summary = c.summary.trim().to_string();
+    let billable = c.billable;
+    let mut params = json!({"id": id});
+    if !summary.is_empty() && summary != c.saved.0 {
+        params["summary"] = json!(summary);
+    }
+    if billable != c.saved.1 {
+        params["billable"] = json!(billable);
+    }
+    if params.as_object().is_some_and(|o| o.len() > 1) {
+        if let Some(c) = app.timer.card.as_mut() {
+            c.saved = (if summary.is_empty() { c.saved.0.clone() } else { summary }, billable);
+        }
+        app.run("intervention.update", params);
+    }
+}
+
+/// The card lets its running intervention go (closed, or about to follow another): the
+/// summary and Billable are saved, the notes kept for the stop (`x`, or the card reopened).
+fn release(app: &mut DeskApp) {
+    save_typed(app);
+    let Some(c) = app.timer.card.as_ref() else { return };
+    if !matches!(c.mode, Mode::Running | Mode::Stop) || c.busy {
+        return;
+    }
+    let Some(id) = c.running.as_ref().map(|r| r.id) else { return };
+    let draft = Draft { notes: c.notes.trim().to_string(), ..Draft::default() };
+    keep_draft(app, id, draft);
+}
+
+/// Everything typed in a card that follows a running intervention and cannot be saved now: the
+/// notes, and the summary and Billable typed over the stored ones.
+fn typed_draft(c: &Card) -> Draft {
+    let summary = c.summary.trim();
+    Draft {
+        notes: c.notes.trim().to_string(),
+        summary: (!summary.is_empty() && summary != c.saved.0).then(|| summary.to_string()),
+        billable: (c.billable != c.saved.1).then_some(c.billable),
+    }
+}
+
+/// Keeps what was typed for running intervention `id` (an empty draft forgets it), at most
+/// [`MAX_DRAFTS`] of them.
+fn keep_draft(app: &mut DeskApp, id: u64, draft: Draft) {
+    if draft.is_empty() {
+        app.timer.drafts.remove(&id);
+        return;
+    }
+    if !app.timer.drafts.contains_key(&id) && app.timer.drafts.len() >= MAX_DRAFTS {
+        app.timer.drafts.pop_first();
+    }
+    app.timer.drafts.insert(id, draft);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reading the mirror
+
+/// The engine's default kind: remote when the PC has a RustDesk ID, on site for a PC without,
+/// phone for a customer alone.
+fn kind_default(data: &Data, target: &Target) -> &'static str {
+    match target.device.and_then(|d| data.device(d)) {
+        Some(d) if !d.rustdesk_id.is_empty() => "remote",
+        Some(_) => "onsite",
+        None => "phone",
+    }
+}
+
+/// Whether the engine would let remote work start on this customer without a reason.
+fn consent_ready(data: &Data, customer: u64, now: DateTime<Utc>) -> bool {
+    let prefs = &data.preferences;
+    !prefs.require_consent
+        || privacy::purpose_state(&data.privacy, customer, "remote_assistance", now, prefs.consent_validity_months).0 == PurposeState::Given
+}
+
+/// Opens the RustDesk link on `device` now when it has a valid ID and the consent is fine;
+/// answers whether it did.
+fn open_link_now(app: &mut DeskApp, customer: u64, device: u64) -> bool {
+    let now = app.now();
+    let uri = {
+        let d = app.data();
+        match d.device(device) {
+            Some(dev) if consent_ready(d, customer, now) => crate::connect_link(&dev.rustdesk_id),
+            _ => None,
+        }
+    };
+    let Some(uri) = uri else { return false };
+    app.requests.push(Request::OpenUrl(uri));
+    true
+}
+
+/// Opens the RustDesk link on the PC of a started intervention, built from the PC in the desk
+/// (never from the link an answer carries); an ID that is not valid opens nothing and the status
+/// bar says why.
+fn open_link_of(app: &mut DeskApp, device: Option<u64>) {
+    let id = device.and_then(|d| app.data().device(d)).map(|d| d.rustdesk_id.clone()).unwrap_or_default();
+    if id.is_empty() {
+        return;
+    }
+    match crate::connect_link(&id) {
+        Some(uri) => app.requests.push(Request::OpenUrl(uri)),
+        None => app.status = app.tr(crate::BAD_RUSTDESK_ID).to_string(),
+    }
+}
+
+/// The actor's running interventions, newest first: `(id, customer, device, started_at)`.
+fn mine_running(data: &Data, actor: &str) -> Vec<(u64, String, String, String)> {
+    let mut mine: Vec<_> = data
+        .interventions
+        .iter()
+        .filter(|i| i.running() && i.technician == actor)
+        .map(|i| (i.id, crate::customer_name(data, i.customer_id), crate::device_name(data, i.device_id), i.started_at.clone()))
+        .collect();
+    mine.sort_by(|a, b| b.3.cmp(&a.3).then(b.0.cmp(&a.0)));
+    mine
+}
+
+/// The followed intervention as the mirror has it now, else as the engine answered:
+/// `(customer, device, started_at, rustdesk_id)`.
+fn running_view(data: &Data, r: &Running) -> (String, String, String, String) {
+    let rid = r.device_id.and_then(|d| data.device(d)).map(|d| d.rustdesk_id.clone()).unwrap_or_default();
+    match data.intervention(r.id) {
+        Some(i) => (crate::customer_name(data, i.customer_id), crate::device_name(data, i.device_id), i.started_at.clone(), rid),
+        None => (r.customer_name.clone(), r.device_name.clone(), r.started_at.clone(), rid),
+    }
+}
+
+/// A form text as the stamp to send (empty or `now` = now); the error to show otherwise.
+fn stamp_of(app: &DeskApp, text: &str) -> Result<String, String> {
+    format::stamp_from_input(text, app.now()).ok_or_else(|| app.tr("Not a time: use 2026-10-13 09:30, 13/10/2026 09:30 or 09:30").to_string())
+}
+
+/// A minutes field: `None` when empty; the error when not a number.
+fn minutes_of(app: &DeskApp, text: &str) -> Result<Option<u32>, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    t.parse::<u32>().map(Some).map_err(|_| app.tr("Minutes must be a number").to_string())
+}
+
+/// `now` moved by `minutes`, as form text.
+fn shifted(now: DateTime<Utc>, minutes: i64) -> String {
+    let t = Duration::try_minutes(minutes).and_then(|d| now.checked_add_signed(d)).unwrap_or(now);
+    format::input(&time::stamp(t))
+}
+
+/// The state word in the engine's refusal (`… consent is missing: …`).
+fn refused_state(message: &str) -> String {
+    message.split_once("consent is ").map(|(_, rest)| rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect()).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sending
+
+fn target_params(c: &Card) -> Option<Value> {
+    let customer = c.target.customer?;
+    Some(match c.target.device {
+        Some(d) => json!({"device": d}),
+        None => json!({"customer": customer}),
+    })
+}
+
+fn set_error(app: &mut DeskApp, text: String) {
+    if let Some(c) = app.timer.card.as_mut() {
+        c.error = text;
+    }
+}
+
+/// Whether the refusal panel was answered for another customer than the card now targets (the
+/// target changed after the refusal): the panel is dropped instead of acting on it.
+fn stale_refusal(app: &mut DeskApp) -> bool {
+    let Some(c) = app.timer.card.as_mut() else { return false };
+    let stale = c.refusal.as_ref().is_some_and(|r| r.customer != c.target.customer);
+    if stale {
+        c.refusal = None;
+    }
+    stale
+}
+
+/// Sends `intervention.start` from the card; `anyway` adds the refusal panel's reason.
+fn submit_start(app: &mut DeskApp, anyway: bool) {
+    if anyway && stale_refusal(app) {
+        return;
+    }
+    let Some(c) = app.timer.card.clone() else { return };
+    let Some(mut params) = target_params(&c) else {
+        set_error(app, app.tr("Choose a customer or a PC").to_string());
+        return;
+    };
+    let started = match stamp_of(app, &c.started_at) {
+        Ok(s) => s,
+        Err(e) => return set_error(app, e),
+    };
+    params["kind"] = json!(c.kind);
+    params["summary"] = json!(c.summary.trim());
+    params["reference"] = json!(c.reference.trim());
+    params["billable"] = json!(c.billable);
+    params["started_at"] = json!(started);
+    let reason = c.refusal.as_ref().map(|r| r.reason.trim().to_string()).unwrap_or_default();
+    if anyway && !reason.is_empty() {
+        params["consent_override"] = json!(reason);
+    }
+    let customer = c.target.customer;
+    let device = c.target.device;
+    // The RustDesk link opens in the click's frame when the mirror says the consent is fine.
+    let opened = c.kind == "remote" && customer.zip(device).is_some_and(|(cu, dev)| open_link_now(app, cu, dev));
+    if let Some(card) = app.timer.card.as_mut() {
+        card.error.clear();
+    }
+    let job = app.run_as("intervention.start", params, crate::Intent::Timer(Intent::Start { customer, device, opened }));
+    wait_for(app, job);
+}
+
+/// Sends `intervention.stop` for the followed intervention, always with its id.
+fn submit_stop(app: &mut DeskApp) {
+    let Some(c) = app.timer.card.clone() else { return };
+    let Some(r) = c.running else { return };
+    let ended = match stamp_of(app, &c.ended_at) {
+        Ok(s) => s,
+        Err(e) => return set_error(app, e),
+    };
+    let minutes = match minutes_of(app, &c.minutes) {
+        Ok(m) => m,
+        Err(e) => return set_error(app, e),
+    };
+    let mut params = json!({"id": r.id, "notes": c.notes.trim(), "billable": c.billable, "ended_at": ended});
+    if !c.summary.trim().is_empty() {
+        params["summary"] = json!(c.summary.trim());
+    }
+    if let Some(m) = minutes {
+        params["minutes"] = json!(m);
+    }
+    if let Some(card) = app.timer.card.as_mut() {
+        card.error.clear();
+    }
+    let job = app.run_as("intervention.stop", params, crate::Intent::Timer(Intent::Stop { id: r.id }));
+    wait_for(app, job);
+}
+
+/// Sends `intervention.add` from the Log mode; `anyway` adds the refusal panel's reason.
+fn submit_log(app: &mut DeskApp, anyway: bool) {
+    if anyway && stale_refusal(app) {
+        return;
+    }
+    let Some(c) = app.timer.card.clone() else { return };
+    let Some(mut params) = target_params(&c) else {
+        set_error(app, app.tr("Choose a customer or a PC").to_string());
+        return;
+    };
+    if c.summary.trim().is_empty() {
+        return set_error(app, app.tr("Summary is required").to_string());
+    }
+    let started = match stamp_of(app, &c.started_at) {
+        Ok(s) => s,
+        Err(e) => return set_error(app, e),
+    };
+    let ended = if c.ended_at.trim().is_empty() {
+        None
+    } else {
+        match stamp_of(app, &c.ended_at) {
+            Ok(s) => Some(s),
+            Err(e) => return set_error(app, e),
+        }
+    };
+    let minutes = match minutes_of(app, &c.minutes) {
+        Ok(m) => m,
+        Err(e) => return set_error(app, e),
+    };
+    if ended.is_none() && minutes.is_none() {
+        return set_error(app, app.tr("Give the end time or the minutes").to_string());
+    }
+    if ended.as_deref().is_some_and(|e| e < started.as_str()) {
+        return set_error(app, app.tr("The end is before the start").to_string());
+    }
+    params["kind"] = json!(c.kind);
+    params["summary"] = json!(c.summary.trim());
+    params["started_at"] = json!(started);
+    if let Some(e) = ended {
+        params["ended_at"] = json!(e);
+    }
+    if let Some(m) = minutes {
+        params["minutes"] = json!(m);
+    }
+    if !c.technician.trim().is_empty() {
+        params["technician"] = json!(c.technician.trim());
+    }
+    params["reference"] = json!(c.reference.trim());
+    params["billable"] = json!(c.billable);
+    params["notes"] = json!(c.notes.trim());
+    let reason = c.refusal.as_ref().map(|r| r.reason.trim().to_string()).unwrap_or_default();
+    if anyway && !reason.is_empty() {
+        params["consent_override"] = json!(reason);
+    }
+    if let Some(card) = app.timer.card.as_mut() {
+        card.error.clear();
+    }
+    let customer = c.target.customer;
+    let job = app.run_as("intervention.add", params, crate::Intent::Timer(Intent::Log { customer }));
+    wait_for(app, job);
+}
+
+/// Records the verbal consent typed in the refusal panel (`privacy.consent`); the refused
+/// start or log is sent again when it succeeds.
+fn submit_consent(app: &mut DeskApp) {
+    if stale_refusal(app) {
+        return;
+    }
+    let Some(c) = app.timer.card.clone() else { return };
+    let (Some(r), Some(customer)) = (c.refusal, c.target.customer) else { return };
+    if r.signer.trim().is_empty() {
+        return;
+    }
+    let params = json!({
+        "customer": customer, "purposes": ["remote_assistance"], "method": "verbal",
+        "signer": r.signer.trim(), "note": r.note.trim(),
+    });
+    if let Some(card) = app.timer.card.as_mut()
+        && let Some(r) = card.refusal.as_mut()
+    {
+        r.error.clear();
+    }
+    let job = app.run_as("privacy.consent", params, crate::Intent::Timer(Intent::Consent { customer }));
+    wait_for(app, job);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Results
+
+/// Applies a finished command of the card.
+pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
+    // Whether the card sent this: the job it waits for. A row's start, a stop from the chip, or a
+    // command of a card replaced since is not the card's and leaves its wait alone.
+    let sent_by_card = app.timer.card.as_ref().is_some_and(|card| card.waiting == Some(c.job));
+    if sent_by_card && let Some(card) = app.timer.card.as_mut() {
+        card.busy = false;
+        card.waiting = None;
+    }
+    match intent {
+        Intent::Start { customer, device, opened } => match &c.result {
+            Ok(v) => started(app, v, opened, sent_by_card),
+            Err(e) => refused(app, &e.to_string(), customer, device, Mode::Start),
+        },
+        Intent::Log { customer } => match &c.result {
+            Ok(v) => {
+                // The card that sent it closes, if it still shows that entry; one opened since
+                // (another form, a running intervention picked from the chip) stays.
+                if sent_by_card && app.timer.card.as_ref().is_some_and(|c| c.mode == Mode::Log) {
+                    app.timer.card = None;
+                }
+                app.selected_intervention = v["intervention"]["id"].as_u64();
+                app.toast(app.tr("Intervention saved").to_string());
+            }
+            Err(e) => refused(app, &e.to_string(), customer, None, Mode::Log),
+        },
+        Intent::Stop { id } => match &c.result {
+            Ok(v) => {
+                let i = &v["intervention"];
+                let duration = format::duration(i["minutes"].as_u64().unwrap_or(0));
+                let customer = i["customer_name"].as_str().unwrap_or_default().to_string();
+                if app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id)) {
+                    app.timer.card = None;
+                }
+                app.timer.drafts.remove(&id);
+                app.selected_intervention = Some(id);
+                app.toast(app.language.fill("Stopped · {duration} · {customer}", &[("duration", &duration), ("customer", &customer)]));
+            }
+            Err(e) => {
+                // Closed by someone else meanwhile: the status bar has the message.
+                let m = e.to_string();
+                if m.contains("already closed") || m.starts_with("no intervention") {
+                    if app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id)) {
+                        app.timer.card = None;
+                    }
+                    app.timer.drafts.remove(&id);
+                } else {
+                    set_error(app, app.language.tr_message(&m));
+                }
+            }
+        },
+        Intent::Consent { customer } => match &c.result {
+            Ok(_) => {
+                // Sent again only by the card that asked, while it still targets the customer who
+                // agreed.
+                let mode = app.timer.card.as_mut().filter(|card| sent_by_card && card.target.customer == Some(customer)).map(|card| {
+                    card.refusal = None;
+                    card.mode
+                });
+                match mode {
+                    Some(Mode::Log) => submit_log(app, false),
+                    Some(Mode::Start) => submit_start(app, false),
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                let text = app.language.tr_message(&e.to_string());
+                if let Some(r) = app.timer.card.as_mut().and_then(|card| card.refusal.as_mut()) {
+                    r.error = text;
+                }
+            }
+        },
+    }
+}
+
+/// A start succeeded: the card follows the intervention in Running mode.
+fn started(app: &mut DeskApp, v: &Value, opened: bool, sent_by_card: bool) {
+    let i = &v["intervention"];
+    let text = |key: &str| i[key].as_str().unwrap_or_default().to_string();
+    let running = Running {
+        id: i["id"].as_u64().unwrap_or(0),
+        customer_id: i["customer_id"].as_u64().unwrap_or(0),
+        device_id: i["device_id"].as_u64(),
+        started_at: text("started_at"),
+        customer_name: text("customer_name"),
+        device_name: text("device_name"),
+    };
+    let warnings: Vec<String> =
+        v["warnings"].as_array().map(|a| a.iter().filter_map(|w| w.as_str()).map(|w| app.language.tr_message(w)).collect()).unwrap_or_default();
+    // The engine's `connect` says the work is remote on a PC with an ID; the link itself comes
+    // from that PC in the desk, never from the answer as given (a hostile server's `https://…`).
+    if !opened && v["connect"].is_object() {
+        open_link_of(app, running.device_id);
+    }
+    let target = Target { customer: Some(running.customer_id), device: running.device_id, text: String::new() };
+    // A start from a row (the card did not send it) while the card waits for its own command, or
+    // is a form holding what was typed for other work: the card stays, the timer runs in the
+    // top-bar chip, and the toast says for whom, with the start's warnings (the status bar keeps
+    // them once the toast is gone).
+    if !sent_by_card && app.timer.card.as_ref().is_some_and(|c| keeps_card(c, running.customer_id)) {
+        let name =
+            if running.customer_name.is_empty() { crate::customer_name(app.data(), running.customer_id) } else { running.customer_name.clone() };
+        let mut toast = app.language.fill("Timer started for {customer}", &[("customer", &name)]);
+        if !warnings.is_empty() {
+            let joined = warnings.join(" · ");
+            toast = format!("{toast} · {joined}");
+            app.status = joined;
+        }
+        app.toast(toast);
+        return;
+    }
+    // A row's start on the customer of a Start form holding what was typed: the form becomes the
+    // card of that intervention (sent, it would start a second one), with what was typed in it.
+    let carried = if sent_by_card { None } else { app.timer.card.as_ref().filter(|c| unsent_typing(c)).cloned() };
+    if app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id != running.id)) {
+        // The card followed another intervention: keep what was typed in it.
+        release(app);
+    }
+    let fresh = Card::new(app, Mode::Running, target.clone());
+    let mut card = app.timer.card.take().unwrap_or(fresh);
+    card.mode = Mode::Running;
+    card.target = target;
+    card.summary = text("summary");
+    card.notes.clear();
+    card.billable = i["billable"].as_bool().unwrap_or(true);
+    card.saved = (card.summary.clone(), card.billable);
+    let update = carried.and_then(|form| carry_typed(&mut card, &form, running.id, &text("reference")));
+    card.seen = app.data().intervention(running.id).is_some();
+    card.missing_since = None;
+    card.running = Some(running);
+    card.warnings = warnings;
+    card.error.clear();
+    card.refusal = None;
+    card.minimized = false;
+    card.refocus = Some(Field::Summary);
+    app.timer.card = Some(card);
+    if let Some(params) = update {
+        app.run("intervention.update", params);
+    }
+    app.toast(app.tr("Timer started").to_string());
+}
+
+/// Puts what was typed in a Start form into the card of the intervention a row's start gave
+/// instead: the summary, the notes (for the stop) and Billable. The summary, Billable and the
+/// reference that differ from the answer's are saved now: answers the `intervention.update`.
+fn carry_typed(card: &mut Card, form: &Card, id: u64, answered_reference: &str) -> Option<Value> {
+    let mut params = json!({"id": id});
+    let summary = form.summary.trim();
+    if !summary.is_empty() && summary != card.summary {
+        card.summary = summary.to_string();
+        params["summary"] = json!(summary);
+    }
+    if form.billable != card.billable {
+        card.billable = form.billable;
+        params["billable"] = json!(form.billable);
+    }
+    let reference = form.reference.trim();
+    if !reference.is_empty() && reference != answered_reference {
+        params["reference"] = json!(reference);
+    }
+    card.notes = form.notes.trim().to_string();
+    card.saved = (card.summary.clone(), card.billable);
+    params.as_object().is_some_and(|o| o.len() > 1).then_some(params)
+}
+
+/// Whether a card is a form not sent yet (Start, Log) holding something the technician typed.
+fn unsent_typing(c: &Card) -> bool {
+    matches!(c.mode, Mode::Start | Mode::Log)
+        && c.running.is_none()
+        && [&c.summary, &c.notes, &c.reference, &c.ended_at, &c.minutes].iter().any(|s| !s.trim().is_empty())
+}
+
+/// Whether a row's start on `customer` leaves the card as it is: the card waits for a command of
+/// its own, or is a form holding what was typed for other work (past work, or a start for another
+/// customer). A Start form typed for this customer gives way (see [`carry_typed`]).
+fn keeps_card(c: &Card, customer: u64) -> bool {
+    c.busy || (unsent_typing(c) && (c.mode != Mode::Start || c.target.customer != Some(customer)))
+}
+
+/// A start or a log failed: the consent refusal panel, or the message under the form. A card
+/// opens on the refused target when none shows it (the fast path from a row, or a card busy
+/// with another intervention or customer), so the technician sees why; an unsent form holding
+/// what was typed for another customer stays, and the refusal shows as a toast instead.
+fn refused(app: &mut DeskApp, message: &str, customer: Option<u64>, device: Option<u64>, mode: Mode) {
+    let customer = device.and_then(|d| app.data().device(d)).map(|d| d.customer_id).or(customer);
+    let shown = app.timer.card.as_ref().is_some_and(|c| matches!(c.mode, Mode::Start | Mode::Log) && c.target.customer == customer);
+    if !shown && app.timer.card.as_ref().is_some_and(unsent_typing) {
+        // The status bar has the engine's message (`pump`); the toast names the customer.
+        let error = if message.contains("remote_assistance consent is") {
+            let state = app.tr(&refused_state(message)).to_string();
+            app.language.fill("Remote-assistance consent is {state}", &[("state", &state)])
+        } else {
+            app.language.tr_message(message)
+        };
+        let name = customer.map(|id| crate::customer_name(app.data(), id)).unwrap_or_default();
+        let text = if name.is_empty() {
+            error
+        } else {
+            let template = if mode == Mode::Log { "Not saved for {customer}: {error}" } else { "Not started for {customer}: {error}" };
+            app.language.fill(template, &[("customer", &name), ("error", &error)])
+        };
+        app.toast(text);
+        return;
+    }
+    if !shown {
+        release(app);
+        let offset = app.timer.card.as_ref().map(|c| c.offset).unwrap_or_default();
+        let mut card = Card::new(app, mode, Target { customer, device, text: String::new() });
+        card.offset = offset;
+        app.timer.card = Some(card);
+    }
+    let consent = message.contains("remote_assistance consent is");
+    let translated = app.language.tr_message(message);
+    let Some(card) = app.timer.card.as_mut() else { return };
+    card.minimized = false;
+    if consent {
+        card.error.clear();
+        card.refusal = Some(Refusal { customer, state: refused_state(message), ..Refusal::default() });
+        card.refocus = Some(Field::Reason);
+    } else {
+        card.error = translated;
+    }
+}
+
+/// Drops a card that follows an intervention the desk no longer runs (stopped from the CLI,
+/// another technician, deleted), and the drafts kept for interventions no longer running. A
+/// remote mirror may lag behind the answer that started an intervention: there it is gone once
+/// the mirror held it and no longer does, or after [`MIRROR_LAG`] without it while the server
+/// answers. That last close may still be lag: what was typed in the card is kept as its draft,
+/// back when the card is opened again on it.
+fn sync(app: &mut DeskApp) {
+    let local = app.session.server().is_empty();
+    let answering = app.session.problem().is_none();
+    if !app.timer.drafts.is_empty() {
+        let d = app.session.data();
+        app.timer.drafts.retain(|id, _| match d.intervention(*id) {
+            Some(i) => i.running(),
+            None => !local,
+        });
+    }
+    let followed = match app.timer.card.as_ref() {
+        Some(c) if matches!(c.mode, Mode::Running | Mode::Stop) && !c.busy => c.running.as_ref().map(|r| r.id),
+        _ => return,
+    };
+    let held = followed.map(|id| app.data().intervention(id).map(|i| i.running()));
+    let Some(c) = app.timer.card.as_mut() else { return };
+    // Gone for sure (stopped, deleted), or maybe only lagging.
+    let (gone, lagging) = match held {
+        None => (true, false),
+        Some(Some(running)) => {
+            c.seen = true;
+            c.missing_since = None;
+            (!running, false)
+        }
+        Some(None) => {
+            let since = *c.missing_since.get_or_insert_with(Instant::now);
+            let lagging = !local && !c.seen && answering && since.elapsed() > MIRROR_LAG;
+            (local || c.seen || lagging, lagging)
+        }
+    };
+    if gone {
+        let card = app.timer.card.take();
+        if let Some(id) = followed {
+            match card.filter(|_| lagging) {
+                Some(c) => keep_draft(app, id, typed_draft(&c)),
+                None => {
+                    app.timer.drafts.remove(&id);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The chip
+
+/// The running-interventions chip in the top bar (drawn right-to-left): a pulsing red dot,
+/// the elapsed time, the customer, a stop glyph. Click = the card in Running mode; click on
+/// the glyph = the card in Stop mode. Only the actor's own timers show here.
+pub fn chip(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
+    let now = app.now();
+    let actor = app.session.actor().to_string();
+    let mine = mine_running(app.data(), &actor);
+    let Some((id, customer, device, started)) = mine.first().cloned() else { return };
+    let hover = app.data().intervention(id).map(|i| format!("{} · {}", i.summary, device)).unwrap_or(device);
+    let extra = mine.len().saturating_sub(1);
+    let mut name = format::clipped(&customer, 18);
+    if extra > 0 {
+        name = format!("{name} +{extra}");
+    }
+    let p = ui.painter().clone();
+    let clock = p.layout_no_wrap(format::elapsed(&started, now), FontId::monospace(13.0), t.ui_text);
+    let label = p.layout_no_wrap(name, FontId::proportional(13.0), t.ui_text);
+    let width = 24.0 + clock.size().x + 8.0 + label.size().x + 34.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
+    let (fill, _) = widgets::tone_colors(t, Tone::Bad);
+    let red = widgets::danger(t);
+    p.rect_filled(rect, 15.0, if resp.hovered() { fill.gamma_multiply(0.85) } else { fill });
+    // The dot pulses: full one second, faint the next (the desk's clock, not a local one).
+    let on = now.timestamp().rem_euclid(2) == 0;
+    p.circle_filled(pos2(rect.left() + 12.0, rect.center().y), 4.0, if on { red } else { red.gamma_multiply(0.35) });
+    let mut x = rect.left() + 22.0;
+    p.galley(pos2(x, rect.center().y - clock.size().y / 2.0), clock.clone(), t.ui_text);
+    x += clock.size().x + 8.0;
+    p.galley(pos2(x, rect.center().y - label.size().y / 2.0), label, t.ui_text);
+    let stop = Rect::from_center_size(pos2(rect.right() - 15.0, rect.center().y), vec2(14.0, 14.0));
+    icons::paint(&p, stop, Icon::Stop, red);
+    let on_stop = resp.interact_pointer_pos().is_some_and(|q| stop.expand(7.0).contains(q));
+    if resp.clicked() {
+        if on_stop {
+            open_running(app, id, true);
+        } else {
+            let shown =
+                app.timer.card.as_ref().is_some_and(|c| c.mode == Mode::Running && !c.minimized && c.running.as_ref().is_some_and(|r| r.id == id));
+            if shown {
+                close(app);
+            } else {
+                open_running(app, id, false);
+            }
+        }
+    }
+    resp.on_hover_text(hover);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The card
+
+/// The docked card (drawn after the screens, like MailCraft's compose card).
+pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
+    sync(app);
+    let Some(mut c) = app.timer.card.clone() else { return };
+    let ctx = ui.ctx().clone();
+    let screen = ctx.content_rect();
+    let width = CARD_W.min((screen.width() - 40.0).max(240.0));
+    // Docked at the bottom right, dragged by its title bar anywhere on the screen.
+    let min_x = -(screen.width() - width - 48.0).max(0.0);
+    let min_y = -(screen.height() - 120.0).max(0.0);
+    c.offset = vec2(c.offset.x.clamp(min_x, 0.0), c.offset.y.clamp(min_y, 0.0));
+    let home = vec2(-24.0, -34.0) + c.offset;
+    let mut acts: Vec<Action> = Vec::new();
+    // Ctrl+Enter inside one of the card's own boxes submits.
+    let focused_here = ctx.memory(|m| m.focused()).is_some_and(|f| Field::ALL.iter().any(|x| x.id() == f));
+    if focused_here && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
+        acts.push(Action::Submit);
+    }
+    let now = app.now();
+    let was_minimized = c.minimized;
+    let app_ref: &DeskApp = app;
+    egui::Area::new(egui::Id::new("work-card")).anchor(egui::Align2::RIGHT_BOTTOM, home).order(egui::Order::Middle).fade_in(false).show(&ctx, |ui| {
+        egui::Frame::NONE
+            .fill(t.card)
+            .stroke(Stroke::new(1.0, t.border))
+            .corner_radius(12)
+            .shadow(egui::epaint::Shadow { offset: [0, 4], blur: 18, spread: 0, color: t.ui_text.gamma_multiply(0.18) })
+            .show(ui, |ui| {
+                ui.set_width(width);
+                title_bar(app_ref, ui, t, &mut c, width, now, &mut acts);
+                if c.minimized {
+                    return;
+                }
+                egui::Frame::NONE.inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
+                    ui.set_width(width - 28.0);
+                    body(app_ref, ui, t, &mut c, now, &mut acts);
+                });
+            });
+    });
+    let minimized = c.minimized && !was_minimized;
+    app.timer.card = Some(c);
+    if minimized {
+        // Minimised from the title bar: what was typed reaches the desk, like with Escape.
+        save_typed(app);
+    }
+    for a in acts {
+        apply(app, a);
+    }
+}
+
+fn apply(app: &mut DeskApp, action: Action) {
+    let mode = app.timer.card.as_ref().map(|c| c.mode);
+    // While the card waits for its command, nothing sends another (Ctrl+Enter in a field, a
+    // double click): one start, one entry, one stop.
+    let waiting = app.timer.card.as_ref().is_some_and(|c| c.busy);
+    if waiting && matches!(action, Action::Submit | Action::Anyway | Action::Consent) {
+        return;
+    }
+    match action {
+        Action::Submit => match mode {
+            Some(Mode::Start) => submit_start(app, false),
+            Some(Mode::Log) => submit_log(app, false),
+            Some(Mode::Stop) => submit_stop(app),
+            Some(Mode::Running) => {
+                if let Some(id) = app.timer.card.as_ref().and_then(|c| c.running.as_ref()).map(|r| r.id) {
+                    open_running(app, id, true);
+                }
+            }
+            None => {}
+        },
+        Action::Anyway => match mode {
+            Some(Mode::Log) => submit_log(app, true),
+            Some(_) => submit_start(app, true),
+            None => {}
+        },
+        Action::Consent => submit_consent(app),
+        Action::Cancel => match mode {
+            Some(Mode::Stop) => {
+                if let Some(c) = app.timer.card.as_mut() {
+                    c.mode = Mode::Running;
+                    c.error.clear();
+                }
+            }
+            _ => {
+                release(app);
+                app.timer.card = None;
+            }
+        },
+        Action::Close => {
+            release(app);
+            app.timer.card = None;
+        }
+        Action::Stop(id) => open_running(app, id, true),
+        Action::Follow(id) => open_running(app, id, false),
+        Action::Connect(device) => app.connect(device),
+    }
+}
+
+/// The dark title bar: the mode (and the ticking time), dragged to move the card, with the
+/// minimise and close buttons; double-click minimises.
+fn title_bar(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card, width: f32, now: DateTime<Utc>, acts: &mut Vec<Action>) {
+    let (bar, resp) = ui.allocate_exact_size(vec2(width, 40.0), Sense::click_and_drag());
+    if resp.dragged() {
+        c.offset += resp.drag_delta();
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if resp.double_clicked() {
+        c.minimized = !c.minimized;
+    }
+    let radius = if c.minimized { egui::CornerRadius::same(12) } else { egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 } };
+    ui.painter().rect_filled(bar, radius, if t.dark { t.chrome } else { t.ui_text });
+    let (icon, title) = match c.mode {
+        Mode::Start => (Icon::Play, app.tr("Start timer").to_string()),
+        Mode::Log => (Icon::Edit, app.tr("Log past work").to_string()),
+        Mode::Running | Mode::Stop => {
+            let (customer, _, started, _) = c.running.as_ref().map(|r| running_view(app.data(), r)).unwrap_or_default();
+            let word = if c.mode == Mode::Stop { app.tr("Stop") } else { app.tr("Running") };
+            (Icon::Timer, format!("{word} · {} · {customer}", format::elapsed(&started, now)))
+        }
+    };
+    let on_bar = t.on_accent;
+    icons::paint(ui.painter(), Rect::from_center_size(bar.left_center() + vec2(22.0, 0.0), vec2(18.0, 18.0)), icon, on_bar);
+    let galley = widgets::truncate(ui.painter(), &title, FontId::proportional(14.0), on_bar, (width - 120.0).max(40.0));
+    ui.painter().galley(pos2(bar.left() + 40.0, bar.center().y - galley.size().y / 2.0), galley, on_bar);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(vec2(6.0, 4.0))).layout(Layout::right_to_left(Align::Center)));
+    let light = Tokens { ui_text: on_bar, hover: on_bar.gamma_multiply(0.15), ..*t };
+    if icon_button(&mut child, &light, Icon::Close, app.tr("Close"), true, false).clicked() {
+        acts.push(Action::Close);
+    }
+    if icon_button(&mut child, &light, Icon::Chevron, app.tr("Minimize"), true, false).clicked() {
+        c.minimized = !c.minimized;
+    }
+}
+
+fn body(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card, now: DateTime<Utc>, acts: &mut Vec<Action>) {
+    match c.mode {
+        Mode::Start => start_body(app, ui, t, c, now, acts),
+        Mode::Running => running_body(app, ui, t, c, now, acts),
+        Mode::Stop => stop_body(app, ui, t, c, now, acts),
+        Mode::Log => log_body(app, ui, t, c, now, acts),
+    }
+    // Focus a box once the pointer is quiet (MailCraft's refocus trick: egui takes the focus
+    // away from a text box that is not under the click that opened it).
+    if let Some(f) = c.refocus {
+        if ui.input(|i| i.pointer.any_click() || i.pointer.any_pressed() || i.pointer.any_down()) {
+            ui.ctx().request_repaint();
+        } else {
+            ui.ctx().memory_mut(|m| m.request_focus(f.id()));
+            c.refocus = None;
+        }
+    }
+}
+
+fn start_body(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card, now: DateTime<Utc>, acts: &mut Vec<Action>) {
+    target_section(app, ui, t, c);
+    kind_row(app, ui, t, c);
+    text_row(ui, t, Field::Summary, app.tr("Summary"), &mut c.summary, app.tr("What is the request?"));
+    text_row(ui, t, Field::Reference, app.tr("Reference"), &mut c.reference, app.tr("Ticket or job number"));
+    let row =
+        TimeRow { field: Field::Started, label: "Started at", hint: app.tr("now"), chips: &[("Now", 0), ("−15 min", -15), ("−30 min", -30)] };
+    time_row(app, ui, t, &row, &mut c.started_at, now);
+    ui.add_space(4.0);
+    ui.checkbox(&mut c.billable, app.tr("Billable"));
+    warning_lines(ui, t, &c.warnings);
+    widgets::error_line(ui, t, &c.error);
+    ui.add_space(6.0);
+    let busy = c.busy;
+    if let Some(r) = c.refusal.as_mut() {
+        if let Some(f) = refusal_panel(app, ui, t, r, Mode::Start, busy, acts) {
+            c.refocus = Some(f);
+        }
+        return;
+    }
+    ui.horizontal(|ui| {
+        if action_button(ui, t, Some(Icon::Play), app.tr("Start"), c.target.customer.is_some() && !busy) {
+            acts.push(Action::Submit);
+        }
+        if ui.button(app.tr("Cancel")).clicked() {
+            acts.push(Action::Cancel);
+        }
+        if busy {
+            ui.add(egui::Spinner::new().size(16.0).color(t.accent));
+        }
+    });
+}
+
+fn running_body(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card, now: DateTime<Utc>, acts: &mut Vec<Action>) {
+    let mine = mine_running(app.data(), app.session.actor());
+    let current = c.running.as_ref().map(|r| r.id);
+    if mine.len() > 1 {
+        for (id, customer, device, started) in &mine {
+            let (rect, resp) = widgets::row(ui, t, 36.0, Some(*id) == current);
+            let p = ui.painter();
+            let text = if device.is_empty() { customer.clone() } else { format!("{customer} › {device}") };
+            let galley = widgets::truncate(p, &text, FontId::proportional(13.0), t.ui_text, (rect.width() - 130.0).max(20.0));
+            p.galley(pos2(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0), galley, t.ui_text);
+            p.text(
+                pos2(rect.right() - 44.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                format::elapsed(started, now),
+                FontId::monospace(13.0),
+                t.accent,
+            );
+            let stop_rect = Rect::from_center_size(pos2(rect.right() - 20.0, rect.center().y), vec2(28.0, 28.0));
+            let stop = ui.interact(stop_rect, ui.id().with(("stop-row", *id)), Sense::click());
+            if stop.hovered() {
+                ui.painter().rect_filled(stop_rect, 8.0, t.hover);
+            }
+            icons::paint(ui.painter(), stop_rect.shrink(7.0), Icon::Stop, widgets::danger(t));
+            if stop.on_hover_text(app.tr("Stop")).clicked() {
+                acts.push(Action::Stop(*id));
+            } else if resp.clicked() {
+                acts.push(Action::Follow(*id));
+            }
+        }
+        ui.add_space(6.0);
+    }
+    let rustdesk_id = header(app, ui, t, c, now);
+    text_row(ui, t, Field::Summary, app.tr("Summary"), &mut c.summary, app.tr("What is the request?"));
+    notes_block(app, ui, t, &mut c.notes);
+    ui.add_space(4.0);
+    ui.checkbox(&mut c.billable, app.tr("Billable"));
+    warning_lines(ui, t, &c.warnings);
+    widgets::error_line(ui, t, &c.error);
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if action_button(ui, t, Some(Icon::Stop), app.tr("Stop"), !c.busy)
+            && let Some(id) = current
+        {
+            acts.push(Action::Stop(id));
+        }
+        if !rustdesk_id.is_empty()
+            && let Some(device) = c.target.device
+            && widgets::icon_text_button(ui, t, Icon::Connect, app.tr("Connect again"), true).clicked()
+        {
+            acts.push(Action::Connect(device));
+        }
+    });
+}
+
+fn stop_body(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card, now: DateTime<Utc>, acts: &mut Vec<Action>) {
+    header(app, ui, t, c, now);
+    notes_block(app, ui, t, &mut c.notes);
+    text_row(ui, t, Field::Summary, app.tr("Summary"), &mut c.summary, app.tr("What is the request?"));
+    let row = TimeRow { field: Field::Ended, label: "Ended at", hint: app.tr("now"), chips: &[("Now", 0), ("−15 min", -15), ("−30 min", -30)] };
+    time_row(app, ui, t, &row, &mut c.ended_at, now);
+    text_row(ui, t, Field::Minutes, app.tr("Minutes"), &mut c.minutes, app.tr("Leave empty to use the elapsed time"));
+    ui.add_space(4.0);
+    ui.checkbox(&mut c.billable, app.tr("Billable"));
+    widgets::error_line(ui, t, &c.error);
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if action_button(ui, t, Some(Icon::Stop), app.tr("Stop"), !c.busy) {
+            acts.push(Action::Submit);
+        }
+        if ui.button(app.tr("Cancel")).clicked() {
+            acts.push(Action::Cancel);
+        }
+        if c.busy {
+            ui.add(egui::Spinner::new().size(16.0).color(t.accent));
+        }
+    });
+}
+
+fn log_body(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card, now: DateTime<Utc>, acts: &mut Vec<Action>) {
+    target_section(app, ui, t, c);
+    kind_row(app, ui, t, c);
+    text_row(ui, t, Field::Summary, app.tr("Summary"), &mut c.summary, app.tr("What is the request?"));
+    let example = format::input(&time::stamp(now));
+    let start = TimeRow { field: Field::Started, label: "Started at", hint: &example, chips: &[("Now", 0), ("−1 h", -60)] };
+    time_row(app, ui, t, &start, &mut c.started_at, now);
+    let end = TimeRow { field: Field::Ended, label: "Ended at", hint: &example, chips: &[("Now", 0)] };
+    time_row(app, ui, t, &end, &mut c.ended_at, now);
+    text_row(ui, t, Field::Minutes, app.tr("Minutes"), &mut c.minutes, "30");
+    text_row(ui, t, Field::Technician, app.tr("Technician"), &mut c.technician, app.session.actor());
+    text_row(ui, t, Field::Reference, app.tr("Reference"), &mut c.reference, app.tr("Ticket or job number"));
+    ui.add_space(4.0);
+    ui.checkbox(&mut c.billable, app.tr("Billable"));
+    notes_block(app, ui, t, &mut c.notes);
+    warning_lines(ui, t, &c.warnings);
+    widgets::error_line(ui, t, &c.error);
+    ui.add_space(6.0);
+    let busy = c.busy;
+    if let Some(r) = c.refusal.as_mut() {
+        if let Some(f) = refusal_panel(app, ui, t, r, Mode::Log, busy, acts) {
+            c.refocus = Some(f);
+        }
+        return;
+    }
+    ui.horizontal(|ui| {
+        let ready = c.target.customer.is_some() && !c.summary.trim().is_empty() && !busy;
+        if action_button(ui, t, None, app.tr("Save"), ready) {
+            acts.push(Action::Submit);
+        }
+        if ui.button(app.tr("Cancel")).clicked() {
+            acts.push(Action::Cancel);
+        }
+        if busy {
+            ui.add(egui::Spinner::new().size(16.0).color(t.accent));
+        }
+    });
+}
+
+/// The customer › PC line and the big elapsed time of the followed intervention; answers the
+/// PC's RustDesk ID (empty when none).
+fn header(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &Card, now: DateTime<Utc>) -> String {
+    let Some(r) = c.running.as_ref() else { return String::new() };
+    let (customer, device, started, rustdesk_id) = running_view(app.data(), r);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        let icon = if !rustdesk_id.is_empty() {
+            Icon::Remote
+        } else if device.is_empty() {
+            Icon::Customer
+        } else {
+            Icon::Device
+        };
+        icons::paint(ui.painter(), rect, icon, t.accent);
+        let text = if device.is_empty() { customer } else { format!("{customer} › {device}") };
+        let w = ui.available_width().max(20.0);
+        let galley = widgets::truncate(ui.painter(), &text, FontId::proportional(15.0), t.ui_text, w);
+        let (rect, _) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
+        ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, t.ui_text);
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format::elapsed(&started, now)).font(FontId::monospace(28.0)).color(t.accent));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let when = format!("{} {}", app.tr("Started at"), format::short(&started, now, app.italian()));
+            ui.label(RichText::new(when).small().color(t.muted));
+            if !rustdesk_id.is_empty() {
+                ui.label(RichText::new(rustdesk::display(&rustdesk_id)).font(FontId::monospace(12.0)).color(t.muted));
+            }
+        });
+    });
+    ui.add_space(4.0);
+    rustdesk_id
+}
+
+/// The picked target as a line with a button to change it, or the picker.
+fn target_section(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card) {
+    let d = app.data();
+    let Some(customer) = c.target.customer else {
+        picker(app, ui, t, c);
+        return;
+    };
+    let device = c.target.device.and_then(|x| d.device(x));
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        let icon = match device {
+            Some(x) if !x.rustdesk_id.is_empty() => Icon::Remote,
+            Some(_) => Icon::Device,
+            None => Icon::Customer,
+        };
+        icons::paint(ui.painter(), rect, icon, t.accent);
+        let mut text = crate::customer_name(d, customer);
+        if let Some(x) = device {
+            text = format!("{text} › {}", x.name);
+            if !x.rustdesk_id.is_empty() {
+                text = format!("{text}  {}", rustdesk::display(&x.rustdesk_id));
+            }
+        }
+        let w = (ui.available_width() - 40.0).max(20.0);
+        let galley = widgets::truncate(ui.painter(), &text, FontId::proportional(14.0), t.ui_text, w);
+        let (rect, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+        ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, t.ui_text);
+        if icon_button(ui, t, Icon::Close, app.tr("Change"), true, false).clicked() {
+            retarget(c, Target::default());
+            c.refocus = Some(Field::Target);
+        }
+    });
+    hairline(ui, t);
+}
+
+/// Points the card at another target: the refusal panel and the error belonged to the old one
+/// (a consent recorded from that panel would go to the new customer).
+fn retarget(c: &mut Card, target: Target) {
+    c.target = target;
+    c.refusal = None;
+    c.error.clear();
+}
+
+/// The target picker: a text box filtering the PCs and the customers of the mirror (a
+/// RustDesk ID matches its PC exactly); click or Enter picks, the kind follows the pick.
+fn picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card) {
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut c.target.text)
+            .id(Field::Target.id())
+            .hint_text(app.tr("Type a name or a RustDesk ID"))
+            .desired_width(f32::INFINITY),
+    );
+    let q = core::fold(c.target.text.trim());
+    if q.is_empty() {
+        ui.label(RichText::new(app.tr("Choose a customer or a PC")).small().color(t.muted));
+        return;
+    }
+    let d = app.data();
+    let devices: Vec<(u64, u64, String)> = d
+        .devices
+        .iter()
+        .filter(|x| !x.retired && views::device_matches(x, &q))
+        .take(PICKER_ROWS)
+        .map(|x| {
+            let id = if x.rustdesk_id.is_empty() { String::new() } else { format!(" · {}", rustdesk::display(&x.rustdesk_id)) };
+            (x.id, x.customer_id, format!("{} · {}{id}", x.name, crate::customer_name(d, x.customer_id)))
+        })
+        .collect();
+    let customers: Vec<(u64, String)> = d
+        .customers
+        .iter()
+        .filter(|x| x.erased_at.is_none() && !x.archived && views::customer_matches(x, &q))
+        .take(PICKER_ROWS)
+        .map(|x| (x.id, if x.tax_id.is_empty() { x.name.clone() } else { format!("{} · {}", x.name, x.tax_id) }))
+        .collect();
+    let mut pick: Option<(u64, Option<u64>)> = None;
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+        pick = devices.first().map(|(dev, cu, _)| (*cu, Some(*dev))).or_else(|| customers.first().map(|(cu, _)| (*cu, None)));
+    }
+    egui::Frame::NONE.fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(8).inner_margin(4).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if devices.is_empty() && customers.is_empty() {
+            ui.label(RichText::new(app.tr("No match")).small().color(t.muted));
+        }
+        for (dev, cu, text) in &devices {
+            if picker_row(ui, t, Icon::Device, text).clicked() {
+                pick = Some((*cu, Some(*dev)));
+            }
+        }
+        for (cu, text) in &customers {
+            if picker_row(ui, t, Icon::Customer, text).clicked() {
+                pick = Some((*cu, None));
+            }
+        }
+    });
+    if let Some((customer, device)) = pick {
+        retarget(c, Target { customer: Some(customer), device, text: String::new() });
+        if !c.kind_touched {
+            c.kind = kind_default(d, &c.target).to_string();
+        }
+        c.refocus = Some(Field::Summary);
+    }
+}
+
+fn picker_row(ui: &mut egui::Ui, t: &Tokens, icon: Icon, text: &str) -> Response {
+    let (rect, resp) = widgets::row(ui, t, 30.0, false);
+    let p = ui.painter();
+    icons::paint(p, Rect::from_center_size(pos2(rect.left() + 16.0, rect.center().y), vec2(16.0, 16.0)), icon, t.muted);
+    let galley = widgets::truncate(p, text, FontId::proportional(13.0), t.ui_text, (rect.width() - 40.0).max(20.0));
+    p.galley(pos2(rect.left() + 30.0, rect.center().y - galley.size().y / 2.0), galley, t.ui_text);
+    resp
+}
+
+/// The kind of work as a row of chips.
+fn kind_row(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card) {
+    ui.horizontal(|ui| {
+        label_box(ui, t, app.tr("Kind"));
+        // The chips wrap in their own column, to the right of the label.
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for (value, label, icon) in KINDS {
+                    if choice_chip(ui, t, icon, app.tr(label), c.kind == value).clicked() {
+                        c.kind = value.to_string();
+                        c.kind_touched = true;
+                    }
+                }
+            });
+        });
+    });
+    hairline(ui, t);
+}
+
+/// A time box with quick chips: `Now` clears it (empty = now), the others set a time
+/// relative to now.
+struct TimeRow<'a> {
+    field: Field,
+    label: &'a str,
+    hint: &'a str,
+    chips: &'a [(&'a str, i64)],
+}
+
+fn time_row(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, row: &TimeRow<'_>, value: &mut String, now: DateTime<Utc>) {
+    // Wrapped: on a narrow card the chips go to a second line instead of widening it.
+    ui.horizontal_wrapped(|ui| {
+        label_box(ui, t, app.tr(row.label));
+        // The chips keep their width; the text box takes what is left of the card.
+        let chips_w: f32 = row
+            .chips
+            .iter()
+            .map(|(label, _)| ui.painter().layout_no_wrap(app.tr(label).to_string(), FontId::proportional(14.0), t.ui_text).size().x + 16.0)
+            .sum();
+        // In a wrapped row `available_width` is the whole line: measure from the cursor.
+        let room = ui.max_rect().right() - ui.cursor().left();
+        let w = (room - chips_w - 12.0).clamp(48.0, 180.0);
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .id(row.field.id())
+                .hint_text(row.hint)
+                .desired_width(w)
+                .frame(egui::Frame::NONE)
+                .font(FontId::monospace(13.0)),
+        );
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = vec2(6.0, 1.0);
+        for (label, minutes) in row.chips {
+            if ui.small_button(app.tr(label)).clicked() {
+                *value = if *minutes == 0 { String::new() } else { shifted(now, *minutes) };
+            }
+        }
+    });
+    hairline(ui, t);
+}
+
+/// A compose-style row: a muted label, a frameless text box, a hairline under both.
+fn text_row(ui: &mut egui::Ui, t: &Tokens, field: Field, label: &str, value: &mut String, hint: &str) -> Response {
+    let r = ui
+        .horizontal(|ui| {
+            label_box(ui, t, label);
+            let w = (ui.available_width() - 4.0).max(40.0);
+            ui.add(egui::TextEdit::singleline(value).id(field.id()).hint_text(hint).desired_width(w).frame(egui::Frame::NONE))
+        })
+        .inner;
+    hairline(ui, t);
+    r
+}
+
+/// The notes box: a few lines on the panel tone.
+fn notes_block(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, notes: &mut String) {
+    ui.add_space(4.0);
+    ui.label(RichText::new(app.tr("Notes")).small().color(t.muted));
+    egui::Frame::NONE.fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(8).inner_margin(6).show(ui, |ui| {
+        ui.add(
+            egui::TextEdit::multiline(notes)
+                .id(Field::Notes.id())
+                .hint_text(app.tr("What was done, found, left to do"))
+                .desired_rows(4)
+                .desired_width(f32::INFINITY)
+                .frame(egui::Frame::NONE),
+        );
+    });
+}
+
+/// The red-outlined panel of a refused start: a reason to go ahead, or a verbal consent to
+/// record first. Answers the field to focus, if any.
+fn refusal_panel(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, r: &mut Refusal, mode: Mode, busy: bool, acts: &mut Vec<Action>) -> Option<Field> {
+    let (fill, _) = widgets::tone_colors(t, Tone::Bad);
+    let red = widgets::danger(t);
+    let mut focus = None;
+    egui::Frame::NONE.fill(fill).stroke(Stroke::new(1.5, red)).corner_radius(8).inner_margin(10).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            icons::paint(ui.painter(), rect, Icon::Warning, red);
+            let state = app.tr(&r.state).to_string();
+            ui.label(RichText::new(app.language.fill("Remote-assistance consent is {state}", &[("state", &state)])).strong().color(red));
+        });
+        ui.label(RichText::new(app.tr("Reason to proceed without consent")).small().color(t.muted));
+        ui.add(
+            egui::TextEdit::singleline(&mut r.reason)
+                .id(Field::Reason.id())
+                .hint_text(app.tr("The person agreed on the phone"))
+                .desired_width(f32::INFINITY),
+        );
+        ui.horizontal(|ui| {
+            let label = if mode == Mode::Log { "Log anyway" } else { "Start anyway" };
+            if action_button(ui, t, Some(Icon::Play), app.tr(label), !r.reason.trim().is_empty() && !busy) {
+                acts.push(Action::Anyway);
+            }
+            if ui.button(app.tr("Record consent first")).clicked() {
+                r.record = !r.record;
+                if r.record {
+                    focus = Some(Field::Signer);
+                }
+            }
+        });
+        if r.record {
+            text_row(ui, t, Field::Signer, app.tr("Who agreed"), &mut r.signer, "");
+            text_row(ui, t, Field::Note, app.tr("Evidence or note"), &mut r.note, "");
+            ui.add_space(4.0);
+            if action_button(ui, t, Some(Icon::Signature), app.tr("Record verbal consent and start"), !r.signer.trim().is_empty() && !busy) {
+                acts.push(Action::Consent);
+            }
+        }
+        widgets::error_line(ui, t, &r.error);
+        if busy {
+            ui.add(egui::Spinner::new().size(16.0).color(t.accent));
+        }
+    });
+    focus
+}
+
+// ---------------------------------------------------------------------------------------------
+// Small widgets of the card
+
+/// A fixed-width muted label at the left of a row.
+fn label_box(ui: &mut egui::Ui, t: &Tokens, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(LABEL_W, 24.0), Sense::hover());
+    let galley = widgets::truncate(ui.painter(), text, FontId::proportional(13.0), t.muted, LABEL_W - 6.0);
+    ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, t.muted);
+}
+
+/// A hairline under a row.
+fn hairline(ui: &mut egui::Ui, t: &Tokens) {
+    ui.painter().hline(ui.min_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, t.border));
+}
+
+/// A selectable pill with a glyph (the kinds of work).
+fn choice_chip(ui: &mut egui::Ui, t: &Tokens, icon: Icon, text: &str, selected: bool) -> Response {
+    let color = if selected { t.accent } else { t.ui_text };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(13.0), color);
+    let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 36.0, 26.0), Sense::click());
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, 13.0, t.active);
+    } else {
+        if resp.hovered() {
+            p.rect_filled(rect, 13.0, t.hover);
+        }
+        p.rect_stroke(rect, 13.0, Stroke::new(1.0, t.border), StrokeKind::Inside);
+    }
+    icons::paint(p, Rect::from_center_size(pos2(rect.left() + 16.0, rect.center().y), vec2(15.0, 15.0)), icon, color);
+    p.galley(pos2(rect.left() + 27.0, rect.center().y - galley.size().y / 2.0), galley, color);
+    resp
+}
+
+/// The accent button of a bar, muted and inert when disabled; answers whether it was clicked.
+fn action_button(ui: &mut egui::Ui, t: &Tokens, icon: Option<Icon>, text: &str, enabled: bool) -> bool {
+    if enabled {
+        return widgets::primary_button(ui, t, icon, text).clicked();
+    }
+    let muted = Tokens { accent: t.accent.gamma_multiply(0.45), ..*t };
+    widgets::primary_button(ui, &muted, icon, text);
+    false
+}
+
+/// The engine's warnings as amber lines.
+fn warning_lines(ui: &mut egui::Ui, t: &Tokens, lines: &[String]) {
+    let (fill, color) = widgets::tone_colors(t, Tone::Warn);
+    for w in lines {
+        egui::Frame::NONE.fill(fill).corner_radius(6).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                icons::paint(ui.painter(), rect, Icon::Warning, color);
+                ui.label(RichText::new(w).small().color(color));
+            });
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Language, Screen};
+
+    /// Renders one frame of the app at 1440×900 (no window, no GPU).
+    fn frame(app: &mut DeskApp) {
+        let ctx = egui::Context::default();
+        let input =
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+    }
+
+    /// The demo desk with the interface in English (the desk's own language is Italian).
+    fn demo_en() -> DeskApp {
+        let mut app = DeskApp::demo();
+        app.language = Language::En;
+        app
+    }
+
+    fn card(app: &DeskApp) -> &Card {
+        app.timer.card.as_ref().expect("the card is open")
+    }
+
+    fn edit(app: &mut DeskApp, f: impl FnOnce(&mut Card)) {
+        f(app.timer.card.as_mut().expect("the card is open"));
+    }
+
+    fn edit_refusal(app: &mut DeskApp, f: impl FnOnce(&mut Refusal)) {
+        f(app.timer.card.as_mut().and_then(|c| c.refusal.as_mut()).expect("the refusal panel is open"));
+    }
+
+    #[test]
+    fn every_mode_renders_in_both_languages_and_themes() {
+        for lang in Language::ALL {
+            for dark in [false, true] {
+                let mut app = DeskApp::demo();
+                app.language = lang;
+                app.dark = dark;
+                app.go(Screen::Customers);
+                open_start(&mut app, Some(1), Some(1));
+                frame(&mut app);
+                assert_eq!(card(&app).kind, "remote");
+                open_start(&mut app, None, None);
+                edit(&mut app, |c| c.target.text = "lun".into());
+                frame(&mut app);
+                assert_eq!(card(&app).kind, "phone");
+                open_log(&mut app, Some(2), Some(4));
+                frame(&mut app);
+                assert!(!card(&app).started_at.is_empty(), "log mode prefills the start");
+                // Running, stop, the refusal panel and its consent form.
+                start_now(&mut app, 4);
+                frame(&mut app);
+                assert_eq!(card(&app).mode, Mode::Running);
+                frame(&mut app);
+                open_running(&mut app, 11, true);
+                frame(&mut app);
+                assert_eq!(card(&app).mode, Mode::Stop);
+                start_now(&mut app, 5);
+                frame(&mut app);
+                assert!(card(&app).refusal.is_some());
+                edit_refusal(&mut app, |r| r.record = true);
+                frame(&mut app);
+                assert!(close(&mut app) && card(&app).minimized);
+                frame(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn start_now_opens_the_link_in_the_click_frame_and_the_card_on_the_answer() {
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/200300400".into())]);
+        assert!(app.timer.card.is_none(), "the card waits for the engine");
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!(c.mode, Mode::Running);
+        assert_eq!(c.running.as_ref().map(|r| r.id), Some(11));
+        assert_eq!(c.target, Target { customer: Some(2), device: Some(4), text: String::new() });
+        assert_eq!(app.requests.len(), 1, "the link is not opened twice");
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started"));
+        assert!(app.data().intervention(11).is_some_and(|i| i.running()));
+        // The chip toggles the card; the stop glyph goes to Stop mode.
+        close(&mut app);
+        assert!(card(&app).minimized);
+        open_running(&mut app, 11, true);
+        let c = app.timer.card.as_mut().expect("card");
+        assert_eq!(c.mode, Mode::Stop);
+        assert!(!c.minimized);
+        c.notes = "Driver aggiornato".into();
+        c.minutes = "x".into();
+        submit_stop(&mut app);
+        assert!(card(&app).error.contains("number"));
+        edit(&mut app, |c| c.minutes = "20".into());
+        submit_stop(&mut app);
+        assert!(card(&app).busy);
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        assert_eq!(app.selected_intervention, Some(11));
+        let i = app.data().intervention(11).expect("stopped");
+        assert!(!i.running());
+        assert_eq!(i.minutes, 20);
+        assert!(i.notes.contains("Driver aggiornato"));
+        let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+        assert!(toast.starts_with("Stopped · 20 min · Ferramenta Corvo"), "{toast}");
+    }
+
+    #[test]
+    fn a_refused_start_offers_a_reason_or_a_verbal_consent() {
+        // Elio Brina (3) has no remote-assistance consent and the desk requires one.
+        let mut app = demo_en();
+        start_now(&mut app, 5);
+        assert!(app.requests.is_empty(), "no link without consent");
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!(c.mode, Mode::Start);
+        assert_eq!(c.refusal.as_ref().map(|r| r.state.as_str()), Some("missing"));
+        assert_eq!(c.target.device, Some(5));
+        assert_eq!(c.kind, "remote");
+        // Start anyway, with the reason.
+        edit_refusal(&mut app, |r| r.reason = "agreed on the phone".into());
+        submit_start(&mut app, true);
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Running);
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/300400500".into())], "opened from the answer");
+        assert_eq!(app.data().intervention(11).map(|i| i.consent_override.as_str()), Some("agreed on the phone"));
+        assert!(card(&app).warnings.iter().any(|w| w.contains("consent is missing")), "{:?}", card(&app).warnings);
+        // Record a verbal consent instead: the start is sent again by itself.
+        let mut app = DeskApp::demo();
+        app.language = Language::It;
+        start_now(&mut app, 5);
+        frame(&mut app);
+        let r = app.timer.card.as_mut().and_then(|c| c.refusal.as_mut()).expect("refusal");
+        r.record = true;
+        r.signer = "Elio Brina".into();
+        r.note = "detto al telefono".into();
+        submit_consent(&mut app);
+        frame(&mut app); // the consent answers: the start is re-sent
+        frame(&mut app); // the start answers
+        assert_eq!(card(&app).mode, Mode::Running);
+        assert!(card(&app).refusal.is_none());
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/300400500".into())], "opened when re-sent");
+        let events = app.data().privacy.iter().filter(|e| e.customer_id == 3 && e.purpose == "remote_assistance").count();
+        assert_eq!(events, 1);
+        assert_eq!(app.data().intervention(11).map(|i| i.consent_override.as_str()), Some(""));
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer avviato"));
+    }
+
+    #[test]
+    fn the_start_form_validates_and_submits() {
+        let mut app = demo_en();
+        open_start(&mut app, None, None);
+        submit_start(&mut app, false);
+        assert_eq!(card(&app).error, "Choose a customer or a PC");
+        let c = app.timer.card.as_mut().expect("card");
+        c.target = Target { customer: Some(1), device: None, text: String::new() };
+        c.kind = "phone".into();
+        c.summary = "Domanda sulla posta".into();
+        c.started_at = "ieri".into();
+        submit_start(&mut app, false);
+        assert!(card(&app).error.starts_with("Not a time"));
+        edit(&mut app, |c| c.started_at = "09:00".into());
+        submit_start(&mut app, false);
+        assert!(app.requests.is_empty(), "a phone call opens no link");
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!(c.mode, Mode::Running);
+        assert_eq!(c.summary, "Domanda sulla posta");
+        let i = app.data().intervention(11).expect("started");
+        assert_eq!(i.kind, core::InterventionKind::Phone);
+        assert!(i.started_at.ends_with("Z"));
+    }
+
+    #[test]
+    fn past_work_is_logged_from_the_card() {
+        let mut app = demo_en();
+        open_log(&mut app, Some(1), None);
+        assert_eq!(card(&app).technician, "riccardo");
+        let c = app.timer.card.as_mut().expect("card");
+        c.summary = "Backup verificato".into();
+        c.started_at = "09:00".into();
+        submit_log(&mut app, false);
+        assert_eq!(card(&app).error, "Give the end time or the minutes");
+        edit(&mut app, |c| c.ended_at = "08:00".into());
+        submit_log(&mut app, false);
+        assert_eq!(card(&app).error, "The end is before the start");
+        let c = app.timer.card.as_mut().expect("card");
+        c.ended_at.clear();
+        c.minutes = "30".into();
+        submit_log(&mut app, false);
+        assert!(card(&app).busy, "the card waits for the engine's answer");
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        assert_eq!(app.selected_intervention, Some(11));
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Intervention saved"));
+        let i = app.data().intervention(11).expect("logged");
+        assert_eq!(i.minutes, 30);
+        assert_eq!(i.kind, core::InterventionKind::Phone);
+        assert!(!i.running());
+        // A required summary stops the submit locally.
+        open_log(&mut app, Some(1), None);
+        submit_log(&mut app, false);
+        assert_eq!(card(&app).error, "Summary is required");
+    }
+
+    #[test]
+    fn escape_minimises_then_closes_and_an_external_stop_drops_the_card() {
+        let mut app = demo_en();
+        assert!(!close(&mut app));
+        open_start(&mut app, Some(1), None);
+        assert!(close(&mut app));
+        assert!(card(&app).minimized);
+        assert!(close(&mut app));
+        assert!(app.timer.card.is_none());
+        start_now(&mut app, 1);
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Running);
+        app.run("intervention.stop", json!({"id": 11}));
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "stopped elsewhere");
+        // `x`: stop my timer right now, without notes (nothing to stop first: a no-op).
+        stop_mine(&mut app);
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        assert!(!app.toast.as_ref().is_some_and(|t| t.0.starts_with("Stopped")), "nothing to stop");
+        start_now(&mut app, 4);
+        frame(&mut app);
+        stop_mine(&mut app);
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        assert!(app.data().intervention(12).is_some_and(|i| !i.running()));
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("Stopped")));
+    }
+
+    /// A desk seen through a mirror, like a remote desk: commands run on the desk at once, the
+    /// mirror catches up on `pump` unless held back (the snapshot has not arrived yet).
+    struct Mirror {
+        desk: crate::Session,
+        data: Data,
+        revision: u64,
+        hold: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl crate::DeskSession for Mirror {
+        fn data(&self) -> &Data {
+            &self.data
+        }
+        fn actor(&self) -> &str {
+            self.desk.actor()
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.desk.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.desk.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            let done = self.desk.pump();
+            if !self.hold.get() && self.revision != self.desk.revision() {
+                self.data = self.desk.data().clone();
+                self.revision = self.desk.revision();
+            }
+            done
+        }
+        fn jobs_pending(&self) -> usize {
+            0
+        }
+        fn revision(&self) -> u64 {
+            self.revision
+        }
+        fn server(&self) -> String {
+            "http://mirror.test".into()
+        }
+    }
+
+    /// The demo desk whose answers wait until `release` is set, as from a slow server.
+    struct Slow {
+        desk: crate::Session,
+        held: Vec<Completed>,
+        release: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl crate::DeskSession for Slow {
+        fn data(&self) -> &Data {
+            self.desk.data()
+        }
+        fn actor(&self) -> &str {
+            self.desk.actor()
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.desk.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.desk.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            self.held.extend(self.desk.pump());
+            if self.release.get() { std::mem::take(&mut self.held) } else { Vec::new() }
+        }
+        fn jobs_pending(&self) -> usize {
+            self.held.len()
+        }
+        fn revision(&self) -> u64 {
+            self.desk.revision()
+        }
+        fn server(&self) -> String {
+            "http://slow.test".into()
+        }
+    }
+
+    #[test]
+    fn a_card_waiting_for_its_answer_sends_nothing_more_and_keeps_what_it_shows() {
+        let release = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut app = DeskApp::new(Box::new(Slow { desk: crate::Session::demo(), held: Vec::new(), release: release.clone() }));
+        app.language = Language::En;
+        // A start sent from the card, then sent again (Ctrl+Enter, a double click) before the
+        // slow answer: one timer.
+        open_start(&mut app, Some(2), Some(4));
+        edit(&mut app, |c| c.summary = "Cassa bloccata".into());
+        apply(&mut app, Action::Submit);
+        apply(&mut app, Action::Submit);
+        apply(&mut app, Action::Anyway);
+        release.set(true);
+        frame(&mut app);
+        let running: Vec<u64> = app.data().interventions.iter().filter(|i| i.running()).map(|i| i.id).collect();
+        assert_eq!(running, vec![11], "one start only");
+        assert_eq!(card(&app).mode, Mode::Running);
+        // A past-work entry answered after the card moved on to the running intervention (the
+        // chip): the card stays on it with the notes typed meanwhile.
+        open_log(&mut app, Some(1), Some(1));
+        edit(&mut app, |c| {
+            c.summary = "Backup".into();
+            c.started_at = "09:00".into();
+            c.minutes = "30".into();
+        });
+        release.set(false);
+        apply(&mut app, Action::Submit);
+        open_running(&mut app, 11, false);
+        edit(&mut app, |c| c.notes = "Rullo sostituito".into());
+        release.set(true);
+        frame(&mut app);
+        assert!(app.data().interventions.iter().any(|i| i.summary == "Backup"), "the entry is saved");
+        let c = card(&app);
+        assert_eq!((c.mode, c.running.as_ref().map(|r| r.id), c.notes.as_str()), (Mode::Running, Some(11), "Rullo sostituito"));
+    }
+
+    #[test]
+    fn a_stop_answered_after_the_card_moved_on_frees_the_card() {
+        let release = std::rc::Rc::new(std::cell::Cell::new(true));
+        let mut app = DeskApp::new(Box::new(Slow { desk: crate::Session::demo(), held: Vec::new(), release: release.clone() }));
+        app.language = Language::En;
+        // Two timers of mine: 11 on PC 1, 12 on PC 4.
+        start_now(&mut app, 1);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        let running: Vec<u64> = app.data().interventions.iter().filter(|i| i.running()).map(|i| i.id).collect();
+        assert_eq!(running, vec![11, 12]);
+        // The card stops 11; the server is slow, and the technician moves on to 12 meanwhile.
+        open_running(&mut app, 11, true);
+        release.set(false);
+        submit_stop(&mut app);
+        assert!(card(&app).busy);
+        open_running(&mut app, 12, false);
+        frame(&mut app);
+        assert_eq!(card(&app).running.as_ref().map(|r| r.id), Some(12));
+        // The stop of 11 is answered: the card, now on 12, is free again and keeps following 12.
+        release.set(true);
+        frame(&mut app);
+        let c = card(&app);
+        assert!(!c.busy && c.waiting.is_none(), "the card waits for nothing any more");
+        assert_eq!((c.mode, c.running.as_ref().map(|r| r.id)), (Mode::Running, Some(12)));
+        assert!(app.data().intervention(11).is_some_and(|i| !i.running()));
+        // What is typed for 12 is saved when the card is minimised.
+        edit(&mut app, |c| c.summary = "Stampante".into());
+        assert!(close(&mut app));
+        frame(&mut app);
+        assert_eq!(app.data().intervention(12).map(|i| i.summary.as_str()), Some("Stampante"));
+        // A past-work entry is saved slowly; a new form opened meanwhile stays open.
+        open_log(&mut app, Some(1), Some(1));
+        edit(&mut app, |c| {
+            c.summary = "Backup".into();
+            c.started_at = "09:00".into();
+            c.minutes = "30".into();
+        });
+        release.set(false);
+        submit_log(&mut app, false);
+        open_start(&mut app, Some(2), Some(4));
+        edit(&mut app, |c| c.summary = "Cassa".into());
+        release.set(true);
+        frame(&mut app);
+        assert!(app.data().interventions.iter().any(|i| i.summary == "Backup"), "the entry is saved");
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer, c.summary.as_str()), (Mode::Start, Some(2), "Cassa"), "the new form stays");
+    }
+
+    /// The demo desk behind a mirror, in English, and the switch that holds the mirror back.
+    fn mirrored() -> (DeskApp, std::rc::Rc<std::cell::Cell<bool>>) {
+        use crate::DeskSession;
+        let desk = crate::Session::demo();
+        let hold = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mirror = Mirror { data: desk.data().clone(), revision: desk.revision(), desk, hold: hold.clone() };
+        let mut app = DeskApp::new(Box::new(mirror));
+        app.language = Language::En;
+        (app, hold)
+    }
+
+    /// One frame on a context that lives across frames (the focus), with these input events.
+    fn frame_in(ctx: &egui::Context, app: &mut DeskApp, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+    }
+
+    pub(crate) fn ctrl_enter() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers { ctrl: true, command: true, ..Modifiers::NONE },
+        }
+    }
+
+    #[test]
+    fn on_a_lagging_mirror_stop_works_before_the_snapshot() {
+        let (mut app, hold) = mirrored();
+        hold.set(true);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        assert_eq!(card(&app).running.as_ref().map(|r| r.id), Some(11));
+        assert!(app.data().intervention(11).is_none(), "the snapshot has not arrived");
+        frame(&mut app);
+        assert!(app.timer.card.is_some(), "a lagging mirror does not close the card");
+        // Stop (the button, or Ctrl+Enter in Running mode) goes to Stop mode from the card's copy.
+        apply(&mut app, Action::Stop(11));
+        assert_eq!(card(&app).mode, Mode::Stop);
+        apply(&mut app, Action::Cancel);
+        apply(&mut app, Action::Submit);
+        assert_eq!(card(&app).mode, Mode::Stop);
+        edit(&mut app, |c| c.notes = "Fatto".into());
+        submit_stop(&mut app);
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "stopped");
+        hold.set(false);
+        frame(&mut app);
+        assert!(app.data().intervention(11).is_some_and(|i| !i.running() && i.notes.contains("Fatto")));
+        // Nothing to switch when no card follows it.
+        open_running(&mut app, 99, true);
+        assert!(app.timer.card.is_none());
+    }
+
+    #[test]
+    fn a_running_card_closes_when_its_intervention_is_deleted_elsewhere() {
+        // The mirror held it, then a snapshot without it arrives: deleted, the card closes.
+        let (mut app, _hold) = mirrored();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        frame(&mut app);
+        assert!(card(&app).seen);
+        app.session.execute("intervention.remove", &json!({"id": 11}));
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "deleted elsewhere");
+        // Never seen in the mirror (deleted before any snapshot held it): closed after the lag.
+        let (mut app, hold) = mirrored();
+        hold.set(true);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        app.session.execute("intervention.remove", &json!({"id": 11}));
+        hold.set(false);
+        frame(&mut app);
+        assert!(app.timer.card.is_some(), "may still be lag");
+        assert!(card(&app).missing_since.is_some());
+        edit(&mut app, |c| c.missing_since = Some(beyond_the_lag()));
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "missing for longer than the lag");
+        // The local desk cannot lag: closed at once (and the record is present meanwhile).
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        app.run("intervention.remove", json!({"id": 11}));
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+    }
+
+    #[test]
+    fn closing_the_running_card_keeps_what_was_typed() {
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        edit(&mut app, |c| {
+            c.summary = "Stampante bloccata".into();
+            c.notes = "Driver reinstallato".into();
+            c.billable = false;
+        });
+        // Escape minimises: the summary and Billable reach the desk.
+        assert!(close(&mut app));
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("running");
+        assert_eq!((i.summary.as_str(), i.billable), ("Stampante bloccata", false));
+        assert!(i.notes.is_empty(), "the notes wait for the stop");
+        // Escape again closes: the notes are kept for the stop.
+        assert!(close(&mut app));
+        assert!(app.timer.card.is_none());
+        assert_eq!(app.timer.drafts.get(&11).map(|d| d.notes.as_str()), Some("Driver reinstallato"));
+        // Reopened from the chip: the stored summary and the kept notes.
+        open_running(&mut app, 11, false);
+        assert_eq!(card(&app).summary, "Stampante bloccata");
+        assert_eq!(card(&app).notes, "Driver reinstallato");
+        assert!(app.timer.drafts.is_empty());
+        // The close button, after typing more; an emptied summary is never sent.
+        edit(&mut app, |c| {
+            c.summary.clear();
+            c.notes.push_str(" e testato");
+        });
+        apply(&mut app, Action::Close);
+        frame(&mut app);
+        assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some("Stampante bloccata"));
+        // Another form replacing the card keeps them too.
+        open_running(&mut app, 11, false);
+        edit(&mut app, |c| c.summary = "Stampante sbloccata".into());
+        open_log(&mut app, Some(1), None);
+        frame(&mut app);
+        assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some("Stampante sbloccata"));
+        assert_eq!(app.timer.drafts.get(&11).map(|d| d.notes.as_str()), Some("Driver reinstallato e testato"));
+        // Stopped with `x`: the kept notes go with it, and are forgotten.
+        app.timer.card = None;
+        stop_mine(&mut app);
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("stopped");
+        assert!(!i.running());
+        assert!(i.notes.contains("Driver reinstallato e testato"), "{}", i.notes);
+        assert!(app.timer.drafts.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_acts_only_for_its_own_customer() {
+        // Elio Brina (3) has no remote-assistance consent; Lunaria (1, PC 1) has.
+        let mut app = demo_en();
+        let consents = |app: &DeskApp, customer: u64| {
+            app.data().privacy.iter().filter(|e| e.customer_id == customer && e.purpose == "remote_assistance").count()
+        };
+        start_now(&mut app, 5);
+        frame(&mut app);
+        assert_eq!(card(&app).refusal.as_ref().map(|r| r.customer), Some(Some(3)));
+        // Change the target (the Change button, the picker): the panel goes.
+        edit(&mut app, |c| retarget(c, Target { customer: Some(1), device: Some(1), text: String::new() }));
+        assert!(card(&app).refusal.is_none());
+        assert!(card(&app).error.is_empty());
+        // A panel left over from another customer never records a consent for this one.
+        let before = consents(&app, 1);
+        edit(&mut app, |c| {
+            c.refusal = Some(Refusal {
+                customer: Some(3),
+                state: "missing".into(),
+                reason: "agreed on the phone".into(),
+                record: true,
+                signer: "Elio Brina".into(),
+                ..Refusal::default()
+            });
+        });
+        submit_consent(&mut app);
+        frame(&mut app);
+        assert_eq!(consents(&app, 1), before, "no consent for the wrong customer");
+        assert!(card(&app).refusal.is_none(), "the stale panel is dropped");
+        assert!(app.data().intervention(11).is_none());
+        // Nor starts anyway with its reason.
+        edit(&mut app, |c| c.refusal = Some(Refusal { customer: Some(3), reason: "agreed".into(), ..Refusal::default() }));
+        submit_start(&mut app, true);
+        frame(&mut app);
+        assert!(app.data().intervention(11).is_none());
+        assert!(card(&app).refusal.is_none());
+        // A consent answered after the target changed is not followed by a start elsewhere.
+        let mut app = demo_en();
+        start_now(&mut app, 5);
+        frame(&mut app);
+        edit_refusal(&mut app, |r| {
+            r.record = true;
+            r.signer = "Elio Brina".into();
+        });
+        let before = consents(&app, 3);
+        submit_consent(&mut app);
+        edit(&mut app, |c| retarget(c, Target { customer: Some(1), device: Some(1), text: String::new() }));
+        frame(&mut app);
+        assert_eq!(consents(&app, 3), before + 1, "the consent the technician asked for is recorded");
+        assert!(app.data().intervention(11).is_none(), "no start re-sent for the new target");
+        // A row's start refused while the card follows a running intervention opens its own card.
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        start_now(&mut app, 5);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer), (Mode::Start, Some(3)));
+        assert_eq!(c.refusal.as_ref().map(|r| r.customer), Some(Some(3)));
+    }
+
+    #[test]
+    fn ctrl_enter_in_the_card_never_saves_a_privacy_form() {
+        let mut app = demo_en();
+        let ctx = egui::Context::default();
+        app.go(Screen::Customers);
+        app.selected_customer = Some(1);
+        crate::privacy::open_delivery(&mut app, 1, None);
+        start_now(&mut app, 4);
+        frame_in(&ctx, &mut app, Vec::new());
+        frame_in(&ctx, &mut app, Vec::new());
+        assert!(crate::privacy::form_customer(&app).is_some(), "the delivery form is open");
+        assert_eq!(ctx.memory(|m| m.focused()), Some(Field::Summary.id()), "the card's summary has the focus");
+        let events = app.data().privacy.len();
+        frame_in(&ctx, &mut app, vec![ctrl_enter()]);
+        assert_eq!(app.data().privacy.len(), events, "no notice delivery recorded");
+        assert!(crate::privacy::form_customer(&app).is_some(), "the form stays open");
+        assert_eq!(card(&app).mode, Mode::Stop, "the card got the shortcut");
+    }
+
+    /// An instant older than [`MIRROR_LAG`]: the mirror has lacked the intervention too long.
+    fn beyond_the_lag() -> Instant {
+        Instant::now().checked_sub(MIRROR_LAG + std::time::Duration::from_secs(1)).expect("an instant in the past")
+    }
+
+    #[test]
+    fn a_card_closed_by_a_lagging_mirror_keeps_what_was_typed() {
+        let (mut app, hold) = mirrored();
+        hold.set(true);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        edit(&mut app, |c| {
+            c.summary = "Stampante bloccata".into();
+            c.notes = "Driver reinstallato".into();
+            c.billable = false;
+        });
+        frame(&mut app);
+        assert!(app.timer.card.is_some(), "a lagging mirror does not close the card at once");
+        // Still missing after the lag while the server answers: closed, but nothing typed is lost.
+        edit(&mut app, |c| c.missing_since = Some(beyond_the_lag()));
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        let kept = Draft { notes: "Driver reinstallato".into(), summary: Some("Stampante bloccata".into()), billable: Some(false) };
+        assert_eq!(app.timer.drafts.get(&11), Some(&kept));
+        // The snapshot arrives: it runs with nothing saved yet, and the draft waits for it.
+        hold.set(false);
+        frame(&mut app);
+        assert!(app.data().intervention(11).is_some_and(|i| i.running() && i.summary.is_empty() && i.billable));
+        assert!(app.timer.drafts.contains_key(&11));
+        // Reopened from the chip: everything typed is back, and closing saves the summary.
+        open_running(&mut app, 11, false);
+        let c = card(&app);
+        assert_eq!((c.summary.as_str(), c.notes.as_str(), c.billable), ("Stampante bloccata", "Driver reinstallato", false));
+        assert!(app.timer.drafts.is_empty());
+        apply(&mut app, Action::Close);
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("running");
+        assert_eq!((i.summary.as_str(), i.billable), ("Stampante bloccata", false));
+        assert_eq!(app.timer.drafts.get(&11).map(|d| d.notes.as_str()), Some("Driver reinstallato"));
+        // Or stopped with `x` without reopening it: the draft goes with the stop.
+        let (mut app, hold) = mirrored();
+        hold.set(true);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        edit(&mut app, |c| {
+            c.summary = "Rete lenta".into();
+            c.notes = "Switch sostituito".into();
+            c.billable = false;
+            c.missing_since = Some(beyond_the_lag());
+        });
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        hold.set(false);
+        frame(&mut app);
+        stop_mine(&mut app);
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("stopped");
+        assert!(!i.running());
+        assert_eq!((i.summary.as_str(), i.billable), ("Rete lenta", false));
+        assert!(i.notes.contains("Switch sostituito"), "{}", i.notes);
+        assert!(app.timer.drafts.is_empty());
+        // Deleted once the mirror held it: closed, and nothing is kept for it.
+        let (mut app, _hold) = mirrored();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        frame(&mut app);
+        edit(&mut app, |c| c.notes = "Da buttare".into());
+        app.session.execute("intervention.remove", &json!({"id": 11}));
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        assert!(app.timer.drafts.is_empty());
+    }
+
+    #[test]
+    fn a_row_start_keeps_an_unsent_form_and_runs_in_the_chip() {
+        // A past-work entry for Lunaria (1) is half typed; the PC of Ferramenta Corvo (2, PC 4)
+        // is started from its row.
+        let mut app = demo_en();
+        open_log(&mut app, Some(1), Some(1));
+        edit(&mut app, |c| {
+            c.summary = "Backup NAS".into();
+            c.notes = "Dischi verificati".into();
+        });
+        start_now(&mut app, 4);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer), (Mode::Log, Some(1)), "the form stays");
+        assert_eq!((c.summary.as_str(), c.notes.as_str()), ("Backup NAS", "Dischi verificati"));
+        // The timer runs all the same, for the PC started.
+        let running: Vec<_> = app.data().interventions.iter().filter(|i| i.running() && i.device_id == Some(4)).collect();
+        assert_eq!(running.len(), 1);
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started for Ferramenta Corvo"));
+        // A form with nothing typed becomes the running card, as before.
+        let mut app = demo_en();
+        open_log(&mut app, Some(1), Some(1));
+        start_now(&mut app, 4);
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Running);
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started"));
+        // A Start form typed for that same PC gives way to the running card, with what was typed:
+        // sent, it would start a second intervention on the PC.
+        let mut app = demo_en();
+        open_start(&mut app, Some(2), Some(4));
+        edit(&mut app, |c| {
+            c.summary = "Cassa bloccata".into();
+            c.reference = "T-42".into();
+            c.billable = false;
+        });
+        start_now(&mut app, 4);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.running.as_ref().map(|r| r.id)), (Mode::Running, Some(11)));
+        assert_eq!((c.summary.as_str(), c.billable), ("Cassa bloccata", false));
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started"));
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("running");
+        assert_eq!((i.summary.as_str(), i.reference.as_str(), i.billable), ("Cassa bloccata", "T-42", false), "saved at once");
+        // The card's main button now stops it; nothing starts twice.
+        apply(&mut app, Action::Submit);
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Stop);
+        let on_pc4 = |app: &DeskApp| app.data().interventions.iter().filter(|i| i.running() && i.device_id == Some(4)).count();
+        assert_eq!(on_pc4(&app), 1);
+        // The same customer without a PC picked: the same.
+        let mut app = demo_en();
+        open_start(&mut app, Some(2), None);
+        edit(&mut app, |c| c.summary = "Cassa bloccata".into());
+        start_now(&mut app, 4);
+        frame(&mut app);
+        assert_eq!((card(&app).mode, card(&app).summary.as_str()), (Mode::Running, "Cassa bloccata"));
+        // A Start form typed for another customer, or past work for this one, stays.
+        for (mode, customer) in [(Mode::Start, 1), (Mode::Log, 2)] {
+            let mut app = demo_en();
+            if mode == Mode::Start {
+                open_start(&mut app, Some(customer), None)
+            } else {
+                open_log(&mut app, Some(customer), None)
+            }
+            edit(&mut app, |c| c.summary = "Altro lavoro".into());
+            start_now(&mut app, 4);
+            frame(&mut app);
+            let c = card(&app);
+            assert_eq!((c.mode, c.target.customer, c.summary.as_str()), (mode, Some(customer), "Altro lavoro"), "the form stays");
+            assert!(c.running.is_none());
+            assert_eq!(on_pc4(&app), 1);
+            assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some(""), "nothing typed for other work moves over");
+        }
+    }
+
+    #[test]
+    fn a_row_start_that_keeps_the_form_still_shows_its_warnings() {
+        // Another of my timers runs (Lunaria's PC 1); a past-work entry for Lunaria is half
+        // typed; Ferramenta Corvo's PC 4 is started from its row.
+        for lang in Language::ALL {
+            let mut app = DeskApp::demo();
+            app.language = lang;
+            start_now(&mut app, 1);
+            frame(&mut app);
+            open_log(&mut app, Some(1), None);
+            edit(&mut app, |c| c.summary = "Backup NAS".into());
+            start_now(&mut app, 4);
+            frame(&mut app);
+            assert_eq!(card(&app).mode, Mode::Log, "the form stays");
+            let (toast, warning) = match lang {
+                Language::En => ("Timer started for Ferramenta Corvo", "you have other running interventions: [11]"),
+                Language::It => ("Timer avviato per Ferramenta Corvo", "hai altri interventi in corso: [11]"),
+            };
+            assert_eq!(app.toast.as_ref().map(|t| t.0.clone()), Some(format!("{toast} · {warning}")));
+            assert_eq!(app.status, warning, "kept once the toast is gone");
+        }
+        // The privacy notice changed after Ferramenta Corvo received it: the warning shows too.
+        let mut app = DeskApp::demo();
+        app.language = Language::It;
+        app.run("notice.add", json!({"version": "2026-09", "title": "Informativa", "text": "Testo"}));
+        frame(&mut app);
+        open_log(&mut app, Some(1), None);
+        edit(&mut app, |c| c.summary = "Backup NAS".into());
+        start_now(&mut app, 4);
+        frame(&mut app);
+        let warning = "il cliente ha ricevuto l'informativa 2026-01 ma quella attuale è 2026-09";
+        assert_eq!(app.toast.as_ref().map(|t| t.0.clone()), Some(format!("Timer avviato per Ferramenta Corvo · {warning}")));
+        assert_eq!(app.status, warning);
+        // Without warnings the toast names the customer alone and the status bar is left as is.
+        let mut app = demo_en();
+        open_log(&mut app, Some(1), None);
+        edit(&mut app, |c| c.summary = "Backup NAS".into());
+        start_now(&mut app, 4);
+        frame(&mut app);
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started for Ferramenta Corvo"));
+        assert!(app.status.is_empty(), "{}", app.status);
+    }
+
+    #[test]
+    fn a_row_start_answered_while_the_card_waits_is_never_taken_for_the_card_s() {
+        // A row start on Ferramenta Corvo's PC 4 waits for its answer while a past-work entry
+        // for Elio Brina (3, PC 5, no remote-assistance consent) is sent from the card: the row's
+        // answer arrives first.
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        open_log(&mut app, Some(3), Some(5));
+        edit(&mut app, |c| {
+            c.summary = "Notebook lento".into();
+            c.notes = "Pulizia ventole".into();
+            c.minutes = "30".into();
+        });
+        submit_log(&mut app, false);
+        assert!(card(&app).busy);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer), (Mode::Log, Some(3)), "the form is not taken for the running card");
+        assert_eq!((c.summary.as_str(), c.notes.as_str()), ("Notebook lento", "Pulizia ventole"), "nothing typed is lost");
+        assert_eq!(c.refusal.as_ref().map(|r| r.customer), Some(Some(3)), "the log's own refusal");
+        assert!(!c.busy);
+        assert!(app.data().intervention(11).is_some_and(|i| i.running() && i.device_id == Some(4)));
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started for Ferramenta Corvo"));
+        // The log goes through with a reason.
+        edit_refusal(&mut app, |r| r.reason = "agreed on the phone".into());
+        submit_log(&mut app, true);
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        assert_eq!(app.data().intervention(12).map(|i| i.summary.as_str()), Some("Notebook lento"));
+        // Nor while the card waits for its own stop: the card closes on it, the row's timer runs
+        // in the chip.
+        let mut app = demo_en();
+        start_now(&mut app, 1);
+        frame(&mut app);
+        start_now(&mut app, 4);
+        open_running(&mut app, 11, true);
+        edit(&mut app, |c| c.notes = "Fatto".into());
+        submit_stop(&mut app);
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "closed by its own stop");
+        assert!(app.data().intervention(11).is_some_and(|i| !i.running() && i.notes.contains("Fatto")));
+        assert!(app.data().intervention(12).is_some_and(|i| i.running() && i.device_id == Some(4)));
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("Stopped")));
+    }
+
+    #[test]
+    fn a_refused_row_start_keeps_an_unsent_form_for_another_customer() {
+        // Lunaria (1) has the consent; Elio Brina (3, PC 5) has not.
+        for lang in Language::ALL {
+            let mut app = DeskApp::demo();
+            app.language = lang;
+            open_log(&mut app, Some(1), Some(1));
+            edit(&mut app, |c| {
+                c.summary = "Backup NAS".into();
+                c.notes = "Dischi verificati".into();
+            });
+            start_now(&mut app, 5);
+            frame(&mut app);
+            let c = card(&app);
+            assert_eq!((c.mode, c.target.customer), (Mode::Log, Some(1)), "the form stays");
+            assert_eq!((c.summary.as_str(), c.notes.as_str()), ("Backup NAS", "Dischi verificati"));
+            assert!(c.refusal.is_none() && c.error.is_empty(), "no panel for the wrong customer");
+            let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            let expected = match lang {
+                Language::En => "Not started for Elio Brina: Remote-assistance consent is missing",
+                Language::It => "Non avviato per Elio Brina: Il consenso all'assistenza remota è mancante",
+            };
+            assert_eq!(toast, expected);
+            assert!(app.data().intervention(11).is_none());
+            // The form still saves.
+            edit(&mut app, |c| c.minutes = "30".into());
+            submit_log(&mut app, false);
+            frame(&mut app);
+            assert!(app.timer.card.is_none());
+            assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some("Backup NAS"));
+        }
+        // A form with nothing typed gives way to the refusal (nothing is lost).
+        let mut app = demo_en();
+        open_start(&mut app, Some(1), Some(1));
+        start_now(&mut app, 5);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer), (Mode::Start, Some(3)));
+        assert!(c.refusal.is_some());
+    }
+
+    /// The demo desk behind a hostile server: its answers to `intervention.start` carry a link of
+    /// the server's own, and the data it shows may differ from the desk's (`shown`).
+    struct Hostile {
+        desk: crate::Session,
+        shown: Option<Data>,
+    }
+
+    impl crate::DeskSession for Hostile {
+        fn data(&self) -> &Data {
+            self.shown.as_ref().unwrap_or_else(|| self.desk.data())
+        }
+        fn actor(&self) -> &str {
+            self.desk.actor()
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.desk.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.desk.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            let mut done = self.desk.pump();
+            for c in &mut done {
+                if c.command == "intervention.start"
+                    && let Ok(v) = c.result.as_mut()
+                {
+                    v["connect"]["uri"] = json!("https://evil.test/phish");
+                }
+            }
+            done
+        }
+        fn jobs_pending(&self) -> usize {
+            0
+        }
+        fn revision(&self) -> u64 {
+            self.desk.revision()
+        }
+        fn server(&self) -> String {
+            "https://hostile.test".into()
+        }
+    }
+
+    #[test]
+    fn the_link_of_a_start_comes_from_the_desk_never_from_the_answer() {
+        let mut app = DeskApp::new(Box::new(Hostile { desk: crate::Session::demo(), shown: None }));
+        app.language = Language::En;
+        // Elio Brina (3) has no consent: the link waits for the answer of the start anyway.
+        start_now(&mut app, 5);
+        frame(&mut app);
+        assert!(app.requests.is_empty());
+        edit_refusal(&mut app, |r| r.reason = "agreed on the phone".into());
+        submit_start(&mut app, true);
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Running);
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/300400500".into())], "the PC's own link");
+    }
+
+    #[test]
+    fn a_rustdesk_id_that_is_not_valid_opens_nothing() {
+        // A desk file edited by hand: PC 4's ID would run commands in a Windows shell.
+        use crate::DeskSession;
+        let desk = crate::Session::demo();
+        let mut shown = desk.data().clone();
+        for d in shown.devices.iter_mut().filter(|d| d.id == 4) {
+            d.rustdesk_id = "123456&calc.exe&rem".into();
+        }
+        let mut app = DeskApp::new(Box::new(Hostile { desk, shown: Some(shown) }));
+        app.language = Language::It;
+        let warning = "L'ID RustDesk di questo PC non è valido: correggilo nella scheda del PC";
+        // The fast path from a row: no link in the click's frame, nor from the start's answer.
+        start_now(&mut app, 4);
+        assert!(app.requests.is_empty());
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Running);
+        assert!(app.requests.is_empty(), "{:?}", app.requests);
+        assert_eq!(app.status, warning);
+        // Connect again (the card's button, `c`): nothing opened, no access recorded.
+        app.status.clear();
+        let jobs = app.jobs.len();
+        apply(&mut app, Action::Connect(4));
+        assert!(app.requests.is_empty(), "{:?}", app.requests);
+        assert_eq!(app.jobs.len(), jobs, "no device.connect");
+        assert_eq!(app.status, warning);
+        frame(&mut app);
+        // A valid ID still opens.
+        app.connect(1);
+        assert_eq!(app.requests, vec![Request::OpenUrl("rustdesk://connection/new/100200300".into())]);
+    }
+
+    #[test]
+    fn elapsed_and_the_refused_state() {
+        let now = time::parse_stamp("2026-10-13T12:00:04Z").expect("stamp");
+        // The chip and the card show `h:mm:ss`, never negative.
+        assert_eq!(format::elapsed("2026-10-13T09:58:30Z", now), "2:01:34");
+        assert_eq!(format::elapsed("2026-10-13T13:00:00Z", now), "0:00:00");
+        assert_eq!(refused_state("the customer's remote_assistance consent is expired: record it first"), "expired");
+        assert_eq!(refused_state("nothing"), "");
+        assert!(shifted(now, -15).ends_with(":45"));
+        assert_eq!(mine_running(DeskApp::demo().data(), "riccardo").len(), 0);
+    }
+}

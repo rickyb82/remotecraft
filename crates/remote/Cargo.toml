@@ -1,0 +1,20 @@
+[package]
+name = "remotecraft-remote"
+description = "RemoteCraft remote session: the desk mirrored from a remotecraft-cli serve server over HTTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+remotecraft-engine = { workspace = true }
+ehttp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dependencies.web-time]
+workspace = true
+
+[lints]
+workspace = true

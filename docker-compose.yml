@@ -1,32 +1,37 @@
-# RustDesk Server OSS: hbbs (ID / rendezvous) and hbbr (relay).
-# Avvio: docker compose up -d   ·   Chiave pubblica per i client: data/id_ed25519.pub
+# RemoteCraft: RustDesk Server OSS (hbbs + hbbr) and the support desk, in one container.
 #
-# RUSTDESK_TAG fissa la versione dell'immagine (default: latest). Dopo il primo avvio
-# conviene fissarla alla versione installata, per aggiornare solo quando lo decidi tu.
+#   echo "REMOTECRAFT_TOKEN=$(openssl rand -hex 32)" >> .env      # once: a new random token
+#   echo "RUSTDESK_HOST=rustdesk.siriustec.it" >> .env
+#   docker compose up -d
+#
+# ./data keeps the RustDesk key pair, as in the previous setup: existing clients keep working
+# (owned by uid 10002, the user running hbbs and hbbr).
+# ./desk keeps customers, PCs, interventions, the GDPR record and the audit log (owned by uid
+# 10001, the user running the desk API).
+# Back up both directories.
+#
+# Upgrading with an older, shorter token: RustDesk keeps working, but the desk API does not
+# start until REMOTECRAFT_TOKEN has at least 32 characters (docs/deploy.md, "Aggiornamento").
 
 services:
-  hbbs:
-    image: rustdesk/rustdesk-server:${RUSTDESK_TAG:-latest}
-    container_name: rustdesk-hbbs
-    # -k _ : usa la coppia di chiavi in /root (generata al primo avvio) e accetta solo
-    # i client configurati con la chiave pubblica.
-    command: hbbs -k _
-    volumes:
-      - ./data:/root
-    ports:
-      - "21115:21115"       # TCP: test del tipo di NAT
-      - "21116:21116"       # TCP: registrazione ID e connessioni
-      - "21116:21116/udp"   # UDP: registrazione ID, heartbeat, connessione diretta
-    depends_on:
-      - hbbr
+  remotecraft:
+    build:
+      context: .
+      args:
+        RUSTDESK_TAG: ${RUSTDESK_TAG:-1.1.16}
+    image: remotecraft
+    container_name: remotecraft
     restart: unless-stopped
-
-  hbbr:
-    image: rustdesk/rustdesk-server:${RUSTDESK_TAG:-latest}
-    container_name: rustdesk-hbbr
-    command: hbbr -k _
-    volumes:
-      - ./data:/root
     ports:
-      - "21117:21117"       # TCP: relay, quando la connessione diretta non riesce
-    restart: unless-stopped
+      - "21115:21115"           # TCP: NAT type test
+      - "21116:21116"           # TCP: ID registration and connections
+      - "21116:21116/udp"       # UDP: ID registration, heartbeat, direct connections
+      - "21117:21117"           # TCP: relay, when the direct connection fails
+      - "127.0.0.1:7979:7979"   # the desk API and web app: only for the framework / reverse proxy on this machine
+    environment:
+      REMOTECRAFT_TOKEN: ${REMOTECRAFT_TOKEN:?set the service token for the desk API (openssl rand -hex 32)}
+      RUSTDESK_HOST: ${RUSTDESK_HOST:-}
+      TZ: ${TZ:-Europe/Rome}
+    volumes:
+      - ./data:/data/rustdesk
+      - ./desk:/data/desk

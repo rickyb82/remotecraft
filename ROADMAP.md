@@ -76,4 +76,7 @@
   `trunk serve` go back to the saved server); forgetting the token holds in every open tab;
   answers that would expand too much in memory are refused before parsing; Ctrl+R reloads the
   screen's data in the browser instead of the page; Cmd is shown only in the macOS desktop
-  app; starts keep their warnings and never put two timers on one PC.
+  app; starts keep their warnings, and a start from a row on the customer of a typed Start
+  form takes over the form instead of starting a second timer; Ctrl+R works from text fields
+  too; the running card waits for its own command by job, so a stop answered after it moved
+  on no longer leaves it stuck.

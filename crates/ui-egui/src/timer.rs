@@ -99,10 +99,11 @@ const KINDS: [(&str, &str, Icon); 5] = [
 /// What a command queued by this screen was for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Intent {
-    /// `intervention.start`, from the card (`from_card`) or straight from a row; `opened` says
-    /// the RustDesk link was already opened in the click's frame. Who sent it is recorded, never
-    /// guessed: a row's start can be answered while the card waits for a command of its own.
-    Start { customer: Option<u64>, device: Option<u64>, opened: bool, from_card: bool },
+    /// `intervention.start`, from the card or straight from a row; `opened` says the RustDesk
+    /// link was already opened in the click's frame. Whether the card sent it is never guessed:
+    /// the card keeps the job of its own command (`Card::waiting`), and a row's start can be
+    /// answered while the card waits for that.
+    Start { customer: Option<u64>, device: Option<u64>, opened: bool },
     /// `intervention.stop {id}`.
     Stop { id: u64 },
     /// `intervention.add` from the Log mode, for this customer.
@@ -236,8 +237,10 @@ pub struct Card {
     pub warnings: Vec<String>,
     pub error: String,
     pub refusal: Option<Refusal>,
-    /// A command of the card is in flight.
+    /// A command of the card is in flight: `busy`, and its job (`waiting`). A result is the
+    /// card's own only when its job is the one the card waits for, whatever the card shows now.
     pub busy: bool,
+    pub waiting: Option<u64>,
     pub minimized: bool,
     /// Where the technician dragged the card (from its bottom-right home).
     pub offset: egui::Vec2,
@@ -412,7 +415,7 @@ pub fn start_now(app: &mut DeskApp, device: u64) {
     app.run_as(
         "intervention.start",
         json!({"device": device}),
-        crate::Intent::Timer(Intent::Start { customer: Some(customer), device: Some(device), opened, from_card: false }),
+        crate::Intent::Timer(Intent::Start { customer: Some(customer), device: Some(device), opened }),
     );
 }
 
@@ -431,10 +434,10 @@ pub fn stop_mine(app: &mut DeskApp) {
     if let Some(b) = draft.billable {
         params["billable"] = json!(b);
     }
+    let from_card = app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id));
     if let Some(c) = app.timer.card.as_mut()
-        && c.running.as_ref().is_some_and(|r| r.id == id)
+        && from_card
     {
-        c.busy = true;
         notes = c.notes.trim().to_string();
         if !c.summary.trim().is_empty() {
             params["summary"] = json!(c.summary.trim());
@@ -444,7 +447,18 @@ pub fn stop_mine(app: &mut DeskApp) {
     if !notes.trim().is_empty() {
         params["notes"] = json!(notes.trim());
     }
-    app.run_as("intervention.stop", params, crate::Intent::Timer(Intent::Stop { id }));
+    let job = app.run_as("intervention.stop", params, crate::Intent::Timer(Intent::Stop { id }));
+    if from_card {
+        wait_for(app, job);
+    }
+}
+
+/// The card waits for its own command `job`.
+fn wait_for(app: &mut DeskApp, job: u64) {
+    if let Some(card) = app.timer.card.as_mut() {
+        card.busy = true;
+        card.waiting = Some(job);
+    }
 }
 
 /// Closes an open card: minimises it when expanded, closes it when minimised (Escape, like
@@ -684,10 +698,10 @@ fn submit_start(app: &mut DeskApp, anyway: bool) {
     // The RustDesk link opens in the click's frame when the mirror says the consent is fine.
     let opened = c.kind == "remote" && customer.zip(device).is_some_and(|(cu, dev)| open_link_now(app, cu, dev));
     if let Some(card) = app.timer.card.as_mut() {
-        card.busy = true;
         card.error.clear();
     }
-    app.run_as("intervention.start", params, crate::Intent::Timer(Intent::Start { customer, device, opened, from_card: true }));
+    let job = app.run_as("intervention.start", params, crate::Intent::Timer(Intent::Start { customer, device, opened }));
+    wait_for(app, job);
 }
 
 /// Sends `intervention.stop` for the followed intervention, always with its id.
@@ -710,10 +724,10 @@ fn submit_stop(app: &mut DeskApp) {
         params["minutes"] = json!(m);
     }
     if let Some(card) = app.timer.card.as_mut() {
-        card.busy = true;
         card.error.clear();
     }
-    app.run_as("intervention.stop", params, crate::Intent::Timer(Intent::Stop { id: r.id }));
+    let job = app.run_as("intervention.stop", params, crate::Intent::Timer(Intent::Stop { id: r.id }));
+    wait_for(app, job);
 }
 
 /// Sends `intervention.add` from the Log mode; `anyway` adds the refusal panel's reason.
@@ -771,11 +785,11 @@ fn submit_log(app: &mut DeskApp, anyway: bool) {
         params["consent_override"] = json!(reason);
     }
     if let Some(card) = app.timer.card.as_mut() {
-        card.busy = true;
         card.error.clear();
     }
     let customer = c.target.customer;
-    app.run_as("intervention.add", params, crate::Intent::Timer(Intent::Log { customer }));
+    let job = app.run_as("intervention.add", params, crate::Intent::Timer(Intent::Log { customer }));
+    wait_for(app, job);
 }
 
 /// Records the verbal consent typed in the refusal panel (`privacy.consent`); the refused
@@ -793,13 +807,13 @@ fn submit_consent(app: &mut DeskApp) {
         "customer": customer, "purposes": ["remote_assistance"], "method": "verbal",
         "signer": r.signer.trim(), "note": r.note.trim(),
     });
-    if let Some(card) = app.timer.card.as_mut() {
-        card.busy = true;
-        if let Some(r) = card.refusal.as_mut() {
-            r.error.clear();
-        }
+    if let Some(card) = app.timer.card.as_mut()
+        && let Some(r) = card.refusal.as_mut()
+    {
+        r.error.clear();
     }
-    app.run_as("privacy.consent", params, crate::Intent::Timer(Intent::Consent { customer }));
+    let job = app.run_as("privacy.consent", params, crate::Intent::Timer(Intent::Consent { customer }));
+    wait_for(app, job);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -807,26 +821,24 @@ fn submit_consent(app: &mut DeskApp) {
 
 /// Applies a finished command of the card.
 pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
-    // Whether the card sent this: a row's start, or a stop of an intervention the card does not
-    // follow, is not the card's and leaves the wait of the card's own command alone.
-    let own = match &intent {
-        Intent::Start { from_card, .. } => *from_card,
-        Intent::Stop { id } => app.timer.card.as_ref().is_some_and(|card| card.running.as_ref().is_some_and(|r| r.id == *id)),
-        Intent::Log { .. } | Intent::Consent { .. } => true,
-    };
-    // A card opened since (a new form) is not the one that sent it.
-    let sent_by_card = own && app.timer.card.as_ref().is_some_and(|card| card.busy);
-    if own && let Some(card) = app.timer.card.as_mut() {
+    // Whether the card sent this: the job it waits for. A row's start, a stop from the chip, or a
+    // command of a card replaced since is not the card's and leaves its wait alone.
+    let sent_by_card = app.timer.card.as_ref().is_some_and(|card| card.waiting == Some(c.job));
+    if sent_by_card && let Some(card) = app.timer.card.as_mut() {
         card.busy = false;
+        card.waiting = None;
     }
     match intent {
-        Intent::Start { customer, device, opened, .. } => match &c.result {
+        Intent::Start { customer, device, opened } => match &c.result {
             Ok(v) => started(app, v, opened, sent_by_card),
             Err(e) => refused(app, &e.to_string(), customer, device, Mode::Start),
         },
         Intent::Log { customer } => match &c.result {
             Ok(v) => {
-                app.timer.card = None;
+                // The card that sent it closes; one opened since (another form) stays.
+                if sent_by_card {
+                    app.timer.card = None;
+                }
                 app.selected_intervention = v["intervention"]["id"].as_u64();
                 app.toast(app.tr("Intervention saved").to_string());
             }
@@ -2052,6 +2064,90 @@ mod tests {
         fn server(&self) -> String {
             "http://mirror.test".into()
         }
+    }
+
+    /// The demo desk whose answers wait until `release` is set, as from a slow server.
+    struct Slow {
+        desk: crate::Session,
+        held: Vec<Completed>,
+        release: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl crate::DeskSession for Slow {
+        fn data(&self) -> &Data {
+            self.desk.data()
+        }
+        fn actor(&self) -> &str {
+            self.desk.actor()
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.desk.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.desk.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            self.held.extend(self.desk.pump());
+            if self.release.get() { std::mem::take(&mut self.held) } else { Vec::new() }
+        }
+        fn jobs_pending(&self) -> usize {
+            self.held.len()
+        }
+        fn revision(&self) -> u64 {
+            self.desk.revision()
+        }
+        fn server(&self) -> String {
+            "http://slow.test".into()
+        }
+    }
+
+    #[test]
+    fn a_stop_answered_after_the_card_moved_on_frees_the_card() {
+        let release = std::rc::Rc::new(std::cell::Cell::new(true));
+        let mut app = DeskApp::new(Box::new(Slow { desk: crate::Session::demo(), held: Vec::new(), release: release.clone() }));
+        app.language = Language::En;
+        // Two timers of mine: 11 on PC 1, 12 on PC 4.
+        start_now(&mut app, 1);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        let running: Vec<u64> = app.data().interventions.iter().filter(|i| i.running()).map(|i| i.id).collect();
+        assert_eq!(running, vec![11, 12]);
+        // The card stops 11; the server is slow, and the technician moves on to 12 meanwhile.
+        open_running(&mut app, 11, true);
+        release.set(false);
+        submit_stop(&mut app);
+        assert!(card(&app).busy);
+        open_running(&mut app, 12, false);
+        frame(&mut app);
+        assert_eq!(card(&app).running.as_ref().map(|r| r.id), Some(12));
+        // The stop of 11 is answered: the card, now on 12, is free again and keeps following 12.
+        release.set(true);
+        frame(&mut app);
+        let c = card(&app);
+        assert!(!c.busy && c.waiting.is_none(), "the card waits for nothing any more");
+        assert_eq!((c.mode, c.running.as_ref().map(|r| r.id)), (Mode::Running, Some(12)));
+        assert!(app.data().intervention(11).is_some_and(|i| !i.running()));
+        // What is typed for 12 is saved when the card is minimised.
+        edit(&mut app, |c| c.summary = "Stampante".into());
+        assert!(close(&mut app));
+        frame(&mut app);
+        assert_eq!(app.data().intervention(12).map(|i| i.summary.as_str()), Some("Stampante"));
+        // A past-work entry is saved slowly; a new form opened meanwhile stays open.
+        open_log(&mut app, Some(1), Some(1));
+        edit(&mut app, |c| {
+            c.summary = "Backup".into();
+            c.started_at = "09:00".into();
+            c.minutes = "30".into();
+        });
+        release.set(false);
+        submit_log(&mut app, false);
+        open_start(&mut app, Some(2), Some(4));
+        edit(&mut app, |c| c.summary = "Cassa".into());
+        release.set(true);
+        frame(&mut app);
+        assert!(app.data().interventions.iter().any(|i| i.summary == "Backup"), "the entry is saved");
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer, c.summary.as_str()), (Mode::Start, Some(2), "Cassa"), "the new form stays");
     }
 
     /// The demo desk behind a mirror, in English, and the switch that holds the mirror back.

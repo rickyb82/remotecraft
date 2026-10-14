@@ -152,8 +152,8 @@ pub fn shortcut_key(os: egui::os::OperatingSystem, key: &str) -> std::borrow::Co
 
 /// A key of [`SHORTCUTS`] on `os`, in a browser or not. The shortcuts listen for
 /// `Modifiers::COMMAND`, which the desktop app on a Mac reads from Cmd only, so `Ctrl+` reads
-/// `Cmd+` there. A browser (on a Mac or an iPad too) reads it from Ctrl as well, and keeps Cmd+R
-/// for itself: it reloads the page, losing what was typed. There the keys stay `Ctrl+`.
+/// `Cmd+` there. A browser (on a Mac or an iPad too) reads it from Ctrl as well as Cmd, so
+/// `Ctrl+` works on every platform there and the keys stay as written.
 pub fn shortcut_key_in(os: egui::os::OperatingSystem, browser: bool, key: &str) -> std::borrow::Cow<'_, str> {
     if os.is_mac() && !browser { key.replace("Ctrl+", "Cmd+").into() } else { key.into() }
 }
@@ -696,6 +696,12 @@ impl DeskApp {
             return;
         }
         let pressed = |m: Modifiers, k: Key| ui.ctx().input_mut(|i| i.consume_key(m, k));
+        // Ctrl+R reloads the screen's data from a text field too: no field uses it, and in the
+        // browser the web app keeps the page reload from it.
+        if pressed(Modifiers::COMMAND, Key::R) {
+            self.refresh_serial = self.refresh_serial.wrapping_add(1);
+            return;
+        }
         if ui.ctx().memory(|m| m.focused().is_some()) {
             if pressed(Modifiers::NONE, Key::Escape)
                 && let Some(id) = ui.ctx().memory(|m| m.focused())
@@ -714,8 +720,6 @@ impl DeskApp {
             self.search_focus = true;
         } else if pressed(Modifiers::COMMAND, Key::Comma) {
             self.go(Screen::Settings);
-        } else if pressed(Modifiers::COMMAND, Key::R) {
-            self.refresh_serial = self.refresh_serial.wrapping_add(1);
         } else if pressed(Modifiers::SHIFT, Key::Slash) || pressed(Modifiers::NONE, Key::Questionmark) {
             self.shortcuts_open = true;
         } else if pressed(Modifiers::NONE, Key::Escape) {
@@ -1023,6 +1027,33 @@ mod tests {
         assert_eq!(app.timer.card.as_ref().map(|c| c.mode), Some(timer::Mode::Running));
         assert_eq!(app.data().privacy.len(), events, "the open privacy form is not saved");
         assert!(privacy::form_customer(&app).is_some());
+    }
+
+    #[test]
+    fn ctrl_r_reloads_the_data_from_a_text_field_too() {
+        let mut app = DeskApp::demo();
+        let ctx = egui::Context::default();
+        let ctrl_r = || egui::Event::Key {
+            key: egui::Key::R,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE },
+        };
+        // Nothing focused.
+        frame_in(&ctx, &mut app, Vec::new());
+        let before = app.refresh_serial;
+        frame_in(&ctx, &mut app, vec![ctrl_r()]);
+        assert_eq!(app.refresh_serial, before.wrapping_add(1));
+        // The search box focused, with text in it: the data reloads, the text stays.
+        app.search = "Lunaria".into();
+        app.search_focus = true;
+        frame_in(&ctx, &mut app, Vec::new());
+        frame_in(&ctx, &mut app, Vec::new());
+        assert!(ctx.memory(|m| m.focused().is_some()), "the search box has the focus");
+        frame_in(&ctx, &mut app, vec![ctrl_r()]);
+        assert_eq!(app.refresh_serial, before.wrapping_add(2));
+        assert_eq!(app.search, "Lunaria");
     }
 
     #[test]

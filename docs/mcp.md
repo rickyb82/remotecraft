@@ -44,8 +44,9 @@ Per provarlo: `remotecraft-cli mcp --demo`.
 
 **Su un server locale senza token** (`remotecraft-cli serve`, che allora risponde solo a questa
 macchina): `remotecraft-cli mcp --server http://127.0.0.1:7979`, senza `--token`. Senza token le
-richieste partono senza `Authorization`; un token mandato a un server avviato senza token viene
-rifiutato (`unknown token`), perché lì i token dei tecnici non esistono.
+richieste partono senza `Authorization`. Un server avviato senza token non crea token per i
+tecnici; accetta solo quelli già presenti in `tokens.json` (creati quando aveva un token di
+servizio) e rifiuta ogni altro token (`unknown token`).
 
 ## Strumenti
 

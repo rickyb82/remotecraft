@@ -53,7 +53,7 @@ servizio) e rifiuta ogni altro token (`unknown token`).
 | Strumento | Comando |
 |---|---|
 | `find_customers`, `get_customer`, `add_customer`, `update_customer`, `archive_customer` | `customer.*` |
-| `add_device`, `update_device`, `find_device`, `list_devices`, `connect_device` | `device.*` |
+| `add_device`, `update_device`, `find_device`, `list_devices`, `connect_device` (anche solo con `rustdesk_id`, per un PC che il gestionale non conosce) | `device.*` |
 | `start_intervention`, `stop_intervention`, `log_intervention`, `update_intervention`, `delete_intervention`, `list_interventions`, `running_interventions` | `intervention.*` |
 | `time_report` | `report.time` |
 | `privacy_status`, `privacy_history`, `record_notice_delivery`, `record_consent`, `withdraw_consent` | `privacy.*` |

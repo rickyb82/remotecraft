@@ -83,12 +83,22 @@ L'elenco sempre aggiornato è `remotecraft-cli commands` (o `GET /api/commands`)
 
 {"command": "intervention.stop", "params": {"notes": "Spooler riavviato, driver aggiornato"}}
 
+{"command": "device.connect", "params": {"rustdesk_id": "987 654 321"}}
+→ {"device": null, "customer": "", "connect": {"rustdesk_id": "987654321", "uri": "rustdesk://connection/new/987654321", ...},
+   "consent_ok": null, "warnings": ["RustDesk ID 987 654 321 is not in the desk: ..."]}
+
 {"command": "intervention.add", "params": {"customer": 2, "kind": "onsite", "summary": "Cablaggio", "started_at": "2026-10-12 14:00", "ended_at": "2026-10-12 16:30"}}
 
 {"command": "report.time", "params": {"from": "2026-10-01", "to": "2026-11-01", "group_by": "customer"}}
 ```
 
 ### Regole da sapere
+
+- **Connessione rapida.** `device.connect` accetta, al posto di `device`, un `rustdesk_id`: se
+  l'ID è di un PC (in servizio, altrimenti dismesso) risponde come per quel PC, consenso
+  compreso; altrimenti, per un ID di sole cifre, dà solo il link e il comando, con
+  `device: null`, `consent_ok: null` e un avviso (un nome o un host name viene rifiutato: per
+  quelli si usa `device`). Non salva niente e nell'audit resta solo il comando, senza l'ID.
 
 - **Consenso anche in modifica.** `intervention.update` che trasforma un intervento in remoto
   (`kind: "remote"` su uno che non lo era) o sposta un intervento remoto su un altro PC fa gli

@@ -41,6 +41,11 @@ richiedono o per cui scegli di chiederlo. Il gestionale propone:
   motivo, che resta nell'intervento e nell'audit. Se il consenso `unattended_access` manca o è
   revocato e un PC ha l'accesso non presidiato, il gestionale lo segnala: rimuovi la password
   permanente dal client.
+- **Connessione rapida:** `device.connect {rustdesk_id}` su un ID che nessun PC ha (nemmeno
+  dismesso: quello risponde con il consenso del suo cliente) apre solo RustDesk: nessun dato salvato, nessun consenso controllato (non c'è un cliente a cui
+  chiederlo), e l'avviso lo dice. Il cliente acconsente a quella sessione dettando ID e
+  password; per un cliente abituale aggiungi il PC e registra il consenso. L'audit annota il
+  comando senza l'ID.
 
 ## Diritti dell'interessato
 

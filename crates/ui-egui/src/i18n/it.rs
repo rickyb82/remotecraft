@@ -31,6 +31,7 @@ pub(super) const MESSAGES: &[(&str, &str)] = &[
     ("stop the running interventions first", "chiudi prima gli interventi in corso"),
     ("there is no privacy notice in the desk", "non c'è nessuna informativa nel gestionale"),
     ("RustDesk ID ", "L'ID RustDesk "),
+    ("no PC has the RustDesk ID ", "nessun PC ha l'ID RustDesk "),
     ("unknown command `", "comando sconosciuto `"),
     ("the desk is full", "il gestionale è pieno"),
     ("several running interventions: ", "più interventi in corso: "),
@@ -108,6 +109,14 @@ pub(super) const INFIX: &[(&str, &str)] = &[
     ("(current: ", "(attuale: "),
     ("` of ", "` di "),
     (": invalid RustDesk ID cleared", ": ID RustDesk non valido, cancellato"),
+    (
+        ": a quick connection takes the digits RustDesk shows; name the `device` for a PC in the desk",
+        ": la connessione rapida accetta solo le cifre mostrate da RustDesk; per un PC del gestionale indica il PC",
+    ),
+    (
+        " is not in the desk: the connection is tied to no customer and no consent is checked",
+        " non è nel gestionale: la connessione non è legata a nessun cliente e nessun consenso viene controllato",
+    ),
     (": update or retire that one first", ": aggiorna o dismetti prima quel PC"),
     (": retire that one first", ": dismetti prima quel PC"),
     ("(e.g. the person agreed on the phone)", "(ad esempio la persona ha acconsentito al telefono)"),
@@ -215,8 +224,14 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Close the card, the form or the pane" => "Chiudi la scheda, il modulo o il pannello",
         "Customers, Devices, Interventions, Privacy, Reports" => "Clienti, PC, Interventi, Privacy, Report",
         "Reload this screen's data" => "Ricarica i dati di questa schermata",
-        "Save the form, or start on the PC found by the search" => "Salva il modulo, oppure avvia sul PC trovato dalla ricerca",
+        "Save the form, start on the PC found by the search, or connect to an ID the desk does not know" => {
+            "Salva il modulo, avvia sul PC trovato dalla ricerca, oppure collegati a un ID che il gestionale non conosce"
+        }
         "This help" => "Questo aiuto",
+        "Connect now" => "Collegati subito",
+        "That is not a RustDesk ID" => "Questo non è un ID RustDesk",
+        "Create the customer \"{name}\"" => "Crea il cliente \"{name}\"",
+        "The customer \"{name}\" is archived: restore it to pick it" => "Il cliente \"{name}\" è archiviato: ripristinalo per sceglierlo",
         // Command labels, shown in tooltips.
         "New Customer" => "Nuovo cliente",
         "Edit Customer" => "Modifica cliente",

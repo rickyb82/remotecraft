@@ -23,6 +23,7 @@ use crate::{Completed, Confirm, DeskApp, Screen, format, interventions, privacy,
 
 /// The labels this screen shows: `(English, Italian)`.
 pub const LABELS_IT: &[(&str, &str)] = &[
+    ("Pick the customer to save the PC", "Scegli il cliente per salvare il PC"),
     ("New PC", "Nuovo PC"),
     ("Edit PC", "Modifica PC"),
     ("PC saved", "PC salvato"),
@@ -107,6 +108,8 @@ pub enum Intent {
     Removed,
     /// `device.update {device, customer}` answered: the PC moved to another customer.
     Moved,
+    /// `customer.add` from the form's customer field ("Create the customer"): the form picks it.
+    CustomerAdded,
 }
 
 /// The new/edit PC form, as typed.
@@ -280,6 +283,31 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
             }
         }
         Intent::Moved => moved(app, c),
+        Intent::CustomerAdded => customer_added(app, c),
+    }
+}
+
+/// The customer created from the form's customer field: the form picks it while the field still
+/// names it (on a remote desk the answer can come after more typing); a refusal shows in the
+/// form.
+fn customer_added(app: &mut DeskApp, c: &Completed) {
+    if app.devices.busy != Some(c.job) {
+        return;
+    }
+    app.devices.busy = None;
+    let Some(f) = app.devices.form.as_mut() else { return };
+    match &c.result {
+        Ok(v) => {
+            let name = v["customer"]["name"].as_str().unwrap_or_default();
+            if let Some(id) = forms::new_id(v, "customer")
+                && f.customer.id.is_none()
+                && fold(f.customer.text.trim()) == fold(name)
+            {
+                f.customer = Picker { text: name.to_string(), id: Some(id) };
+                f.error.clear();
+            }
+        }
+        Err(e) => f.error = app.language.tr_message(&e.to_string()),
     }
 }
 
@@ -652,12 +680,20 @@ fn empty(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         let title = app.language.fill("No PC has the RustDesk ID {id}", &[("id", &rustdesk::display(&id))]);
         widgets::empty_state(ui, t, Icon::Remote, &title, "");
         ui.add_space(10.0);
+        let mut connect = false;
         ui.vertical_centered(|ui| {
-            if widgets::primary_button(ui, t, Some(Icon::Plus), app.tr("Add a PC with this ID")).clicked() {
+            if app.search_quick_offer().is_some() {
+                connect = widgets::primary_button(ui, t, Some(Icon::Remote), app.tr("Connect now")).clicked();
+                ui.add_space(6.0);
+            }
+            if ui.button(app.tr("Add a PC with this ID")).clicked() {
                 let customer = app.devices.customer;
                 open_new(app, customer, &id);
             }
         });
+        if connect {
+            app.quick_connect(&id);
+        }
     } else if !query.is_empty() {
         let title = app.language.fill("No PC matches \"{query}\"", &[("query", &format::clipped(&query, 60))]);
         widgets::empty_state(ui, t, Icon::Search, &title, "");
@@ -1032,11 +1068,12 @@ pub fn form_ui(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.add_space(8.0);
     let mut request = None;
     let mut enabled = false;
+    let mut create = None;
     widgets::card(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
         egui::Grid::new("device-form-grid").num_columns(2).spacing([12.0, 8.0]).min_col_width(LABEL_W).show(ui, |ui| {
             let customer_label = format!("{} *", app.tr("Customer"));
-            forms::customer_picker(app, ui, t, &customer_label, &mut f.customer, f.customer_locked);
+            create = forms::customer_picker(app, ui, t, &customer_label, &mut f.customer, f.customer_locked, !busy);
             widgets::field(ui, t, app.tr("Name"), &mut f.name, app.tr("PC reception, Notebook Anna…"));
             widgets::field(ui, t, app.tr("RustDesk ID"), &mut f.rustdesk_id, app.tr("As shown in the RustDesk window"));
             let rid = rustdesk::normalize(&f.rustdesk_id);
@@ -1103,8 +1140,18 @@ pub fn form_ui(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         {
             request = Some(FormRequest::OpenConflict(other));
         }
+        // Why Save is off while no customer is picked (the field says why under it).
+        if !busy && f.customer.id.is_none() {
+            ui.label(RichText::new(app.tr("Pick the customer to save the PC")).small().color(t.muted));
+        }
     });
     let action = forms::submit_row(app, ui, t, app.tr("Save"), busy, enabled);
+    if let Some(name) = create {
+        let job = app.run_as("customer.add", json!({"name": name}), crate::Intent::Devices(Intent::CustomerAdded));
+        app.devices.busy = Some(job);
+        app.devices.form = Some(f);
+        return;
+    }
     match request {
         Some(FormRequest::OpenConflict(other)) => {
             app.devices.form = None;
@@ -1262,7 +1309,7 @@ fn move_panel(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, d: &Device) {
         ui.label(RichText::new(app.tr("Move to another customer")).strong().color(t.ui_text));
         ui.add_space(4.0);
         egui::Grid::new("device-move-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            forms::customer_picker(app, ui, t, app.tr("Customer"), &mut m.customer, false);
+            forms::customer_picker(app, ui, t, app.tr("Customer"), &mut m.customer, false, false);
         });
         widgets::error_line(ui, t, &m.error);
         ui.horizontal(|ui| {
@@ -1772,6 +1819,143 @@ mod tests {
             walk(&c.shape, &mut out);
         }
         out
+    }
+
+    /// One frame of a context that lives across frames (the focus), with these events: the
+    /// texts painted and where.
+    fn frame_with(ctx: &egui::Context, app: &mut DeskApp, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1440.0, 900.0))), events, ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        let mut out = Vec::new();
+        for c in &output.shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// Clicks, as a mouse does (press, then release a frame later), the rightmost text painted
+    /// as `text` (the pane's, not the list's); answers the texts after it.
+    fn click_text(ctx: &egui::Context, app: &mut DeskApp, text: &str) -> Vec<(String, Rect)> {
+        let texts = frame_with(ctx, app, Vec::new());
+        let at = texts
+            .iter()
+            .filter(|(t, _)| t == text)
+            .map(|(_, r)| r.center())
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .unwrap_or_else(|| panic!("{text:?} is not painted: {:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>()));
+        let button =
+            |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame_with(ctx, app, vec![egui::Event::PointerMoved(at), button(true)]);
+        frame_with(ctx, app, vec![button(false)]);
+        frame_with(ctx, app, Vec::new())
+    }
+
+    #[test]
+    fn connect_now_is_offered_for_digits_only() {
+        let mut app = app();
+        let connect = app.tr("Connect now").to_string();
+        let add = app.tr("Add a PC with this ID").to_string();
+        app.search = "555 666 777".into();
+        let texts = texts_at(&mut app, 1440.0, 900.0);
+        assert!(texts.contains(&connect) && texts.contains(&add), "{texts:?}");
+        // A word reads as a RustDesk ID too: it can be added, never dialled from the search.
+        app.search = "Zanzibar".into();
+        let texts = texts_at(&mut app, 1440.0, 900.0);
+        assert!(!texts.contains(&connect) && texts.contains(&add), "{texts:?}");
+        // Nor a customer's phone number, nor the ID of a retired PC (hidden from the list).
+        app.run("device.retire", json!({"device": 1}));
+        frame(&mut app);
+        for search in ["0471 000002", "100 200 300"] {
+            app.search = search.into();
+            let texts = texts_at(&mut app, 1440.0, 900.0);
+            assert!(!texts.contains(&connect), "{search}: {texts:?}");
+        }
+    }
+
+    #[test]
+    fn a_customer_is_picked_with_a_click_while_the_field_has_the_focus() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        open_new(&mut app, None, "987654321");
+        frame_with(&ctx, &mut app, Vec::new());
+        // Click the empty customer field (its hint), then type: the matches show under it.
+        let field = app.tr("Type a name…").to_string();
+        click_text(&ctx, &mut app, &field);
+        frame_with(&ctx, &mut app, vec![egui::Event::Text("Lunar".into())]);
+        assert_eq!(app.devices.form.as_ref().map(|f| f.customer.text.as_str()), Some("Lunar"));
+        assert!(ctx.memory(|m| m.focused().is_some()), "the field has the focus");
+        // The click takes the focus from the field: the match must still be there to take it.
+        click_text(&ctx, &mut app, "Studio Tecnico Lunaria");
+        let f = app.devices.form.clone().expect("the form");
+        assert_eq!((f.customer.id, f.customer.text.as_str()), (Some(1), "Studio Tecnico Lunaria"));
+        let save = app.tr("Save").to_string();
+        click_text(&ctx, &mut app, &save);
+        assert!(app.devices.form.is_none(), "saved");
+        assert!(app.data().devices.iter().any(|d| d.rustdesk_id == "987654321" && d.customer_id == 1));
+    }
+
+    #[test]
+    fn a_customer_the_desk_does_not_have_is_created_from_the_field() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        open_new(&mut app, None, "987654321");
+        frame_with(&ctx, &mut app, Vec::new());
+        let field = app.tr("Type a name…").to_string();
+        click_text(&ctx, &mut app, &field);
+        let texts = frame_with(&ctx, &mut app, vec![egui::Event::Text("Emilian".into())]);
+        let hint = app.tr("Pick the customer to save the PC");
+        assert!(texts.iter().any(|(t, _)| t == hint), "why Save is off");
+        let customers = app.data().customers.len();
+        let create = format!("+ {}", app.language.fill("Create the customer \"{name}\"", &[("name", "Emilian")]));
+        click_text(&ctx, &mut app, &create);
+        assert_eq!(app.data().customers.len(), customers + 1);
+        let created = app.data().customers.iter().find(|c| c.name == "Emilian").map(|c| c.id).expect("Emilian");
+        let f = app.devices.form.clone().expect("the form stays open");
+        assert_eq!(f.customer.id, Some(created));
+        assert_eq!(app.devices.busy, None);
+        let save = app.tr("Save").to_string();
+        click_text(&ctx, &mut app, &save);
+        assert!(app.data().devices.iter().any(|d| d.rustdesk_id == "987654321" && d.customer_id == created));
+        // A name pasted with a tab is created as the engine stores it, and picked.
+        open_new(&mut app, None, "");
+        frame_with(&ctx, &mut app, Vec::new());
+        let field = app.tr("Type a name…").to_string();
+        click_text(&ctx, &mut app, &field);
+        frame_with(&ctx, &mut app, vec![egui::Event::Paste("Rossi\tMario".into())]);
+        let create = format!("+ {}", app.language.fill("Create the customer \"{name}\"", &[("name", "Rossi\tMario")]));
+        click_text(&ctx, &mut app, &create);
+        let rossi = app.data().customers.iter().find(|c| c.name == "Rossi Mario").map(|c| c.id);
+        assert!(rossi.is_some());
+        assert_eq!(app.devices.form.as_ref().and_then(|f| f.customer.id), rossi);
+        // An archived customer's name: neither picked nor created, and the field says why, even
+        // under another customer it finds.
+        app.run("customer.add", json!({"name": "Elio Brina Impianti"}));
+        app.run("customer.archive", json!({"customer": 3}));
+        open_new(&mut app, None, "");
+        frame_with(&ctx, &mut app, Vec::new());
+        let field = app.tr("Type a name…").to_string();
+        click_text(&ctx, &mut app, &field);
+        let texts = frame_with(&ctx, &mut app, vec![egui::Event::Text("Elio Brina".into())]);
+        let archived = app.language.fill("The customer \"{name}\" is archived: restore it to pick it", &[("name", "Elio Brina")]);
+        assert!(texts.iter().any(|(t, _)| *t == archived), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        assert!(texts.iter().any(|(t, _)| t == "Elio Brina Impianti"));
+        assert!(!texts.iter().any(|(t, _)| t.starts_with('+')), "no create row");
+        assert_eq!(app.devices.form.as_ref().and_then(|f| f.customer.id), None);
+        // A name typed exactly as the only customer it finds picks that customer.
+        open_new(&mut app, None, "");
+        frame_with(&ctx, &mut app, Vec::new());
+        let field = app.tr("Type a name…").to_string();
+        click_text(&ctx, &mut app, &field);
+        frame_with(&ctx, &mut app, vec![egui::Event::Text("ferramenta corvo".into())]);
+        assert_eq!(app.devices.form.as_ref().and_then(|f| f.customer.id), Some(2));
     }
 
     #[test]

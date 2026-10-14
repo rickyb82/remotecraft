@@ -1381,7 +1381,7 @@ pub fn form_ui(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         ui.set_width(ui.available_width());
         egui::Grid::new("intervention-form-who").num_columns(2).spacing([12.0, 8.0]).min_col_width(LABEL_W).show(ui, |ui| {
             let before = f.customer.id;
-            forms::customer_picker(app, ui, t, app.tr("Customer"), &mut f.customer, editing);
+            forms::customer_picker(app, ui, t, app.tr("Customer"), &mut f.customer, editing, false);
             if f.customer.id != before
                 && let Some(c) = f.customer.id
                 && f.device.id.and_then(|d| app.data().device(d)).is_some_and(|d| d.customer_id != c)

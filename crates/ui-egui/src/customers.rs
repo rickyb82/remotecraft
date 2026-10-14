@@ -759,7 +759,9 @@ fn who_is(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     found.sort();
     let found: Vec<u64> = found.into_iter().take(WHO_MAX).map(|f| f.2).collect();
     let shown = rustdesk::display(&rid);
+    let quick = found.is_empty() && app.search_quick_offer().is_some();
     let mut add = false;
+    let mut connect = false;
     let mut open = None;
     egui::Frame::NONE.fill(t.card).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -773,6 +775,9 @@ fn who_is(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                     let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
                     icons::paint(ui.painter(), r, Icon::Device, t.muted);
                     ui.label(RichText::new(app.language.fill("No PC has the RustDesk ID {id}", &[("id", &shown)])).color(t.ui_text));
+                    if quick && widgets::primary_button(ui, t, Some(Icon::Remote), app.tr("Connect now")).clicked() {
+                        connect = true;
+                    }
                     if ui.button(app.tr("Add a PC with this ID")).clicked() {
                         add = true;
                     }
@@ -787,6 +792,9 @@ fn who_is(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         let r = ui.min_rect();
         ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, t.border));
     });
+    if connect {
+        app.quick_connect(&rid);
+    }
     if add {
         new_pc(app, None, &rid);
     }

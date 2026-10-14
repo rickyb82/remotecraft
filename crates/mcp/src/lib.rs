@@ -158,9 +158,9 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "connect_device",
             command: "device.connect",
-            description: "The rustdesk:// link and command line to connect to a PC, with the consent state and warnings. Opening the link is up to the person.",
-            properties: json!({"device": device}),
-            required: &["device"],
+            description: "The rustdesk:// link and command line to connect to a PC, with the consent state and warnings. Give the device, or only the RustDesk ID the customer reads out (a quick connection to a PC not in the desk: the link only, tied to no customer, no consent checked; digits only). Opening the link is up to the person.",
+            properties: json!({"device": device, "rustdesk_id": {"type": "string", "description": "A RustDesk ID (123 456 789), for a PC that may not be in the desk"}}),
+            required: &[],
         },
         Tool {
             name: "start_intervention",

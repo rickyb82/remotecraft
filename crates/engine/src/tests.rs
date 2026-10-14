@@ -499,6 +499,43 @@ fn putting_a_pc_back_in_service_keeps_rustdesk_ids_unique() {
 }
 
 #[test]
+fn a_quick_connection_needs_only_the_rustdesk_id() {
+    let mut d = demo();
+    let before = d.data().clone();
+    // A PC the desk does not know: the link only, tied to no customer, nothing changed.
+    let v = run(&mut d, "device.connect", json!({"rustdesk_id": "987 654 321"}));
+    assert_eq!(v["connect"]["uri"], "rustdesk://connection/new/987654321");
+    assert_eq!(v["connect"]["display"], "987 654 321");
+    assert!(v["device"].is_null() && v["consent_ok"].is_null(), "{v}");
+    assert!(v["warnings"][0].as_str().unwrap().contains("not in the desk"), "{v}");
+    assert_eq!(d.data(), &before);
+    // Audited without the ID: no record to name, and an ID typed is not kept.
+    let last = d.audit_entries(1).pop().unwrap();
+    assert_eq!((last.command.as_str(), last.targets.len()), ("device.connect", 0));
+    assert!(!serde_json::to_string(&last).unwrap().contains("987"));
+    // A known PC is the same as naming it: its customer, its consent.
+    let known = run(&mut d, "device.connect", json!({"rustdesk_id": "100-200-300"}));
+    assert_eq!(known["device"]["id"], 1);
+    assert_eq!(known["customer"], "Studio Tecnico Lunaria");
+    // `id` names the PC as `device` does.
+    assert_eq!(run(&mut d, "device.connect", json!({"id": 1, "rustdesk_id": "987654321"}))["device"]["id"], 1);
+    // A name or a host name is not dialled as an ID.
+    for name in ["LUN-SEG01", "PC segreteria", "Lunaria"] {
+        assert!(fails(&mut d, "device.connect", json!({"rustdesk_id": name})).contains("no PC has the RustDesk ID"), "{name}");
+    }
+    // A retired PC connects as itself: its customer, its consent, both in the audit.
+    run(&mut d, "privacy.withdraw", json!({"customer": 1, "purposes": ["remote_assistance"]}));
+    run(&mut d, "device.retire", json!({"device": 1}));
+    let retired = run(&mut d, "device.connect", json!({"rustdesk_id": "100 200 300"}));
+    assert_eq!((retired["device"]["id"].as_u64(), retired["consent_ok"].as_bool()), (Some(1), Some(false)), "{retired}");
+    let last = d.audit_entries(1).pop().unwrap();
+    assert_eq!(last.targets, vec!["device:1", "customer:1"]);
+    // Not an ID, or nothing at all: refused.
+    assert!(fails(&mut d, "device.connect", json!({"rustdesk_id": "12; rm -rf /"})).contains("not a RustDesk ID"));
+    assert!(!fails(&mut d, "device.connect", json!({"rustdesk_id": "  "})).is_empty());
+}
+
+#[test]
 fn an_unchanged_rustdesk_id_is_not_a_clash() {
     // Two PCs in service with one ID (a desk written before put-backs were checked).
     let mut data = remotecraft_core::mock::demo(now());

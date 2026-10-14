@@ -102,6 +102,7 @@ fn main() {
     let mut open: Option<usize> = None;
     let mut new = false;
     let mut start = false;
+    let mut customer: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -112,6 +113,8 @@ fn main() {
             "--new" => new = true,
             "--start" => start = true,
             "--search" => app.search = it.next().cloned().unwrap_or_default(),
+            // The customer typed (not picked) in the new PC form opened by `--new`.
+            "--customer" => customer = it.next().cloned(),
             "--size" => {
                 if let Some((a, b)) = it.next().and_then(|s| s.split_once('x')) {
                     w = a.parse().unwrap_or(w);
@@ -144,6 +147,9 @@ fn main() {
     for i in 0..6 {
         if i == 2 && new {
             app.new_record();
+            if let (Some(text), Some(f)) = (&customer, app.devices.form.as_mut()) {
+                f.customer = remotecraft_ui_egui::forms::Picker { text: text.clone(), id: None };
+            }
         }
         if i == 2 && start {
             app.start_intervention();

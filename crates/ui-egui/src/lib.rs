@@ -82,7 +82,8 @@ pub enum Request {
     /// Save bytes somewhere (a GDPR export).
     SaveFile { name: String, data: Vec<u8> },
     /// Forget the server and token this browser keeps and reload without them (Settings, on a
-    /// remote desk: a shared or lost PC). Nothing to do for a local desk.
+    /// remote desk: a shared PC; a lost one needs the token revoked from the framework). Nothing
+    /// to do for a local desk.
     ForgetToken,
 }
 
@@ -144,10 +145,17 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("?", "This help"),
 ];
 
-/// A key of [`SHORTCUTS`] as this platform's keyboard says it: the shortcuts listen for
-/// `Modifiers::COMMAND`, which is Cmd on a Mac (or an iPad), so `Ctrl+` reads `Cmd+` there.
+/// A key of [`SHORTCUTS`] as this platform's keyboard says it (see [`shortcut_key_in`]).
 pub fn shortcut_key(os: egui::os::OperatingSystem, key: &str) -> std::borrow::Cow<'_, str> {
-    if os.is_mac() { key.replace("Ctrl+", "Cmd+").into() } else { key.into() }
+    shortcut_key_in(os, cfg!(target_arch = "wasm32"), key)
+}
+
+/// A key of [`SHORTCUTS`] on `os`, in a browser or not. The shortcuts listen for
+/// `Modifiers::COMMAND`, which the desktop app on a Mac reads from Cmd only, so `Ctrl+` reads
+/// `Cmd+` there. A browser (on a Mac or an iPad too) reads it from Ctrl as well, and keeps Cmd+R
+/// for itself: it reloads the page, losing what was typed. There the keys stay `Ctrl+`.
+pub fn shortcut_key_in(os: egui::os::OperatingSystem, browser: bool, key: &str) -> std::borrow::Cow<'_, str> {
+    if os.is_mac() && !browser { key.replace("Ctrl+", "Cmd+").into() } else { key.into() }
 }
 
 /// A question before an action that cannot be undone: `DeskApp::ask(Confirm { .. })`.
@@ -455,6 +463,7 @@ impl DeskApp {
         if self.auto_settings && !self.session.data().customers.is_empty() {
             self.auto_settings = false;
             if self.screen == Screen::Settings {
+                self.leave_settings();
                 self.screen = Screen::Customers;
             }
         }
@@ -541,13 +550,22 @@ impl DeskApp {
     pub fn go(&mut self, screen: Screen) {
         if self.screen != Screen::Settings {
             self.previous = self.screen;
+        } else if screen != Screen::Settings {
+            self.leave_settings();
         }
         self.screen = screen;
     }
 
     /// Leaves Settings for the screen it was opened from.
     pub fn go_back(&mut self) {
+        self.leave_settings();
         self.screen = if self.previous == Screen::Settings { Screen::Customers } else { self.previous };
+    }
+
+    /// Settings is left: a first press of "Forget the token" does not wait for the return (one
+    /// press after it would forget at once).
+    fn leave_settings(&mut self) {
+        self.settings.forget_armed = false;
     }
 
     pub fn open_customer(&mut self, id: u64) {

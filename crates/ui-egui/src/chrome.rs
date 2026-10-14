@@ -436,6 +436,14 @@ mod tests {
         assert!(!texts.iter().any(|t| t.starts_with("Ctrl+")), "{texts:?}");
         assert_eq!(crate::shortcut_key(OperatingSystem::Mac, "j / k"), "j / k");
         assert_eq!(crate::shortcut_key(OperatingSystem::Nix, "Ctrl+R"), "Ctrl+R");
+        assert_eq!(crate::shortcut_key_in(OperatingSystem::Mac, false, "Ctrl+R"), "Cmd+R", "the desktop app on a Mac");
+        // In a browser Ctrl works on a Mac too, and Cmd+R would reload the page (what was typed
+        // is lost): the web app says Ctrl everywhere.
+        for os in [OperatingSystem::Mac, OperatingSystem::IOS, OperatingSystem::Windows, OperatingSystem::Nix] {
+            for (key, _) in crate::SHORTCUTS {
+                assert_eq!(crate::shortcut_key_in(os, true, key), *key, "{os:?}");
+            }
+        }
     }
 
     #[test]

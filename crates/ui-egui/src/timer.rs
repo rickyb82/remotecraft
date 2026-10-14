@@ -99,9 +99,10 @@ const KINDS: [(&str, &str, Icon); 5] = [
 /// What a command queued by this screen was for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Intent {
-    /// `intervention.start`, from the card or straight from a row; `opened` says the RustDesk
-    /// link was already opened in the click's frame.
-    Start { customer: Option<u64>, device: Option<u64>, opened: bool },
+    /// `intervention.start`, from the card (`from_card`) or straight from a row; `opened` says
+    /// the RustDesk link was already opened in the click's frame. Who sent it is recorded, never
+    /// guessed: a row's start can be answered while the card waits for a command of its own.
+    Start { customer: Option<u64>, device: Option<u64>, opened: bool, from_card: bool },
     /// `intervention.stop {id}`.
     Stop { id: u64 },
     /// `intervention.add` from the Log mode, for this customer.
@@ -411,7 +412,7 @@ pub fn start_now(app: &mut DeskApp, device: u64) {
     app.run_as(
         "intervention.start",
         json!({"device": device}),
-        crate::Intent::Timer(Intent::Start { customer: Some(customer), device: Some(device), opened }),
+        crate::Intent::Timer(Intent::Start { customer: Some(customer), device: Some(device), opened, from_card: false }),
     );
 }
 
@@ -686,7 +687,7 @@ fn submit_start(app: &mut DeskApp, anyway: bool) {
         card.busy = true;
         card.error.clear();
     }
-    app.run_as("intervention.start", params, crate::Intent::Timer(Intent::Start { customer, device, opened }));
+    app.run_as("intervention.start", params, crate::Intent::Timer(Intent::Start { customer, device, opened, from_card: true }));
 }
 
 /// Sends `intervention.stop` for the followed intervention, always with its id.
@@ -806,13 +807,20 @@ fn submit_consent(app: &mut DeskApp) {
 
 /// Applies a finished command of the card.
 pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
-    // Whether the card itself sent this (a row's start finds it idle).
-    let sent_by_card = app.timer.card.as_ref().is_some_and(|card| card.busy);
-    if let Some(card) = app.timer.card.as_mut() {
+    // Whether the card sent this: a row's start, or a stop of an intervention the card does not
+    // follow, is not the card's and leaves the wait of the card's own command alone.
+    let own = match &intent {
+        Intent::Start { from_card, .. } => *from_card,
+        Intent::Stop { id } => app.timer.card.as_ref().is_some_and(|card| card.running.as_ref().is_some_and(|r| r.id == *id)),
+        Intent::Log { .. } | Intent::Consent { .. } => true,
+    };
+    // A card opened since (a new form) is not the one that sent it.
+    let sent_by_card = own && app.timer.card.as_ref().is_some_and(|card| card.busy);
+    if own && let Some(card) = app.timer.card.as_mut() {
         card.busy = false;
     }
     match intent {
-        Intent::Start { customer, device, opened } => match &c.result {
+        Intent::Start { customer, device, opened, .. } => match &c.result {
             Ok(v) => started(app, v, opened, sent_by_card),
             Err(e) => refused(app, &e.to_string(), customer, device, Mode::Start),
         },
@@ -892,14 +900,25 @@ fn started(app: &mut DeskApp, v: &Value, opened: bool, sent_by_card: bool) {
         open_link_of(app, running.device_id);
     }
     let target = Target { customer: Some(running.customer_id), device: running.device_id, text: String::new() };
-    // A start from a row (the card did not send it) while the card is a form holding what was
-    // typed: the form stays, the timer runs in the top-bar chip, and the toast says for whom.
-    if !sent_by_card && app.timer.card.as_ref().is_some_and(unsent_typing) {
+    // A start from a row (the card did not send it) while the card waits for its own command, or
+    // is a form holding what was typed for other work: the card stays, the timer runs in the
+    // top-bar chip, and the toast says for whom, with the start's warnings (the status bar keeps
+    // them once the toast is gone).
+    if !sent_by_card && app.timer.card.as_ref().is_some_and(|c| keeps_card(c, running.customer_id)) {
         let name =
             if running.customer_name.is_empty() { crate::customer_name(app.data(), running.customer_id) } else { running.customer_name.clone() };
-        app.toast(app.language.fill("Timer started for {customer}", &[("customer", &name)]));
+        let mut toast = app.language.fill("Timer started for {customer}", &[("customer", &name)]);
+        if !warnings.is_empty() {
+            let joined = warnings.join(" · ");
+            toast = format!("{toast} · {joined}");
+            app.status = joined;
+        }
+        app.toast(toast);
         return;
     }
+    // A row's start on the customer of a Start form holding what was typed: the form becomes the
+    // card of that intervention (sent, it would start a second one), with what was typed in it.
+    let carried = if sent_by_card { None } else { app.timer.card.as_ref().filter(|c| unsent_typing(c)).cloned() };
     if app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id != running.id)) {
         // The card followed another intervention: keep what was typed in it.
         release(app);
@@ -912,6 +931,7 @@ fn started(app: &mut DeskApp, v: &Value, opened: bool, sent_by_card: bool) {
     card.notes.clear();
     card.billable = i["billable"].as_bool().unwrap_or(true);
     card.saved = (card.summary.clone(), card.billable);
+    let update = carried.and_then(|form| carry_typed(&mut card, &form, running.id, &text("reference")));
     card.seen = app.data().intervention(running.id).is_some();
     card.missing_since = None;
     card.running = Some(running);
@@ -921,7 +941,33 @@ fn started(app: &mut DeskApp, v: &Value, opened: bool, sent_by_card: bool) {
     card.minimized = false;
     card.refocus = Some(Field::Summary);
     app.timer.card = Some(card);
+    if let Some(params) = update {
+        app.run("intervention.update", params);
+    }
     app.toast(app.tr("Timer started").to_string());
+}
+
+/// Puts what was typed in a Start form into the card of the intervention a row's start gave
+/// instead: the summary, the notes (for the stop) and Billable. The summary, Billable and the
+/// reference that differ from the answer's are saved now: answers the `intervention.update`.
+fn carry_typed(card: &mut Card, form: &Card, id: u64, answered_reference: &str) -> Option<Value> {
+    let mut params = json!({"id": id});
+    let summary = form.summary.trim();
+    if !summary.is_empty() && summary != card.summary {
+        card.summary = summary.to_string();
+        params["summary"] = json!(summary);
+    }
+    if form.billable != card.billable {
+        card.billable = form.billable;
+        params["billable"] = json!(form.billable);
+    }
+    let reference = form.reference.trim();
+    if !reference.is_empty() && reference != answered_reference {
+        params["reference"] = json!(reference);
+    }
+    card.notes = form.notes.trim().to_string();
+    card.saved = (card.summary.clone(), card.billable);
+    params.as_object().is_some_and(|o| o.len() > 1).then_some(params)
 }
 
 /// Whether a card is a form not sent yet (Start, Log) holding something the technician typed.
@@ -929,6 +975,13 @@ fn unsent_typing(c: &Card) -> bool {
     matches!(c.mode, Mode::Start | Mode::Log)
         && c.running.is_none()
         && [&c.summary, &c.notes, &c.reference, &c.ended_at, &c.minutes].iter().any(|s| !s.trim().is_empty())
+}
+
+/// Whether a row's start on `customer` leaves the card as it is: the card waits for a command of
+/// its own, or is a form holding what was typed for other work (past work, or a start for another
+/// customer). A Start form typed for this customer gives way (see [`carry_typed`]).
+fn keeps_card(c: &Card, customer: u64) -> bool {
+    c.busy || (unsent_typing(c) && (c.mode != Mode::Start || c.target.customer != Some(customer)))
 }
 
 /// A start or a log failed: the consent refusal panel, or the message under the form. A card
@@ -2324,6 +2377,142 @@ mod tests {
         frame(&mut app);
         assert_eq!(card(&app).mode, Mode::Running);
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started"));
+        // A Start form typed for that same PC gives way to the running card, with what was typed:
+        // sent, it would start a second intervention on the PC.
+        let mut app = demo_en();
+        open_start(&mut app, Some(2), Some(4));
+        edit(&mut app, |c| {
+            c.summary = "Cassa bloccata".into();
+            c.reference = "T-42".into();
+            c.billable = false;
+        });
+        start_now(&mut app, 4);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.running.as_ref().map(|r| r.id)), (Mode::Running, Some(11)));
+        assert_eq!((c.summary.as_str(), c.billable), ("Cassa bloccata", false));
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started"));
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("running");
+        assert_eq!((i.summary.as_str(), i.reference.as_str(), i.billable), ("Cassa bloccata", "T-42", false), "saved at once");
+        // The card's main button now stops it; nothing starts twice.
+        apply(&mut app, Action::Submit);
+        frame(&mut app);
+        assert_eq!(card(&app).mode, Mode::Stop);
+        let on_pc4 = |app: &DeskApp| app.data().interventions.iter().filter(|i| i.running() && i.device_id == Some(4)).count();
+        assert_eq!(on_pc4(&app), 1);
+        // The same customer without a PC picked: the same.
+        let mut app = demo_en();
+        open_start(&mut app, Some(2), None);
+        edit(&mut app, |c| c.summary = "Cassa bloccata".into());
+        start_now(&mut app, 4);
+        frame(&mut app);
+        assert_eq!((card(&app).mode, card(&app).summary.as_str()), (Mode::Running, "Cassa bloccata"));
+        // A Start form typed for another customer, or past work for this one, stays.
+        for (mode, customer) in [(Mode::Start, 1), (Mode::Log, 2)] {
+            let mut app = demo_en();
+            if mode == Mode::Start {
+                open_start(&mut app, Some(customer), None)
+            } else {
+                open_log(&mut app, Some(customer), None)
+            }
+            edit(&mut app, |c| c.summary = "Altro lavoro".into());
+            start_now(&mut app, 4);
+            frame(&mut app);
+            let c = card(&app);
+            assert_eq!((c.mode, c.target.customer, c.summary.as_str()), (mode, Some(customer), "Altro lavoro"), "the form stays");
+            assert!(c.running.is_none());
+            assert_eq!(on_pc4(&app), 1);
+            assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some(""), "nothing typed for other work moves over");
+        }
+    }
+
+    #[test]
+    fn a_row_start_that_keeps_the_form_still_shows_its_warnings() {
+        // Another of my timers runs (Lunaria's PC 1); a past-work entry for Lunaria is half
+        // typed; Ferramenta Corvo's PC 4 is started from its row.
+        for lang in Language::ALL {
+            let mut app = DeskApp::demo();
+            app.language = lang;
+            start_now(&mut app, 1);
+            frame(&mut app);
+            open_log(&mut app, Some(1), None);
+            edit(&mut app, |c| c.summary = "Backup NAS".into());
+            start_now(&mut app, 4);
+            frame(&mut app);
+            assert_eq!(card(&app).mode, Mode::Log, "the form stays");
+            let (toast, warning) = match lang {
+                Language::En => ("Timer started for Ferramenta Corvo", "you have other running interventions: [11]"),
+                Language::It => ("Timer avviato per Ferramenta Corvo", "hai altri interventi in corso: [11]"),
+            };
+            assert_eq!(app.toast.as_ref().map(|t| t.0.clone()), Some(format!("{toast} · {warning}")));
+            assert_eq!(app.status, warning, "kept once the toast is gone");
+        }
+        // The privacy notice changed after Ferramenta Corvo received it: the warning shows too.
+        let mut app = DeskApp::demo();
+        app.language = Language::It;
+        app.run("notice.add", json!({"version": "2026-09", "title": "Informativa", "text": "Testo"}));
+        frame(&mut app);
+        open_log(&mut app, Some(1), None);
+        edit(&mut app, |c| c.summary = "Backup NAS".into());
+        start_now(&mut app, 4);
+        frame(&mut app);
+        let warning = "il cliente ha ricevuto l'informativa 2026-01 ma quella attuale è 2026-09";
+        assert_eq!(app.toast.as_ref().map(|t| t.0.clone()), Some(format!("Timer avviato per Ferramenta Corvo · {warning}")));
+        assert_eq!(app.status, warning);
+        // Without warnings the toast names the customer alone and the status bar is left as is.
+        let mut app = demo_en();
+        open_log(&mut app, Some(1), None);
+        edit(&mut app, |c| c.summary = "Backup NAS".into());
+        start_now(&mut app, 4);
+        frame(&mut app);
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started for Ferramenta Corvo"));
+        assert!(app.status.is_empty(), "{}", app.status);
+    }
+
+    #[test]
+    fn a_row_start_answered_while_the_card_waits_is_never_taken_for_the_card_s() {
+        // A row start on Ferramenta Corvo's PC 4 waits for its answer while a past-work entry
+        // for Elio Brina (3, PC 5, no remote-assistance consent) is sent from the card: the row's
+        // answer arrives first.
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        open_log(&mut app, Some(3), Some(5));
+        edit(&mut app, |c| {
+            c.summary = "Notebook lento".into();
+            c.notes = "Pulizia ventole".into();
+            c.minutes = "30".into();
+        });
+        submit_log(&mut app, false);
+        assert!(card(&app).busy);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer), (Mode::Log, Some(3)), "the form is not taken for the running card");
+        assert_eq!((c.summary.as_str(), c.notes.as_str()), ("Notebook lento", "Pulizia ventole"), "nothing typed is lost");
+        assert_eq!(c.refusal.as_ref().map(|r| r.customer), Some(Some(3)), "the log's own refusal");
+        assert!(!c.busy);
+        assert!(app.data().intervention(11).is_some_and(|i| i.running() && i.device_id == Some(4)));
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Timer started for Ferramenta Corvo"));
+        // The log goes through with a reason.
+        edit_refusal(&mut app, |r| r.reason = "agreed on the phone".into());
+        submit_log(&mut app, true);
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+        assert_eq!(app.data().intervention(12).map(|i| i.summary.as_str()), Some("Notebook lento"));
+        // Nor while the card waits for its own stop: the card closes on it, the row's timer runs
+        // in the chip.
+        let mut app = demo_en();
+        start_now(&mut app, 1);
+        frame(&mut app);
+        start_now(&mut app, 4);
+        open_running(&mut app, 11, true);
+        edit(&mut app, |c| c.notes = "Fatto".into());
+        submit_stop(&mut app);
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "closed by its own stop");
+        assert!(app.data().intervention(11).is_some_and(|i| !i.running() && i.notes.contains("Fatto")));
+        assert!(app.data().intervention(12).is_some_and(|i| i.running() && i.device_id == Some(4)));
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("Stopped")));
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! interventions, and keep the GDPR record — in plain language.
 //!
 //! Every tool is an engine command run through a [`Runner`]: the local [`Desk`], or a
-//! RemoteCraft server over HTTP (`remotecraft-cli mcp --server URL --token T`). What the API
+//! RemoteCraft server over HTTP (`remotecraft-cli mcp --server URL [--token T]`, no token for a
+//! tokenless server on this computer). What the API
 //! does, an agent can do, and nothing else.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

@@ -35,3 +35,15 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' http://127.0.0.1:7979/api/snapshot)" = 401
           grep -q '"ok":true' check.json
           docker exec -u remotecraft rc remotecraft-cli rustdesk
+      - name: A token too short stops the desk API, not RustDesk
+        run: |
+          docker run -d --name short -e REMOTECRAFT_TOKEN=too-short -e RUSTDESK_HOST=rustdesk.example.net remotecraft
+          for i in $(seq 1 60); do docker logs short 2>&1 | grep -q 'ERROR: the desk API (port 7979' && break; sleep 1; done
+          docker logs short 2>&1 | grep -q 'ERROR: the desk API (port 7979'
+          sleep 5
+          test "$(docker inspect -f '{{.State.Running}}' short)" = true
+          # RustDesk answers (the same check as the health check); the desk API does not.
+          docker exec -u remotecraft short remotecraft-cli rustdesk
+          if docker exec short bash -c 'exec 3<>/dev/tcp/127.0.0.1/7979' 2>/dev/null; then
+            echo "the desk API should not be listening with a short token"; exit 1
+          fi

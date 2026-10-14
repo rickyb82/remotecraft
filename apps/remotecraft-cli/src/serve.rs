@@ -164,8 +164,6 @@ const MAX_HEAD: u64 = 16 * 1024;
 const BODY_DEADLINE: Duration = Duration::from_secs(30);
 /// Time for each write of an answer.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Wait before answering a missing or wrong token.
-const AUTH_DELAY: Duration = Duration::from_millis(250);
 /// After an early answer: how long, and how much, of what the client still sends is read
 /// and dropped.
 const LINGER: Duration = Duration::from_secs(2);
@@ -325,6 +323,10 @@ fn query_params(query: &str) -> Value {
     Value::Object(out)
 }
 
+/// Headers every answer carries, the 503 of [`busy`] too: no guessing a type other than the
+/// one sent, and no address (a `#token=` link's) passed on to another site.
+const SAFETY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n";
+
 /// Writes the status line and the headers. `cors` is an origin already allowed.
 fn write_head(stream: &mut impl Write, status: &str, content_type: &str, length: u64, cache: &str, cors: Option<&str>) -> std::io::Result<()> {
     let cors = match cors {
@@ -336,7 +338,7 @@ Access-Control-Allow-Headers: Content-Type, Authorization, X-Remotecraft-User\r\
     };
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nCache-Control: {cache}\r\nConnection: close\r\n\
-X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nVary: Origin\r\n{cors}\r\n"
+{SAFETY_HEADERS}Vary: Origin\r\n{cors}\r\n"
     );
     stream.write_all(head.as_bytes())
 }
@@ -420,6 +422,19 @@ fn serve_static(stream: &mut TcpStream, dir: &Path, path: &str, cors: Option<&st
         return;
     }
     match open_static(dir, &rel) {
+        // The root page says that this server serves it: the web app talks to its own origin
+        // only then (a page copied to another site does not).
+        Some((file, len)) if rel == INDEX => match read_index(file, len) {
+            Some(page) => {
+                let page = with_server_mark(&page);
+                let length = u64::try_from(page.len()).unwrap_or(u64::MAX);
+                if write_head(stream, "200 OK", mime_of(Path::new(INDEX)), length, cache_control(INDEX), cors).is_ok() {
+                    let _ = stream.write_all(&page);
+                }
+                let _ = stream.flush();
+            }
+            None => respond_bytes(stream, "500 Internal Server Error", "text/plain; charset=utf-8", b"index.html is too large or unreadable", cors),
+        },
         Some((file, len)) => {
             if write_head(stream, "200 OK", mime_of(Path::new(&rel)), len, cache_control(&rel), cors).is_ok() {
                 let _ = std::io::copy(&mut file.take(len), stream);
@@ -428,6 +443,44 @@ fn serve_static(stream: &mut TcpStream, dir: &Path, path: &str, cors: Option<&st
         }
         None => respond_bytes(stream, "404 Not Found", "text/plain; charset=utf-8", b"not found", cors),
     }
+}
+
+/// The web app's root page.
+const INDEX: &str = "index.html";
+/// Largest root page read whole to mark it (trunk's is a couple of KB).
+const MAX_INDEX: u64 = 1024 * 1024;
+/// Added to the root page: the web app treats its own origin as the server only with it.
+const SERVER_MARK: &str = r#"<meta name="remotecraft-server" content="same-origin">"#;
+
+/// The whole root page, when it is at most [`MAX_INDEX`] bytes.
+fn read_index(file: std::fs::File, len: u64) -> Option<Vec<u8>> {
+    if len > MAX_INDEX {
+        return None;
+    }
+    let mut page = Vec::with_capacity(usize::try_from(len).ok()?);
+    file.take(MAX_INDEX.checked_add(1)?).read_to_end(&mut page).ok()?;
+    (u64::try_from(page.len()).ok()? <= MAX_INDEX).then_some(page)
+}
+
+/// The page with [`SERVER_MARK`] right after its opening `<head>` tag (any case, with or
+/// without attributes; `<header>` is not one), or before everything when it has none.
+fn with_server_mark(page: &[u8]) -> Vec<u8> {
+    let at = page
+        .windows(5)
+        .enumerate()
+        .filter(|(_, w)| w.eq_ignore_ascii_case(b"<head"))
+        .find_map(|(i, _)| {
+            let rest = page.get(i.checked_add(5)?..)?;
+            let next = *rest.first()?;
+            if next != b'>' && next != b'/' && !next.is_ascii_whitespace() {
+                return None;
+            }
+            let close = rest.iter().position(|&b| b == b'>')?;
+            i.checked_add(5)?.checked_add(close)?.checked_add(1)
+        })
+        .unwrap_or(0);
+    let (before, after) = page.split_at(at.min(page.len()));
+    [before, SERVER_MARK.as_bytes(), after].concat()
 }
 
 /// `dir/rel` and its length, when it is a regular file inside `dir`, at most [`MAX_STATIC`].
@@ -680,11 +733,13 @@ fn answer(stream: &mut TcpStream, reader: &mut BufReader<Timed>, head: &Head, hu
         }
         return;
     }
-    // Who is calling, before reading a byte of the body.
+    // Who is calling, before reading a byte of the body. A missing or wrong token is answered
+    // at once: a fixed wait used to hold one of the connections served at once, so a few
+    // hundred requests a second without a token turned every technician away with 503. Tokens
+    // of at least 32 random characters cannot be guessed anyway.
     let caller = match authenticate(hub, head) {
         Ok(c) => c,
         Err(e) => {
-            std::thread::sleep(AUTH_DELAY);
             respond(stream, "401 Unauthorized", &json!({"error": e}), origin);
             return;
         }
@@ -820,7 +875,8 @@ fn busy(stream: &mut TcpStream) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
     let body = br#"{"error": "the server is busy, try again"}"#;
     let head = format!(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nRetry-After: 1\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\
+Retry-After: 1\r\nConnection: close\r\n{SAFETY_HEADERS}\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body));
@@ -1077,11 +1133,40 @@ mod tests {
         assert!(ask(Some("Bearer wrong"), 8 * 1024 * 1024).starts_with("HTTP/1.1 401"));
         assert!(ask(Some(&bearer), MAX_BODY + 1).starts_with("HTTP/1.1 413"));
         assert!(started.elapsed() < Duration::from_secs(10));
-        // Wrong tokens wait a little before the answer.
-        let started = Instant::now();
         assert_eq!(http(&addr, "GET", "/api/status", &[("Authorization", "Bearer wrong")], "").0, 401);
-        assert!(started.elapsed() >= AUTH_DELAY);
         assert_eq!(http(&addr, "GET", "/api/status", &[("Authorization", &bearer)], "").0, 200);
+    }
+
+    #[test]
+    fn requests_without_a_good_token_do_not_turn_technicians_away() {
+        // A missing or wrong token used to wait 250 ms holding one of the connections served at
+        // once: a handful of such requests filled them all, and the technicians got 503.
+        let addr = start_with(options(SVC), Limits { head: Duration::from_secs(5), connections: 4 });
+        let bearer = format!("Bearer {SVC}");
+        for round in 0..3 {
+            let go = Arc::new(std::sync::Barrier::new(8));
+            let flood: Vec<_> = (0..8)
+                .map(|i| {
+                    let (addr, go) = (addr.clone(), go.clone());
+                    std::thread::spawn(move || {
+                        let auth = if i % 2 == 0 { "" } else { "Authorization: Bearer wrong\r\n" };
+                        go.wait();
+                        let mut s = TcpStream::connect(&addr).unwrap();
+                        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let _ = s.write_all(format!("GET /api/status HTTP/1.1\r\nHost: {addr}\r\n{auth}\r\n").as_bytes());
+                        let mut out = String::new();
+                        let _ = s.read_to_string(&mut out);
+                    })
+                })
+                .collect();
+            // The flood has been sent; a technician comes right after.
+            std::thread::sleep(Duration::from_millis(100));
+            let (st, v) = http(&addr, "GET", "/api/status", &[("Authorization", &bearer)], "");
+            assert_eq!(st, 200, "round {round}: {v}");
+            for t in flood {
+                t.join().unwrap();
+            }
+        }
     }
 
     #[test]
@@ -1127,6 +1212,12 @@ mod tests {
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
         assert!(out.starts_with("HTTP/1.1 503"), "{out}");
+        // Written by hand, without a thread, but with the headers of every answer.
+        let (head, body) = out.split_once("\r\n\r\n").unwrap();
+        assert_eq!(header_of(head, "x-content-type-options"), Some("nosniff"), "{head}");
+        assert_eq!(header_of(head, "referrer-policy"), Some("no-referrer"), "{head}");
+        assert_eq!(header_of(head, "retry-after"), Some("1"), "{head}");
+        assert_eq!(header_of(head, "content-length"), Some(body.len().to_string().as_str()), "{head}");
         drop(idle);
         let back = (0..50).any(|_| {
             std::thread::sleep(Duration::from_millis(100));
@@ -1178,9 +1269,23 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 200") && out.contains("text/html") && out.ends_with("<html>app</html>"), "{out}");
         // The index names the current module: checked every time; the token in a link's
         // address is never sent on to another site.
-        let head = out.split_once("\r\n\r\n").unwrap().0;
+        let (head, page) = out.split_once("\r\n\r\n").unwrap();
         assert_eq!(header_of(head, "cache-control"), Some("no-cache"));
         assert_eq!(header_of(head, "referrer-policy"), Some("no-referrer"));
+        // The root page carries the server's mark (no `<head>`: in front), and its length.
+        assert_eq!(page, format!("{SERVER_MARK}<html>app</html>"));
+        assert_eq!(header_of(head, "content-length"), Some(page.len().to_string().as_str()));
+        std::fs::write(dir.join("index.html"), "<!DOCTYPE html>\n<HTML><Head lang=\"it\">\n<title>RemoteCraft</title></head></html>").unwrap();
+        let out = text("/index.html");
+        let (head, page) = out.split_once("\r\n\r\n").unwrap();
+        assert_eq!(page, format!("<!DOCTYPE html>\n<HTML><Head lang=\"it\">{SERVER_MARK}\n<title>RemoteCraft</title></head></html>"));
+        assert_eq!(header_of(head, "content-length"), Some(page.len().to_string().as_str()));
+        // Other pages are sent as they are.
+        std::fs::write(dir.join("other.html"), "<head></head>").unwrap();
+        assert!(text("/other.html").ends_with("\r\n\r\n<head></head>"));
+        // A root page too large to read whole is refused, never cut.
+        std::fs::write(dir.join("index.html"), vec![b' '; usize::try_from(MAX_INDEX).unwrap() + 1]).unwrap();
+        assert!(text("/").starts_with("HTTP/1.1 500"));
         assert!(text("/app.wasm").contains("application/wasm"));
         assert!(text("/assets/app.js").starts_with("HTTP/1.1 200"));
         // `+` in a path is a plus, not a space.
@@ -1324,6 +1429,23 @@ mod tests {
         assert_eq!(cache_control("-1f2e3d4c5b6a7980.js"), "no-cache");
         assert_eq!(cache_control("logo-1f2e3d4c5b6a7980.png"), "no-cache");
         assert_eq!(parse_origins("https://a.example/, ,HTTP://B.example:8080"), vec!["https://a.example", "http://b.example:8080"]);
+    }
+
+    #[test]
+    fn the_root_page_is_marked_after_its_head_tag() {
+        let mark = |page: &str| String::from_utf8(with_server_mark(page.as_bytes())).unwrap();
+        let m = SERVER_MARK;
+        assert_eq!(mark("<html><head><title>x</title></head></html>"), format!("<html><head>{m}<title>x</title></head></html>"));
+        assert_eq!(mark("<HEAD>"), format!("<HEAD>{m}"));
+        assert_eq!(mark("<head\n  data-x=\"1\">a"), format!("<head\n  data-x=\"1\">{m}a"));
+        // `<header>` is not the head; the real one later is.
+        assert_eq!(mark("<header>h</header><head>"), format!("<header>h</header><head>{m}"));
+        assert_eq!(mark("<header>h</header>"), format!("{m}<header>h</header>"));
+        // An opening tag never closed, or nothing at all: in front.
+        assert_eq!(mark("<head"), format!("{m}<head"));
+        assert_eq!(mark("<head lang=it"), format!("{m}<head lang=it"));
+        assert_eq!(mark(""), m);
+        assert_eq!(with_server_mark(b"<head>\xff\xfe"), [b"<head>".as_slice(), m.as_bytes(), b"\xff\xfe"].concat());
     }
 
     #[test]

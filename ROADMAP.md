@@ -55,15 +55,25 @@
   narrow layouts from 1240 px, dark-theme contrast, and `views::review` grouped by customer
   (one pass instead of customers × records).
 - 2026-10-14: verification of those fixes (all 37 confirmed) and a second security review of the
-  server, the remote session and the apps; 6 regressions and 13 findings fixed. The server
-  answers a tokenless caller only on a loopback `Host` and origin (`--allow-origin` for
-  others), requires JSON for commands, authenticates before reading a body (1 MiB), caps
-  connections (64) and the request head (10 s, 16 KiB), streams static files with cache
-  headers, sends `Referrer-Policy: no-referrer`, needs a 32-character service token and waits
-  after a wrong one; `Data::repair` clears RustDesk IDs that are not IDs; the Docker relays run
+  server, the remote session and the apps; 6 regressions and 13 findings fixed. A server
+  without a service token answers only on a loopback `Host` and origin (`--allow-origin` for
+  others); the server requires JSON for commands, authenticates before reading a body (1 MiB),
+  caps connections (64) and the request head (10 s, 16 KiB), streams static files with cache
+  headers, sends `Referrer-Policy: no-referrer` and needs a 32-character service token; `Data::repair` clears RustDesk IDs that are not IDs; the Docker relays run
   as their own user without the desk's token; private files are created 0600. The web app takes
   the token from `#token=`, strips it from the address bar, pairs it with its server, never
   sends it over plain http to another machine, and can forget it from Settings; hosts open only
   valid `rustdesk://` links (no shell on Windows); answers are streamed with a 64 MiB cap and a
   slow snapshot is no longer thrown away. The running card keeps its text when the mirror lags,
   and a start from a row no longer discards an unsent form.
+- 2026-10-14: a third pass over those fixes. A wrong token no longer holds a connection slot
+  (no fixed wait: 32-character tokens cannot be guessed); the RustDesk relays keep running when
+  the desk's token is missing or too short (the desk API stays off and says why) and the desk
+  is restarted on its own if it stops; the entrypoint never follows a symlink as root and the
+  key file is read only when it is a small regular file; `mcp --server` works against a
+  tokenless local server; the 503 carries the security headers; the server marks the
+  `index.html` it serves, so the web app uses its own origin only there (static hosts and
+  `trunk serve` go back to the saved server); forgetting the token holds in every open tab;
+  answers that would expand too much in memory are refused before parsing; Ctrl+R reloads the
+  screen's data in the browser instead of the page; Cmd is shown only in the macOS desktop
+  app; starts keep their warnings and never put two timers on one PC.

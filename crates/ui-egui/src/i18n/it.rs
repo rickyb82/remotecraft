@@ -99,6 +99,13 @@ pub(super) const INFIX: &[(&str, &str)] = &[
         "has unattended access but the customer's unattended_access consent is ",
         "ha l'accesso non presidiato ma il consenso del cliente all'accesso non presidiato è ",
     ),
+    (
+        ": record it (privacy.consent) or remove the permanent password from the RustDesk client",
+        ": registralo oppure togli la password permanente dal client RustDesk",
+    ),
+    // The warnings of a start (the customer received notice 2026-01 but the current one is …).
+    (" but the current one is ", " ma quella attuale è "),
+    ("(current: ", "(attuale: "),
     ("` of ", "` di "),
     (": invalid RustDesk ID cleared", ": ID RustDesk non valido, cancellato"),
     (": update or retire that one first", ": aggiorna o dismetti prima quel PC"),

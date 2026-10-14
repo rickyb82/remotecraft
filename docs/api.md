@@ -30,14 +30,17 @@ lettura sugli stessi comandi: i parametri della query string diventano `params`.
 - `POST /api/cmd` vuole `Content-Type: application/json` (altrimenti **415**) e un corpo di
   al massimo 1 MiB (altrimenti **413**). Il corpo viene letto solo dopo aver controllato il
   token.
-- Token mancante o sbagliato: **401**, dopo una breve attesa (250 ms) che rende inutili i
-  tentativi a raffica. Il token di servizio deve avere almeno 32 caratteri.
+- Token mancante o sbagliato: **401**, subito. Il token di servizio deve avere almeno 32
+  caratteri casuali e quelli dei tecnici ne hanno 64: non si indovinano a tentativi, e
+  un'attesa a ogni errore terrebbe occupata una delle 64 connessioni.
 - Senza token di servizio: **403** alle richieste con un `Host` che non è questa macchina, alle
   pagine di altri siti non elencate in `--allow-origin` e a `/api/users` (vedi
   [deploy.md](deploy.md)).
 - Riga della richiesta e intestazioni vanno inviate entro 10 secondi e in al massimo 16 KiB
   (altrimenti **408** o **431**). Il server serve al massimo 64 connessioni insieme: oltre,
   risponde subito **503** (riprova dopo un secondo).
+- Ogni risposta, anche il 503, porta `X-Content-Type-Options: nosniff` e
+  `Referrer-Policy: no-referrer`.
 - Nei percorsi `+` è un più (`/api/customers/Rossi+Figli`); nella query string è uno spazio.
 
 ## Riferimenti

@@ -228,6 +228,21 @@ mod tests {
         assert_eq!(Language::It.tr_message("device 3: invalid RustDesk ID cleared"), "il PC 3: ID RustDesk non valido, cancellato");
         assert_eq!(Language::It.tr_message("the server is busy, try again"), "il server è occupato, riprova");
         assert_eq!(Language::It.tr_message("the request is larger than 1048576 bytes"), "la richiesta supera 1048576 bytes");
+        // The warnings of a start read all in Italian.
+        assert_eq!(
+            Language::It.tr_message("the customer received notice 2026-01 but the current one is 2026-09"),
+            "il cliente ha ricevuto l'informativa 2026-01 ma quella attuale è 2026-09"
+        );
+        assert_eq!(
+            Language::It.tr_message("the customer has not received the privacy notice (current: 2026-09)"),
+            "il cliente non ha ricevuto l'informativa (attuale: 2026-09)"
+        );
+        assert_eq!(
+            Language::It.tr_message(
+                "device 4 has unattended access but the customer's unattended_access consent is missing: record it (privacy.consent) or remove the permanent password from the RustDesk client"
+            ),
+            "il PC 4 ha l'accesso non presidiato ma il consenso del cliente all'accesso non presidiato è mancante: registralo oppure togli la password permanente dal client RustDesk"
+        );
         // The audit log's details: the reason typed stays as typed.
         assert_eq!(Language::It.tr_message("erasure: richiesta"), "cancellazione: richiesta");
         assert_eq!(Language::It.tr_message("consent override: contract expired, missing form"), "consenso forzato: contract expired, missing form");

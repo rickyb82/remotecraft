@@ -112,6 +112,22 @@ docker compose ps                       # deve diventare "healthy"
   solo dal servizio).
 - Le porte RustDesk sono pubbliche (vedi sotto). L'API del gestionale ascolta solo su
   `127.0.0.1:7979`: davanti mettici il framework o un reverse proxy HTTPS.
+- RustDesk non dipende dal gestionale: se l'API non parte, hbbs e hbbr continuano a servire i
+  client e `docker compose logs` dice perché.
+
+### Aggiornamento
+
+`git pull && docker compose up -d --build`. Il token di servizio ora deve avere almeno 32
+caratteri: con quello degli esempi di prima (`un-segreto-lungo-e-casuale`) RustDesk continua a
+funzionare, ma l'API del gestionale non parte (`REMOTECRAFT_TOKEN is too short` nei log).
+Rigeneralo e aggiorna la copia nel framework:
+
+```sh
+sed -i "s/^REMOTECRAFT_TOKEN=.*/REMOTECRAFT_TOKEN=$(openssl rand -hex 32)/" .env
+docker compose up -d
+```
+
+I dettagli sono in [docs/deploy.md](docs/deploy.md#aggiornare).
 
 Prime impostazioni e verifica:
 
@@ -214,7 +230,7 @@ remotecraft-cli commands                        # tutti i comandi e i parametri
 ```sh
 cargo xtask ci        # fmt, clippy -D warnings, test, controllo dei livelli, build wasm
 cargo run -p remotecraft -- --demo                     # l'app desktop sul gestionale demo
-cd apps/remotecraft-web && trunk serve                 # l'app web (con remotecraft-cli serve --demo)
+cd apps/remotecraft-web && trunk serve                 # l'app web su http://127.0.0.1:8783/ (con remotecraft-cli serve --demo su 127.0.0.1:7979; un altro server: ?server=URL, poi ricordato)
 cargo run -p remotecraft-ui-egui --example snapshot -- out.png --lang it --screen customers --open 0
 ```
 

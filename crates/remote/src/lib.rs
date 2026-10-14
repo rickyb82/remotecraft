@@ -62,6 +62,16 @@ const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Largest answer accepted from the server (a snapshot of the whole desk, an export): a larger
 /// one is cut off while it arrives, so a hostile server cannot fill the client's memory.
 const MAX_ANSWER: usize = 64 * 1024 * 1024;
+/// Most memory the records parsed from one answer may take beyond its bytes, as [`parse_cost`]
+/// counts it. Every field defaults, so `{}` is a whole record: without this bound a hostile
+/// answer of `[{},{},…]` within [`MAX_ANSWER`] parses into gigabytes (up to a hundred bytes of
+/// records per byte of answer) and traps the browser tab. With the answer (held while it is
+/// read, its buffer up to twice its length) and its strings, one answer then takes at most about
+/// 512 MiB on wasm32; a real desk at [`MAX_ANSWER`] (records of hundreds of bytes) needs well
+/// under half of this bound.
+const MAX_PARSED: usize = 192 * 1024 * 1024;
+/// Deepest nesting read: serde_json refuses deeper values anyway (its recursion limit).
+const MAX_DEPTH: usize = 128;
 
 /// [`DeskSession::problem`] starts with one of these stable prefixes (then the detail), so the
 /// interface can tell the cases apart: the token was refused (401/403)…
@@ -80,13 +90,17 @@ pub const TOKEN_WITHHELD: &str = "the token is sent only to an https:// address 
 /// machine (`127.0.0.1`, `localhost`, `[::1]`); elsewhere plain HTTP shows it to the network.
 /// Anything unusual in the address (spaces, control characters, another scheme) says no.
 pub fn sends_token_to(base: &str) -> bool {
+    let https = base.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+    (https && !base.chars().any(|c| c.is_whitespace() || c.is_control())) || is_this_computer(base)
+}
+
+/// Whether `base` is a plain `http://` address of this machine (`127.0.0.1`, `localhost`,
+/// `[::1]`, any port), as [`sends_token_to`] reads it.
+pub fn is_this_computer(base: &str) -> bool {
     if base.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return false;
     }
     let lower = base.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return true;
-    }
     let Some(rest) = lower.strip_prefix("http://") else { return false };
     // The authority ends where a browser ends it (`\` included); the host follows any `user@`.
     let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or_default();
@@ -181,18 +195,147 @@ fn fetch_bounded(req: ehttp::Request, limit: usize, done: impl FnOnce(Fetched) +
     });
 }
 
+/// What the values parsed from an answer take in memory, by their place in the JSON (bytes; see
+/// [`parse_cost`]).
+#[derive(Clone, Copy)]
+struct Weights {
+    /// An array's element that is an object or an array, and one that is a string, number…
+    container: usize,
+    scalar: usize,
+    /// An object's first member, and each further one (zero when objects become structs, whose
+    /// fields are inline: unknown ones are skipped without being kept).
+    first_member: usize,
+    member: usize,
+}
+
+const fn larger(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// A [`Snapshot`]: an array element is a record (the largest one, whatever the array) or a
+/// string (`tags`, `problems`); objects are structs.
+const SNAPSHOT: Weights = {
+    use remotecraft_engine::core::{Contact, Customer, Device, Intervention, Notice, PrivacyEvent};
+    use std::mem::size_of;
+    let records = larger(larger(size_of::<Customer>(), size_of::<Device>()), larger(size_of::<Intervention>(), size_of::<PrivacyEvent>()));
+    Weights { container: larger(records, larger(size_of::<Notice>(), size_of::<Contact>())), scalar: size_of::<String>(), first_member: 0, member: 0 }
+};
+
+/// A JSON tree ([`Value`], a command's answer): every element is a `Value`; an object is a
+/// B-tree whose first member allocates a node of eleven entries and whose nodes may be half
+/// full (plus the inner nodes).
+const TREE: Weights = {
+    let entry = std::mem::size_of::<String>() + std::mem::size_of::<Value>();
+    Weights { container: std::mem::size_of::<Value>(), scalar: std::mem::size_of::<Value>(), first_member: 12 * entry, member: 3 * entry }
+};
+
+/// A worst case of the memory parsing `bytes` takes beyond the bytes themselves (strings take
+/// at most their length in the answer): an array's element takes a slot of its weight, twice
+/// over for a growing array's spare capacity, four times for its first one (the smallest
+/// allocation holds four). Stops counting past `budget`. `None` when nested deeper than
+/// [`MAX_DEPTH`]. Only bytes outside strings count, so text in a field is not mistaken for
+/// records; invalid JSON may be counted wrongly past the point where the parser stops, but the
+/// parser allocates only for what comes before it, which is counted right.
+fn parse_cost(bytes: &[u8], w: Weights, budget: usize) -> Option<usize> {
+    // An open array (`true`) or object, and whether it has an element (member) already.
+    let mut open: Vec<(bool, bool)> = Vec::new();
+    let mut cost = 0usize;
+    // After `:` in an object comes a value, else a member's key.
+    let mut value_of_member = false;
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        i += 1;
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' | b',' => continue,
+            b':' => {
+                value_of_member = true;
+                continue;
+            }
+            b']' | b'}' => {
+                open.pop();
+                value_of_member = false;
+                continue;
+            }
+            _ => {}
+        }
+        // `b` starts a token: an array's element, an object's key, a member's value or the root.
+        let is_container = matches!(b, b'{' | b'[');
+        let charge = match open.last_mut() {
+            Some((true, had)) => {
+                let slot = if is_container { w.container } else { w.scalar };
+                let first = !std::mem::replace(had, true);
+                slot.saturating_mul(if first { 4 } else { 2 })
+            }
+            Some((false, had)) if !value_of_member => {
+                if std::mem::replace(had, true) {
+                    w.member
+                } else {
+                    w.first_member
+                }
+            }
+            _ => 0,
+        };
+        value_of_member = false;
+        cost = cost.saturating_add(charge);
+        if cost > budget {
+            return Some(cost);
+        }
+        match b {
+            b'{' | b'[' => {
+                if open.len() >= MAX_DEPTH {
+                    return None;
+                }
+                open.push((b == b'[', false));
+            }
+            b'"' => {
+                // To the closing quote, past escaped characters.
+                while let Some(&c) = bytes.get(i) {
+                    i += 1;
+                    match c {
+                        b'\\' => i += 1,
+                        b'"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            // A number, `true`, `false`, `null` (or garbage the parser refuses): to its end.
+            _ => {
+                while bytes.get(i).is_some_and(|c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b',' | b':' | b']' | b'}' | b'{' | b'[' | b'"')) {
+                    i += 1;
+                }
+            }
+        }
+    }
+    Some(cost)
+}
+
+/// Whether parsing `bytes` stays within [`MAX_PARSED`].
+fn fits(bytes: &[u8], w: Weights) -> bool {
+    parse_cost(bytes, w, MAX_PARSED).is_some_and(|c| c <= MAX_PARSED)
+}
+
 /// A poll's answer: `None` when the desk is unchanged (an object with `unchanged`), else the
-/// snapshot. Read straight from the bytes, with no intermediate JSON tree of the whole desk.
-fn read_poll(bytes: &[u8]) -> serde_json::Result<Option<Snapshot>> {
+/// snapshot, or the problem's detail. Read straight from the bytes, with no intermediate JSON
+/// tree of the whole desk, and only when its records fit in memory ([`MAX_PARSED`]).
+fn read_poll(bytes: &[u8]) -> Result<Option<Snapshot>, String> {
     #[derive(serde::Deserialize)]
     struct Unchanged {
         #[serde(rename = "unchanged")]
         _unchanged: serde::de::IgnoredAny,
     }
+    if !fits(bytes, SNAPSHOT) {
+        return Err("the snapshot is too large".into());
+    }
     if serde_json::from_slice::<Unchanged>(bytes).is_ok() {
         return Ok(None);
     }
-    serde_json::from_slice::<Snapshot>(bytes).map(Some)
+    serde_json::from_slice::<Snapshot>(bytes).map(Some).map_err(|e| format!("bad snapshot: {e}"))
+}
+
+/// A command's answer as a JSON tree, or `None` when it would not fit in memory
+/// ([`MAX_PARSED`]).
+fn read_answer(bytes: &[u8]) -> Option<serde_json::Result<Value>> {
+    fits(bytes, TREE).then(|| serde_json::from_slice::<Value>(bytes))
 }
 
 /// The remote session.
@@ -296,7 +439,7 @@ impl RemoteDesk {
                 Fetched::Answer(r) if r.ok => match read_poll(&r.bytes) {
                     Ok(None) => Incoming::Unchanged { poll },
                     Ok(Some(s)) => Incoming::Snapshot { poll, snapshot: Box::new(s) },
-                    Err(e) => failed(format!("{INCOMPATIBLE}bad snapshot: {e}")),
+                    Err(e) => failed(format!("{INCOMPATIBLE}{e}")),
                 },
                 Fetched::Answer(r) => failed(Self::refused(withheld, &r)),
                 Fetched::TooLarge => failed(format!("{INCOMPATIBLE}the snapshot is too large")),
@@ -328,12 +471,23 @@ impl RemoteDesk {
     }
 }
 
-/// The error of a non-2xx answer: the JSON `error`, else the status line.
+/// Longest detail of a server's error kept (shown in the interface, copied every frame).
+const MAX_DETAIL: usize = 1024;
+
+fn clip_detail(text: &str) -> String {
+    remotecraft_engine::core::clip(text, MAX_DETAIL).to_string()
+}
+
+/// The error of a non-2xx answer: the JSON `error`, else the status line. Read without keeping
+/// anything else of the answer, however large.
 fn answer_error(r: &ehttp::Response) -> String {
-    serde_json::from_slice::<Value>(&r.bytes)
-        .ok()
-        .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| format!("server answered {} {}", r.status, r.status_text))
+    #[derive(serde::Deserialize)]
+    struct Refusal {
+        error: String,
+    }
+    serde_json::from_slice::<Refusal>(&r.bytes)
+        .map(|e| clip_detail(&e.error))
+        .unwrap_or_else(|_| format!("server answered {} {}", r.status, clip_detail(&r.status_text)))
 }
 
 impl DeskSession for RemoteDesk {
@@ -362,19 +516,22 @@ impl DeskSession for RemoteDesk {
         self.in_flight += 1;
         fetch_bounded(req, MAX_ANSWER, move |fetched| {
             let failed = |error: String, problem: String| Incoming::Failed { job, command: command.clone(), error, problem };
+            let too_large = || failed("the answer is too large".into(), format!("{INCOMPATIBLE}the answer is too large"));
             let incoming = match fetched {
-                Fetched::Answer(r) => match serde_json::from_slice::<Value>(&r.bytes) {
-                    Ok(v) if v.get("error").is_some() => Incoming::Answer {
+                Fetched::Answer(r) => match read_answer(&r.bytes) {
+                    Some(Ok(v)) if v.get("error").is_some() => Incoming::Answer {
                         job,
                         command: command.clone(),
-                        result: Err(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string()),
+                        result: Err(clip_detail(v.get("error").and_then(Value::as_str).unwrap_or("error"))),
                     },
-                    Ok(v) if r.ok => Incoming::Answer { job, command: command.clone(), result: Ok(v.get("result").cloned().unwrap_or(Value::Null)) },
-                    Ok(_) => failed(answer_error(&r), Self::refused(withheld, &r)),
-                    Err(e) if r.ok => failed(format!("bad answer: {e}"), format!("{INCOMPATIBLE}bad answer: {e}")),
-                    Err(_) => failed(answer_error(&r), Self::refused(withheld, &r)),
+                    Some(Ok(mut v)) if r.ok => {
+                        Incoming::Answer { job, command: command.clone(), result: Ok(v.get_mut("result").map(Value::take).unwrap_or(Value::Null)) }
+                    }
+                    Some(Err(e)) if r.ok => failed(format!("bad answer: {e}"), format!("{INCOMPATIBLE}bad answer: {e}")),
+                    None if r.ok => too_large(),
+                    Some(_) | None => failed(answer_error(&r), Self::refused(withheld, &r)),
                 },
-                Fetched::TooLarge => failed("the answer is too large".into(), format!("{INCOMPATIBLE}the answer is too large")),
+                Fetched::TooLarge => too_large(),
                 Fetched::Failed(e) => failed(e.clone(), format!("{UNREACHABLE}{e}")),
             };
             if let Ok(mut q) = inbox.lock() {
@@ -765,6 +922,132 @@ mod tests {
         }
     }
 
+    /// `head`, then `item` repeated (comma-separated) to about `size` bytes, then `tail`.
+    fn repeated(head: &str, item: &str, tail: &str, size: usize) -> Vec<u8> {
+        let mut v = head.as_bytes().to_vec();
+        while v.len() < size {
+            v.extend_from_slice(item.as_bytes());
+            v.push(b',');
+        }
+        v.extend_from_slice(item.as_bytes());
+        v.extend_from_slice(tail.as_bytes());
+        v
+    }
+
+    #[test]
+    fn answers_that_parse_into_far_more_than_their_size_are_refused_before_parsing() {
+        // `{}` is a whole record (every field defaults): 16 MiB of them parsed into about
+        // 1.5 GB natively, and a 64 MiB answer into more than the 4 GiB of a wasm tab.
+        let empty_records = repeated(r#"{"data":{"customers":["#, "{}", "]}}", 16 << 20);
+        let started = std::time::Instant::now();
+        assert_eq!(read_poll(&empty_records).err().as_deref(), Some("the snapshot is too large"));
+        assert!(started.elapsed() < Duration::from_secs(5), "refused without parsing");
+        // Through a poll: the problem says so, and the desk stays empty.
+        static EMPTY_RECORDS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let base = fake(|_| {
+            (200, EMPTY_RECORDS.get_or_init(|| String::from_utf8(repeated(r#"{"data":{"customers":["#, "{}", "]}}", 4 << 20)).unwrap()).as_str())
+        });
+        let mut r = RemoteDesk::new(&base, "t");
+        let mut done = Vec::new();
+        assert!(pump_until(&mut r, &mut done, &has(INCOMPATIBLE)), "{:?}", r.problem());
+        assert_eq!(r.problem().as_deref(), Some("incompatible: the snapshot is too large"));
+        assert!(r.data().customers.is_empty());
+        // Records as arrays, records holding records, strings in a list, nesting.
+        for hostile in [
+            repeated(r#"{"data":{"interventions":["#, "[]", "]}}", 4 << 20),
+            repeated(r#"{"data":{"customers":["#, r#"{"contacts":[{}]}"#, "]}}", 4 << 20),
+            repeated(r#"{"problems":["#, r#""""#, "]}", 32 << 20),
+            [&[b'['; 1 << 20][..], &[b']'; 1 << 20][..]].concat(),
+        ] {
+            assert_eq!(
+                read_poll(&hostile).err().as_deref(),
+                Some("the snapshot is too large"),
+                "{:?}",
+                String::from_utf8_lossy(hostile.get(..40).unwrap())
+            );
+        }
+        // A command's answer is a JSON tree: numbers and empty objects in a list, members.
+        for hostile in [
+            repeated(r#"{"result":["#, "0", "]}", 16 << 20),
+            repeated(r#"{"result":["#, "{}", "]}", 16 << 20),
+            repeated(r#"{"result":["#, r#"{"a":0}"#, "]}", 8 << 20),
+        ] {
+            assert!(read_answer(&hostile).is_none(), "{:?}", String::from_utf8_lossy(hostile.get(..40).unwrap()));
+        }
+        assert!(matches!(read_answer(br#"{"result":[0,{},{"a":0}]}"#), Some(Ok(_))));
+    }
+
+    #[test]
+    fn a_real_desk_at_the_answer_limit_fits() {
+        // The demo desk, as the server sends it: records of a real size. Scaled up to the
+        // largest answer, what it takes stays within the budget (natively, where records are
+        // twice as large as on wasm32).
+        let now = remotecraft_engine::core::time::now();
+        let snapshot = Snapshot { revision: 1, data: remotecraft_engine::core::mock::demo(now), actor: "Anna".into(), ..Snapshot::default() };
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let cost = parse_cost(&bytes, SNAPSHOT, usize::MAX).unwrap();
+        assert!(cost > 0);
+        let at_limit = cost as f64 / bytes.len() as f64 * MAX_ANSWER as f64;
+        assert!(at_limit < MAX_PARSED as f64, "{at_limit} for {} bytes costing {cost}", bytes.len());
+        assert_eq!(read_poll(&bytes).unwrap().unwrap(), snapshot);
+        // A command's answer is a JSON tree, several times larger in memory than its text: real
+        // ones (a customer's export, lists of at most 1,000 rows) are far smaller than a
+        // snapshot, and 16 MiB of real records fit.
+        let tree = serde_json::to_vec(&json!({"result": snapshot.data.customers})).unwrap();
+        let cost = parse_cost(&tree, TREE, usize::MAX).unwrap();
+        let at_16_mib = cost as f64 / tree.len() as f64 * f64::from(16u32 << 20);
+        assert!(at_16_mib < MAX_PARSED as f64, "{at_16_mib}");
+        assert!(matches!(read_answer(&tree), Some(Ok(_))));
+    }
+
+    #[test]
+    fn the_cost_counts_array_elements_and_members_but_not_text() {
+        let w = Weights { container: 100, scalar: 10, first_member: 1000, member: 1 };
+        let cost = |text: &str| parse_cost(text.as_bytes(), w, usize::MAX);
+        // The first element takes the smallest allocation (four slots), the others two.
+        assert_eq!(cost("[1, 2,3]"), Some(40 + 20 + 20));
+        assert_eq!(cost("[[], {}]"), Some(400 + 200));
+        assert_eq!(cost("[]"), Some(0));
+        assert_eq!(cost(r#"{"a": [{}], "b": 2, "c": {"d": true}}"#), Some(1000 + 400 + 1 + 1 + 1000));
+        // Brackets, quotes and commas inside strings are text.
+        assert_eq!(cost(r#""[{},{},{}]""#), Some(0));
+        assert_eq!(cost(r#"{"actor": "a \"[{},{}]\" b\\", "x": "]}"}"#), Some(1001));
+        assert_eq!(cost(r#"["\\", "]", "\"", "x"]"#), Some(40 + 20 * 3));
+        // Deeper than the parser reads: refused.
+        assert_eq!(cost(&"[".repeat(MAX_DEPTH + 1)), None);
+        assert!(cost(&"[".repeat(MAX_DEPTH)).is_some());
+        // Truncated or invalid input does not crash the count.
+        for odd in ["[", "\"", "\"\\", "]]]}}", "{\"a\"", ":::", "[1 2 3]", "\u{0}"] {
+            let _ = cost(odd);
+        }
+        // Past the budget the count stops.
+        assert!(parse_cost(b"[1,2,3,4,5]", w, 50).is_some_and(|c| c > 50));
+    }
+
+    #[test]
+    fn a_command_answer_too_complex_to_parse_is_too_large_and_errors_stay_short() {
+        static HUGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let base = fake(|target| match target {
+            t if t.starts_with("GET /api/snapshot") => (200, r#"{"unchanged": true}"#),
+            _ => (200, HUGE.get_or_init(|| String::from_utf8(repeated(r#"{"result":["#, "0", "]}", 8 << 20)).unwrap()).as_str()),
+        });
+        let mut r = RemoteDesk::new(&base, "t");
+        let job = r.execute("report.time", &json!({}));
+        let mut done = Vec::new();
+        assert!(pump_until(&mut r, &mut done, &|_, d| d.iter().any(|c| c.job == job)));
+        let failed = done.iter().find(|c| c.job == job).unwrap();
+        assert!(matches!(&failed.result, Err(e) if e.to_string() == "the answer is too large"), "{:?}", failed.result);
+        assert_eq!(r.problem().as_deref(), Some("incompatible: the answer is too large"));
+        // A refusal's error is read without the rest of the answer, and clipped.
+        static LONG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let base = fake(|_| {
+            (401, LONG.get_or_init(|| format!(r#"{{"error":"{}","rest":[{}]}}"#, "x".repeat(100_000), "{},".repeat(100_000) + "{}")).as_str())
+        });
+        let mut r = RemoteDesk::new(&base, "t");
+        assert!(pump_until(&mut r, &mut done, &has(UNAUTHORIZED)), "{:?}", r.problem());
+        assert_eq!(r.problem().map(|p| p.len()), Some(UNAUTHORIZED.len() + MAX_DETAIL));
+    }
+
     #[test]
     fn the_token_travels_only_over_https_or_to_this_computer() {
         for ok in [
@@ -797,6 +1080,14 @@ mod tests {
             "",
         ] {
             assert!(!sends_token_to(no), "{no:?}");
+            assert!(!is_this_computer(no), "{no:?}");
+        }
+        // This computer over plain http only.
+        for here in ["http://127.0.0.1:7979", "http://localhost:8783/", "http://[::1]", "HTTP://LOCALHOST"] {
+            assert!(is_this_computer(here), "{here}");
+        }
+        for elsewhere in ["https://127.0.0.1:7979", "https://assistenza.example.it", "http://[::1]x", "http://127.0.0.2"] {
+            assert!(!is_this_computer(elsewhere), "{elsewhere}");
         }
     }
 

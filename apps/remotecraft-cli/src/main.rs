@@ -4,6 +4,7 @@
 //! remotecraft-cli serve [--bind 127.0.0.1:7979] [--static DIR] [--allow-origin URL,…]   # HTTP API (and the web app)
 //! remotecraft-cli mcp                                                # MCP server on stdio (local desk)
 //! remotecraft-cli mcp --server URL --token USER_TOKEN                # MCP for one technician of a server
+//! remotecraft-cli mcp --server http://127.0.0.1:7979                # MCP on a local server without a token
 //! remotecraft-cli customers [QUERY]                                  # find customers
 //! remotecraft-cli customer CUSTOMER                                  # a customer's card
 //! remotecraft-cli who RUSTDESK_ID                                    # whose PC is this?
@@ -36,7 +37,7 @@ use serde_json::{Value, json};
 const USAGE: &str = "Usage:
   remotecraft-cli serve [--bind 127.0.0.1:7979] [--token SECRET] [--static DIR] [--allow-origin URL,...]
   remotecraft-cli mcp [--as NAME]
-  remotecraft-cli mcp --server URL --token USER_TOKEN
+  remotecraft-cli mcp --server URL [--token USER_TOKEN]   (no token: a local server started without one)
   remotecraft-cli customers [QUERY]
   remotecraft-cli customer CUSTOMER
   remotecraft-cli who RUSTDESK_ID
@@ -114,16 +115,48 @@ fn desk(o: &Opts) -> Result<Desk, String> {
     }
     // The RustDesk server next to the desk (the same container): its public key
     // (id_ed25519.pub, written on its first start), its public name, where to check it.
-    if let Some(f) = env("REMOTECRAFT_RUSTDESK_KEY_FILE")
-        && let Ok(key) = std::fs::read_to_string(&f)
-    {
-        d.set_default_rustdesk_key(key.trim());
+    if let Some(f) = env("REMOTECRAFT_RUSTDESK_KEY_FILE") {
+        match read_key_file(std::path::Path::new(&f)) {
+            Ok(key) => d.set_default_rustdesk_key(&key),
+            // Not written yet: hbbs writes it on its first start.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("REMOTECRAFT_RUSTDESK_KEY_FILE ({f}) ignored: {e}"),
+        }
     }
     if let Some(h) = env("REMOTECRAFT_RUSTDESK_HOST").or_else(|| env("RUSTDESK_HOST")) {
         d.set_default_rustdesk_host(&h);
     }
     d.set_rustdesk_probe(&env("REMOTECRAFT_RUSTDESK_CHECK_HOST").unwrap_or_default(), Box::new(probe));
     Ok(d)
+}
+
+/// Largest RustDesk key file read: the key itself is 44 characters.
+const MAX_KEY_FILE: u64 = 4096;
+
+/// The RustDesk server's public key (`id_ed25519.pub`). The relays own its directory and could
+/// put a link there: only a regular file of at most [`MAX_KEY_FILE`] bytes is read (never a
+/// device that never ends or a FIFO that never answers), and only a key is taken from it
+/// (base64), never the desk's `tokens.json` or another file the link points at.
+fn read_key_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+    let invalid = |why: &str| Error::new(ErrorKind::InvalidData, why.to_string());
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_KEY_FILE {
+        return Err(invalid("not a key file"));
+    }
+    let file = std::fs::File::open(path)?;
+    // Checked again on what was opened.
+    if !file.metadata()?.is_file() {
+        return Err(invalid("not a key file"));
+    }
+    let mut text = String::new();
+    file.take(MAX_KEY_FILE).read_to_string(&mut text)?;
+    let key = text.trim();
+    let base64 = |b: u8| b.is_ascii_alphanumeric() || b"+/=-_".contains(&b);
+    if key.is_empty() || key.len() > 128 || !key.bytes().all(base64) {
+        return Err(invalid("not a RustDesk public key"));
+    }
+    Ok(key.to_string())
 }
 
 /// Opens a TCP connection (3 s at most per address) and answers how long it took.
@@ -141,7 +174,8 @@ fn probe(host: &str, port: u16) -> Result<u64, String> {
     Err(last)
 }
 
-/// Runs engine commands on a RemoteCraft server (`mcp --server`).
+/// Runs engine commands on a RemoteCraft server (`mcp --server`). An empty token sends no
+/// `Authorization` header: a local server started without a token needs none.
 struct RemoteRunner {
     url: String,
     token: String,
@@ -151,20 +185,27 @@ struct RemoteRunner {
 impl RemoteRunner {
     fn new(server: &str, token: &str) -> Self {
         let config = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(60))).build();
-        Self { url: format!("{}/api/cmd", server.trim_end_matches('/')), token: token.to_string(), agent: config.into() }
+        Self { url: format!("{}/api/cmd", server.trim_end_matches('/')), token: token.trim().to_string(), agent: config.into() }
     }
+}
+
+/// The runner of `mcp --server URL [--token T]` (or `REMOTECRAFT_SERVER`, `REMOTECRAFT_TOKEN`,
+/// read with `env`); `None` without a server. No token is fine: a local server started without
+/// one needs none.
+fn remote_runner(args: &[String], env: impl Fn(&str) -> Option<String>) -> Option<RemoteRunner> {
+    let url = flag(args, "--server").or_else(|| env("REMOTECRAFT_SERVER"))?;
+    let token = flag(args, "--token").or_else(|| env("REMOTECRAFT_TOKEN")).unwrap_or_default();
+    Some(RemoteRunner::new(&url, &token))
 }
 
 impl Runner for RemoteRunner {
     fn run(&mut self, command: &str, params: Value) -> Result<Value, String> {
         let body = json!({"command": command, "params": params}).to_string();
-        let mut resp = self
-            .agent
-            .post(&self.url)
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
-            .send(body)
-            .map_err(|e| format!("server unreachable: {e}"))?;
+        let mut req = self.agent.post(&self.url).header("Content-Type", "application/json");
+        if !self.token.is_empty() {
+            req = req.header("Authorization", &format!("Bearer {}", self.token));
+        }
+        let mut resp = req.send(body).map_err(|e| format!("server unreachable: {e}"))?;
         let text = resp.body_mut().with_config().limit(64 * 1024 * 1024).read_to_string().map_err(|e| format!("bad answer from the server: {e}"))?;
         let v: Value = serde_json::from_str(&text).map_err(|_| format!("bad answer from the server ({})", resp.status()))?;
         match (v.get("result"), v.get("error").and_then(Value::as_str)) {
@@ -237,11 +278,8 @@ fn run(raw: Vec<String>) -> Result<(), String> {
         "mcp" => {
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
-            let mut server = match flag(&rest, "--server").or_else(|| env("REMOTECRAFT_SERVER")) {
-                Some(url) => {
-                    let token = flag(&rest, "--token").or_else(|| env("REMOTECRAFT_TOKEN")).ok_or("--server needs --token USER_TOKEN")?;
-                    Server::new(RemoteRunner::new(&url, &token))
-                }
+            let mut server = match remote_runner(&rest, env) {
+                Some(runner) => Server::new(runner),
                 None => Server::new(desk(&o)?),
             };
             server.serve(stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
@@ -460,6 +498,40 @@ mod tests {
     }
 
     #[test]
+    fn the_rustdesk_key_is_read_only_from_a_small_key_file() {
+        // The relays own the key's directory. A link from `id_ed25519.pub` to the desk's
+        // tokens.json used to hand the technicians' tokens to whoever reads the "key"; one to
+        // /dev/zero grew until the process died, one to a FIFO waited for ever.
+        let dir = std::env::temp_dir().join(format!("remotecraft-cli-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+        std::fs::write(dir.join("id_ed25519.pub"), format!("{key}\n")).unwrap();
+        assert_eq!(read_key_file(&dir.join("id_ed25519.pub")).unwrap(), key);
+        std::fs::write(dir.join("tokens.json"), r#"{"0123456789abcdef": "marco"}"#).unwrap();
+        std::fs::write(dir.join("big.pub"), "A".repeat(5000)).unwrap();
+        std::fs::write(dir.join("empty.pub"), " \n").unwrap();
+        for bad in ["tokens.json", "big.pub", "empty.pub", "."] {
+            assert!(read_key_file(&dir.join(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(read_key_file(&dir.join("missing.pub")).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        #[cfg(unix)]
+        {
+            for (link, target) in [("tokens.pub", dir.join("tokens.json")), ("zero.pub", "/dev/zero".into())] {
+                std::os::unix::fs::symlink(&target, dir.join(link)).unwrap();
+                assert!(read_key_file(&dir.join(link)).is_err(), "{link}");
+            }
+            if std::process::Command::new("mkfifo").arg(dir.join("fifo.pub")).status().is_ok_and(|s| s.success()) {
+                assert!(read_key_file(&dir.join("fifo.pub")).is_err());
+            }
+            // A link to a real key file still works (a secret mounted by an orchestrator).
+            std::os::unix::fs::symlink(dir.join("id_ed25519.pub"), dir.join("linked.pub")).unwrap();
+            assert_eq!(read_key_file(&dir.join("linked.pub")).unwrap(), key);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn options_and_positionals() {
         let raw: Vec<String> =
             ["start", "--device", "123 456 789", "--demo", "--as", "anna", "--summary", "x"].iter().map(|s| s.to_string()).collect();
@@ -541,5 +613,38 @@ mod tests {
         assert!(probe("no such host.invalid", 1).is_err());
         let mut gone = RemoteRunner::new("http://127.0.0.1:1", "x");
         assert!(gone.run("app.status", json!({})).is_err());
+        // No token: no `Authorization` header (a server with a token says it is missing).
+        let mut none = RemoteRunner::new(&format!("http://{addr}"), "");
+        assert!(none.run("app.status", json!({})).unwrap_err().contains("missing token"));
+    }
+
+    #[test]
+    fn mcp_reaches_a_local_server_without_a_token() {
+        // `mcp --server` used to need `--token`, and any token sent to a server started without
+        // one was refused as unknown: only an undocumented `--token ""` worked.
+        let opts = serve::Options { token: String::new(), ..server_options() };
+        let listener = serve::bind(&opts).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve::serve(listener, Desk::demo(), opts));
+        let url = format!("http://{addr}/");
+        let args = |extra: &[&str]| -> Vec<String> { ["--server", url.as_str()].iter().chain(extra).map(|s| s.to_string()).collect() };
+        let mut r = remote_runner(&args(&[]), |_| None).expect("--server alone is enough");
+        assert_eq!(r.token, "");
+        assert_eq!(r.run("device.find", json!({"rustdesk_id": "200300400"})).unwrap()["devices"][0]["customer"]["name"], "Ferramenta Corvo");
+        let mut blank = RemoteRunner::new(&url, "  ");
+        assert!(blank.run("app.status", json!({})).is_ok());
+        // The token comes from --token, else from the environment; the server from either.
+        assert_eq!(remote_runner(&args(&["--token", "t1"]), |_| Some("t2".into())).map(|r| r.token).as_deref(), Some("t1"));
+        assert_eq!(remote_runner(&args(&[]), |k| (k == "REMOTECRAFT_TOKEN").then(|| "t2".into())).map(|r| r.token).as_deref(), Some("t2"));
+        let from_env = remote_runner(&[], |k| (k == "REMOTECRAFT_SERVER").then(|| url.clone())).map(|r| r.url);
+        assert_eq!(from_env, Some(format!("http://{addr}/api/cmd")));
+        assert!(remote_runner(&[], |_| None).is_none(), "no server: the local desk");
+        let mut s = Server::new(RemoteRunner::new(&format!("http://{addr}"), ""));
+        let out = s
+            .handle(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "find_customers", "arguments": {"query": "lunaria"}}}),
+            )
+            .unwrap();
+        assert_eq!(out["result"]["structuredContent"]["total"], 1, "{out}");
     }
 }

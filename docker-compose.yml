@@ -9,6 +9,9 @@
 # ./desk keeps customers, PCs, interventions, the GDPR record and the audit log (owned by uid
 # 10001, the user running the desk API).
 # Back up both directories.
+#
+# Upgrading with an older, shorter token: RustDesk keeps working, but the desk API does not
+# start until REMOTECRAFT_TOKEN has at least 32 characters (docs/deploy.md, "Aggiornamento").
 
 services:
   remotecraft:

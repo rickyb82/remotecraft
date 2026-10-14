@@ -19,14 +19,18 @@ scrivere solo in `/data/rustdesk`. Solo `remotecraft` può leggere e scrivere `/
 `./desk` appartengono all'uid 10001 e quelli di `./data` all'uid 10002: l'entrypoint sistema
 proprietario e permessi a ogni avvio, anche per le cartelle delle versioni precedenti.
 
-Se uno dei tre si ferma, si ferma il container e la policy `restart: unless-stopped` lo
-riavvia. L'`HEALTHCHECK` verifica le porte RustDesk ogni minuto.
+hbbs e hbbr partono per primi e non dipendono dal gestionale. Se uno dei due si ferma, si ferma
+il container e la policy `restart: unless-stopped` lo riavvia. Se invece l'API del gestionale non
+parte (token mancante o troppo corto, `desk.json` danneggiato) o si ferma, hbbs e hbbr continuano
+a funzionare e `docker compose logs` dice perché: con un token non valido l'API non viene avviata
+finché non lo correggi, negli altri casi l'entrypoint la riavvia dopo 10 secondi. L'`HEALTHCHECK`
+verifica le porte RustDesk ogni minuto.
 
 Variabili d'ambiente:
 
 | Variabile | Obbligatoria | Significato |
 |---|---|---|
-| `REMOTECRAFT_TOKEN` | sì | token di servizio del framework per l'API: almeno 32 caratteri casuali, generali con `openssl rand -hex 32` (più corto, il container non parte) |
+| `REMOTECRAFT_TOKEN` | sì | token di servizio del framework per l'API: almeno 32 caratteri casuali, generali con `openssl rand -hex 32` (senza, `docker compose` si rifiuta di partire; più corto, RustDesk funziona ma l'API del gestionale non parte: vedi [Aggiornare](#aggiornare)) |
 | `RUSTDESK_HOST` | consigliata | nome pubblico del server (es. `rustdesk.siriustec.it`): hbbs lo annuncia come relay, il gestionale lo mostra ai client |
 | `TZ` | no (`Europe/Rome`) | fuso orario per gli orari scritti a mano (`9:30`) e per i report mensili |
 | `RUSTDESK_TAG` (build) | no (`1.1.16`) | versione dell'immagine ufficiale da cui copiare hbbs/hbbr |
@@ -78,11 +82,26 @@ log del proxy: usa `#token=`.
 
 La pagina toglie subito il token dalla barra degli indirizzi e lo tiene nello storage del
 browser insieme al suo server: non lo manda mai a un altro server, né in chiaro (`http://`) a
-un'altra macchina. Su un PC condiviso o smarrito, *Impostazioni → Stato → Dimentica il token su
-questo browser* lo cancella e ricarica la pagina senza; il link del framework riporta dentro.
-La pagina parla con la propria origine (il server che l'ha servita). Può anche essere ospitata altrove (GitHub Pages) e puntata al server con
+un'altra macchina. Su un PC condiviso, *Impostazioni → Stato → Dimentica il token su questo
+browser* lo cancella e ricarica la pagina senza, in tutte le schede aperte (le altre smettono
+di riscriverlo e si ricaricano entro pochi secondi); il link del framework riporta dentro. Su un PC
+smarrito o rubato questo non serve (il PC non ce l'hai tu): revoca i token del tecnico
+(`POST /api/users/<utente>/revoke`, o dal framework) e creane uno nuovo.
+
+La pagina parla con la propria origine quando è il server stesso a servirla. Il server lo
+segnala aggiungendo a `index.html`, subito dopo `<head>`, questa riga, che una copia della
+pagina su un altro sito non ha:
+
+```html
+<meta name="remotecraft-server" content="same-origin">
+```
+
+La pagina può anche essere ospitata altrove (GitHub Pages) e puntata al server con
 `?server=https://assistenza.example.it`: con il token di servizio il server risponde al CORS per
 qualunque origine, perché è il token (che il browser non aggiunge mai da sé) a proteggere i dati.
+Su un altro sito (GitHub Pages con qualunque dominio, Netlify, un nginx aziendale) la riga
+`remotecraft-server` manca: dopo la prima visita con `?server=…` la pagina torna da sola al
+server salvato.
 Il link `rustdesk://` apre il client RustDesk installato sul PC del tecnico; gli export GDPR
 arrivano come download.
 
@@ -138,6 +157,21 @@ Fai il backup di entrambe le cartelle, cifrato: contengono dati personali dei cl
 - RustDesk: cambia `RUSTDESK_TAG` in `.env` (la versione in uso la mostra `docker compose logs`
   all'avvio di hbbs) e ricostruisci.
 
+### Aggiornamento da una versione con un token corto
+
+Il token di servizio ora deve avere almeno 32 caratteri. Gli esempi di prima
+(`REMOTECRAFT_TOKEN=un-segreto-lungo-e-casuale`, `un-segreto-lungo`) sono più corti: dopo
+l'aggiornamento RustDesk continua a funzionare per tutti i client, ma l'API del gestionale (app
+web, framework, MCP) non parte e `docker compose logs` mostra `REMOTECRAFT_TOKEN is too short`.
+Per sistemare:
+
+1. genera un token nuovo e mettilo in `.env` al posto del vecchio:
+   `sed -i "s/^REMOTECRAFT_TOKEN=.*/REMOTECRAFT_TOKEN=$(openssl rand -hex 32)/" .env`;
+2. aggiorna la copia del token nella configurazione del framework (il vecchio non vale più);
+3. `docker compose up -d`.
+
+I token dei tecnici (`desk/tokens.json`) restano validi: cambia solo quello di servizio.
+
 ## Senza Docker
 
 ```sh
@@ -156,9 +190,11 @@ hbbs e hbbr vanno allora avviati a parte (il vecchio `docker-compose.yml` o i bi
 
 ### Senza token, solo su questa macchina
 
-Senza token `serve` ascolta solo su `127.0.0.1`/`localhost` ed è pensato per l'uso personale
-(l'app web con `trunk serve`, un MCP locale). Per non diventare una porta aperta verso il
-gestionale per qualunque sito aperto nel browser:
+Senza token `serve` ascolta solo su `127.0.0.1`/`localhost` ed è pensato per l'uso personale:
+l'app web con `trunk serve`, oppure un MCP locale con
+`remotecraft-cli mcp --server http://127.0.0.1:7979` (senza `--token`: le richieste partono
+senza `Authorization`). Per non diventare una porta aperta verso il gestionale per qualunque sito
+aperto nel browser:
 
 - risponde solo alle richieste indirizzate a questa macchina (`Host: 127.0.0.1:<porta>`,
   `localhost:<porta>` o `[::1]:<porta>`), mai a un altro nome che punta qui (DNS rebinding);

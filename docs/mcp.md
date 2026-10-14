@@ -1,6 +1,6 @@
 # Server MCP
 
-> **Ultimo aggiornamento:** 2026-10-13
+> **Ultimo aggiornamento:** 2026-10-14
 
 `remotecraft-cli mcp` è un server Model Context Protocol (JSON-RPC su stdio). Con un assistente
 AI collegato puoi dire, per esempio:
@@ -41,6 +41,11 @@ claude mcp add remotecraft -- remotecraft-cli mcp --server https://assistenza.ex
 
 In locale, su un gestionale nella propria cartella: `remotecraft-cli mcp --as riccardo`.
 Per provarlo: `remotecraft-cli mcp --demo`.
+
+**Su un server locale senza token** (`remotecraft-cli serve`, che allora risponde solo a questa
+macchina): `remotecraft-cli mcp --server http://127.0.0.1:7979`, senza `--token`. Senza token le
+richieste partono senza `Authorization`; un token mandato a un server avviato senza token viene
+rifiutato (`unknown token`), perché lì i token dei tecnici non esistono.
 
 ## Strumenti
 

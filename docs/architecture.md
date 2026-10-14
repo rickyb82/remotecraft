@@ -44,8 +44,11 @@ of a file another process wrote. Results are routed back to the screen that aske
   another goes out with the window doubled, up to 60 s, back to 30 s on the next answer; the
   late answer of a given-up poll still counts unless a newer one was already applied (each
   carries its poll number), so a slow download of a large desk is not thrown away. Answers are
-  streamed and cut off past 64 MiB (an early `Content-Length` check first), so a hostile
-  server cannot fill the client's memory. `problem()` is `connecting` until the first answer,
+  streamed and cut off past 64 MiB (an early `Content-Length` check first). Before parsing, a
+  scan of the JSON that skips strings estimates what its arrays and objects would take in
+  memory (every field defaults, so `{}` is a whole record); an answer above 192 MiB of that
+  estimate is refused as too large, so one answer takes at most about 512 MiB on wasm32, while
+  a real desk at 64 MiB needs well under half of it. `problem()` is `connecting` until the first answer,
   then `None` or a stable prefix and the detail: `unauthorized: ` (401/403, a revoked token, or
   a token withheld from plain `http://` to another machine), `incompatible: ` (an answer the
   client cannot read: not a RemoteCraft server, another version, too large) or `unreachable: `
@@ -56,8 +59,13 @@ of a file another process wrote. Results are routed back to the screen that aske
   apps check it again (the desktop opens it without a shell: `explorer.exe` on Windows, never
   `cmd /C start`). The web app reads `token`, `server` and `lang` from the URL fragment first
   (`#token=…` never reaches the server or a proxy's logs), removes the token from the address
-  bar, keeps the server and the token as one pair (a saved token goes only to its own server;
-  the page's own origin comes before a saved server) and can forget them from Settings.
+  bar, keeps the server and the token as one pair (a saved token goes only to its own server) and
+  can forget them from Settings. The page's own origin comes before a saved server only when
+  the server marked the page (`<meta name="remotecraft-server" content="same-origin">` after
+  `<head>`); on a static host or under `trunk serve` the order is the link, the saved server,
+  this computer. A tokenless server on this computer is remembered too, with an empty token
+  that never replaces a saved one. Forgetting bumps an epoch in the stored state: every other
+  tab then writes nothing back and reloads within about 2 s.
 
 ## Server
 
@@ -65,15 +73,21 @@ of a file another process wrote. Results are routed back to the screen that aske
 `apps/remotecraft-cli/src/serve.rs`. At most 64 connections live at once (more get 503), the
 request head must arrive whole within 10 s and 16 KiB (100 headers), and the caller is
 authenticated from the head before any body is read (bodies up to 1 MiB, `POST /api/cmd` only,
-`Content-Type: application/json` or 415). A failed token waits 250 ms; tokens are compared in
-constant time and the service token needs 32 characters. Without a service token the server
-binds only to loopback and answers only to a loopback `Host` (no DNS rebinding) and to loopback
-origins or those given with `--allow-origin`; with one, the API is bearer-only and any origin
-may call it. Static files (`--static`, the web app) are served only from inside their
-directory: the decoded path must be plain components, the canonical file must lie under the
-canonical directory, and only regular files up to 64 MiB are streamed (hashed bundles cached as
-immutable, `index.html` never). Every answer carries `Referrer-Policy: no-referrer` and
-`X-Content-Type-Options: nosniff`.
+`Content-Type: application/json` or 415). A missing or wrong token gets 401 at once (a fixed
+wait would hold one of the 64 connections, and a flood of bad requests would turn everyone
+away); tokens are compared in constant time and the service token needs 32 characters.
+Without a service token the server binds only to loopback and answers only to a loopback
+`Host` (no DNS rebinding) and to loopback origins or those given with `--allow-origin`; with
+one, the API is bearer-only and any origin may call it. Static files (`--static`, the web
+app) are served only from inside their directory: the decoded path must be plain components,
+the canonical file must lie under the canonical directory, and only regular files up to 64 MiB
+are streamed (hashed bundles cached as immutable, `index.html` never). The root page
+(`index.html`, read whole up to 1 MiB) gets `<meta name="remotecraft-server"
+content="same-origin">` right after its `<head>` tag: the web app treats its own origin as the
+server only when it is there. Every answer carries `Referrer-Policy: no-referrer` and
+`X-Content-Type-Options: nosniff`, the 503 for too many connections included. `mcp --server
+URL` sends no `Authorization` header when it has no token, for a local server started without
+one.
 
 ## Commands
 

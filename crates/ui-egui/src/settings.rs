@@ -19,11 +19,15 @@ use crate::theme::Tokens;
 use crate::widgets::{self, Tone};
 use crate::{Completed, DeskApp, Intent as AppIntent, Language, Request};
 
+/// What the browser card of a remote desk says: forgetting the token is for a shared PC; a lost
+/// one keeps it, and only the framework can revoke it.
+const FORGET_TEXT: &str = "This browser keeps the token that opens the desk. On a shared PC, forget it: the page reloads without it, and the framework's link brings you back. A lost or stolen PC still has the token: revoke it from the framework.";
+
 /// The labels this screen shows: `(English, Italian)`.
 pub const LABELS_IT: &[(&str, &str)] = &[
     (
-        "This browser keeps the token that opens the desk. On a shared or lost PC, forget it: the page reloads without it, and the framework's link brings you back.",
-        "Questo browser conserva il token che apre il gestionale. Su un PC condiviso o smarrito, dimenticalo: la pagina si ricarica senza token e il link del framework ti riporta qui.",
+        FORGET_TEXT,
+        "Questo browser conserva il token che apre il gestionale. Su un PC condiviso, dimenticalo: la pagina si ricarica senza token e il link del framework ti riporta qui. Un PC smarrito o rubato conserva il token: revocalo dal framework.",
     ),
     ("Forget the token on this browser", "Dimentica il token su questo browser"),
     ("Forget and reload", "Dimentica e ricarica"),
@@ -479,6 +483,8 @@ fn sync(app: &mut DeskApp, frame: u64) {
         for fb in [&mut s.company, &mut s.rules, &mut s.server] {
             fb.error.clear();
         }
+        // However the screen was left, a first press of "Forget the token" did not survive it.
+        s.forget_armed = false;
     } else if s.seeded != Some(rev) {
         s.draft.merge(&s.base, &saved);
         s.base = saved;
@@ -929,14 +935,13 @@ fn status_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     }
 }
 
-/// On a remote desk: forget the token this browser keeps (a shared or lost PC), in two presses.
+/// On a remote desk: forget the token this browser keeps (a shared PC), in two presses; a lost
+/// PC needs the token revoked from the framework, which the card says.
 fn browser_card(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.add_space(8.0);
     widgets::card(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let text = app.tr(
-            "This browser keeps the token that opens the desk. On a shared or lost PC, forget it: the page reloads without it, and the framework's link brings you back.",
-        );
+        let text = app.tr(FORGET_TEXT);
         ui.label(RichText::new(text).color(t.muted));
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
@@ -1362,6 +1367,53 @@ mod tests {
         forget_token(&mut app);
         assert_eq!(app.requests, vec![Request::ForgetToken]);
         assert!(!app.settings.forget_armed);
+    }
+
+    #[test]
+    fn a_first_forget_press_does_not_survive_leaving_settings() {
+        let mut app = DeskApp::new(Box::new(Served(Session::demo())));
+        // Done (back) or another screen: each way out disarms it; Settings asked again does not.
+        for leave in [DeskApp::go_back as fn(&mut DeskApp), |a: &mut DeskApp| a.go(Screen::Customers)] {
+            app.go(Screen::Settings);
+            app.settings.forget_armed = true;
+            app.go(Screen::Settings);
+            assert!(app.settings.forget_armed, "staying keeps it");
+            leave(&mut app);
+            assert!(!app.settings.forget_armed);
+        }
+        // A way out that skips both (the screen set directly): the return disarms it.
+        let ctx = egui::Context::default();
+        app.go(Screen::Settings);
+        frame_in(&ctx, &mut app);
+        app.settings.forget_armed = true;
+        frame_in(&ctx, &mut app);
+        assert!(app.settings.forget_armed);
+        app.screen = Screen::Devices;
+        frame_in(&ctx, &mut app);
+        app.screen = Screen::Settings;
+        frame_in(&ctx, &mut app);
+        assert!(!app.settings.forget_armed);
+        assert!(app.requests.is_empty());
+    }
+
+    #[test]
+    fn the_forget_card_leaves_a_lost_pc_to_the_framework() {
+        // Forgetting is for a shared PC: a lost one still holds the token, which only the
+        // framework revokes. The card never suggests forgetting on a lost PC.
+        for lang in Language::ALL {
+            let mut app = DeskApp::new(Box::new(Served(Session::demo())));
+            app.language = lang;
+            app.go(Screen::Settings);
+            let text = app.tr(FORGET_TEXT).to_string();
+            let texts = crate::privacy::tests::texts_in(&mut app, 1200.0, 4000.0);
+            assert!(crate::privacy::tests::find(&texts, &text).is_some(), "{text}");
+            let (shared, lost, revoke) = match lang {
+                Language::En => ("On a shared PC, forget it", "A lost or stolen PC", "revoke it from the framework"),
+                Language::It => ("Su un PC condiviso, dimenticalo", "Un PC smarrito o rubato", "revocalo dal framework"),
+            };
+            assert!(text.contains(shared) && text.contains(lost) && text.contains(revoke), "{text}");
+            assert!(!text.contains("shared or lost") && !text.contains("condiviso o smarrito"), "{text}");
+        }
     }
 
     /// A desk seen through a mirror, as from a server: a command's answer arrives before the

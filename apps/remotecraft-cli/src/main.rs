@@ -445,7 +445,9 @@ mod tests {
         let opts = serve::Options { bind: "127.0.0.1:0".into(), token: "svc".into(), tokens_dir: None, static_dir: None };
         let listener = serve::bind(&opts).unwrap();
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || serve::serve(listener, Desk::demo(), opts));
+        let mut desk = Desk::demo();
+        desk.set_actor("server");
+        std::thread::spawn(move || serve::serve(listener, desk, opts));
         // Pumps until `until` holds (or 4 s pass), keeping every completion.
         fn pump_until(r: &mut RemoteDesk, done: &mut Vec<Completed>, until: &dyn Fn(&RemoteDesk, &[Completed]) -> bool) -> bool {
             for _ in 0..200 {
@@ -472,6 +474,14 @@ mod tests {
         let mut wrong = RemoteDesk::new(&format!("http://{addr}"), "nope");
         let mut none = Vec::new();
         assert!(pump_until(&mut wrong, &mut none, &|r, _| r.problem().is_some_and(|p| p.contains("token"))), "{:?}", wrong.problem());
+        assert!(wrong.problem().is_some_and(|p| p.starts_with(remotecraft_remote::UNAUTHORIZED)), "{:?}", wrong.problem());
+        // The service token names nobody: the mirror works as the desk's technician, the one
+        // commands run as, so the web app finds its own timers.
+        assert_eq!(r.actor(), "server");
+        let started = r.execute("intervention.start", &json!({"customer": 2, "kind": "phone"}));
+        assert!(pump_until(&mut r, &mut done, &|r, d| d.iter().any(|c| c.job == started) && r.data().interventions.iter().any(|i| i.running())));
+        let mine: Vec<_> = r.data().interventions.iter().filter(|i| i.running() && i.technician == r.actor()).collect();
+        assert_eq!(mine.len(), 1);
     }
 
     #[test]

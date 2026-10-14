@@ -35,13 +35,22 @@ navigazione a sinistra, l'elenco al centro e la scheda a destra, la scheda dell'
 agganciata in basso a destra con il **cronometro**, tema chiaro e scuro, italiano e inglese,
 scorciatoie da tastiera (`/` cerca, `s` avvia, `x` chiude, `n` nuovo, `?` aiuto).
 
-- **Telefonata in arrivo**: digiti l'ID RustDesk che il cliente legge, `Ctrl+Invio` avvia il
-  cronometro e apre il client RustDesk sul suo PC; a fine lavoro scrivi le note e chiudi.
+- **Telefonata in arrivo**: digiti l'ID RustDesk che il cliente legge, `Ctrl+Invio` nella
+  ricerca avvia il cronometro e apre il client RustDesk sul suo PC; a fine lavoro scrivi le note
+  e chiudi. Se chiudi o riduci la scheda di un intervento in corso, oggetto e fatturabilità
+  vengono salvati subito; le note restano nella scheda fino allo stop. Nei moduli `Ctrl+Invio`
+  salva solo se il cursore è in uno dei loro campi.
 - **Privacy a colpo d'occhio**: ogni cliente ha un indicatore (consenso dato, da sistemare,
   mancante); la scheda mostra per prima l'informativa e i consensi, con i pulsanti per
   registrarli; un avvio remoto senza consenso chiede di registrarlo o di indicare il motivo.
 - **Report**: ore e ore fatturabili del mese per cliente, tecnico, PC o tipo, con il dettaglio
-  degli interventi, esportabili in CSV.
+  degli interventi, esportabili in CSV. Il periodo comprende entrambi i giorni indicati (*Dal* e
+  *Al*), come il filtro *Periodo* degli interventi.
+- **Sempre aggiornata**: l'app desktop mostra entro un paio di secondi quello che un assistente
+  AI (MCP) o la riga di comando cambiano sullo stesso archivio; nel browser i cambiamenti degli
+  altri tecnici arrivano da soli. La barra di stato distingue server irraggiungibile, token
+  rifiutato e versioni diverse di server e app. La lingua scelta in alto resta anche alla
+  riapertura.
 - **Impostazioni**: guida iniziale (azienda, informativa, server RustDesk), regole di
   fatturazione e privacy, verifica del server RustDesk e configurazione dei client da copiare.
 

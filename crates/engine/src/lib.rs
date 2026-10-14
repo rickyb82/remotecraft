@@ -12,8 +12,9 @@ mod session;
 pub mod views;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-pub use cmd::{COMMANDS, Command};
+pub use cmd::{COMMANDS, Command, RustDeskCheck};
 pub use remotecraft_core as core;
 use remotecraft_core::chrono::{DateTime, Utc};
 use remotecraft_core::{Data, storage, time};
@@ -121,6 +122,9 @@ pub struct Desk {
     /// The desk file's modification time when it was last read or written: another process
     /// (the CLI next to the server) may have changed it since.
     stamp: Option<std::time::SystemTime>,
+    /// The modification time of a desk file [`Desk::refresh`] could not read: not read again
+    /// on every frame until it changes (a command still tries, and reports the error).
+    unreadable: Option<std::time::SystemTime>,
     clock: Option<DateTime<Utc>>,
     actor: String,
     memory_audit: Vec<AuditEntry>,
@@ -132,8 +136,12 @@ pub struct Desk {
 }
 
 /// Opens a TCP connection to `host:port` and answers how long it took (ms), or why it failed.
-/// Injected by the app: the engine itself never touches the network.
-pub type Probe = Box<dyn Fn(&str, u16) -> std::result::Result<u64, String> + Send>;
+/// Injected by the app: the engine itself never touches the network. It may run on another
+/// thread (the desktop app checks off the interface's thread, one port per thread).
+pub type Probe = Box<dyn Fn(&str, u16) -> std::result::Result<u64, String> + Send + Sync>;
+
+/// A [`Probe`] shared with the threads that run it.
+pub(crate) type SharedProbe = Arc<dyn Fn(&str, u16) -> std::result::Result<u64, String> + Send + Sync>;
 
 /// The RustDesk server running next to the desk (same container or machine).
 #[derive(Default)]
@@ -144,7 +152,7 @@ pub(crate) struct RustDeskEnv {
     pub host: String,
     /// Where `rustdesk.check` connects by default (`127.0.0.1` inside the container).
     pub check_host: String,
-    pub probe: Option<Probe>,
+    pub probe: Option<SharedProbe>,
 }
 
 impl Desk {
@@ -157,12 +165,13 @@ impl Desk {
             data,
             paths: Some(paths),
             stamp,
+            unreadable: None,
             clock: None,
             actor: default_actor(),
             memory_audit: Vec::new(),
             problems,
             rustdesk: RustDeskEnv::default(),
-            revision: 1,
+            revision: first_revision(),
         })
     }
 
@@ -174,12 +183,13 @@ impl Desk {
             data,
             paths: None,
             stamp: None,
+            unreadable: None,
             clock: None,
             actor: default_actor(),
             memory_audit: Vec::new(),
             problems,
             rustdesk: RustDeskEnv::default(),
-            revision: 1,
+            revision: first_revision(),
         }
     }
 
@@ -224,7 +234,7 @@ impl Desk {
     /// How `rustdesk.check` reaches the server: where, and with what.
     pub fn set_rustdesk_probe(&mut self, check_host: &str, probe: Probe) {
         self.rustdesk.check_host = remotecraft_core::line(check_host);
-        self.rustdesk.probe = Some(probe);
+        self.rustdesk.probe = Some(Arc::from(probe));
     }
 
     pub fn data(&self) -> &Data {
@@ -247,11 +257,7 @@ impl Desk {
             return Err(Error::UnknownCommand(remotecraft_core::clip(command, 80).to_string()));
         };
         let empty = json!({});
-        let params = match params {
-            Value::Object(_) => params,
-            Value::Null => &empty,
-            _ => return Err(remotecraft_core::Error::Invalid("params must be an object".into()).into()),
-        };
+        let params = object_params(params, &empty)?;
         self.reload_if_changed()?;
         let actor = remotecraft_core::line(actor);
         let mut ctx =
@@ -277,6 +283,17 @@ impl Desk {
         }
         self.audit(&ctx, command);
         Ok(out)
+    }
+
+    /// `rustdesk.check` up to the probing: the parameters checked and the host chosen, so the
+    /// slow part ([`RustDeskCheck::run`], seconds when a firewall drops the packets) can run
+    /// without the desk — on another thread, or outside the server's lock. The same answer as
+    /// `execute("rustdesk.check", params)`, which is `prepare_rustdesk_check(params)?.run()`.
+    pub fn prepare_rustdesk_check(&mut self, params: &Value) -> Result<RustDeskCheck> {
+        let empty = json!({});
+        let params = object_params(params, &empty)?;
+        self.reload_if_changed()?;
+        Ok(cmd::rustdesk_check_plan(self, params)?)
     }
 
     pub(crate) fn data_mut(&mut self) -> &mut Data {
@@ -307,19 +324,35 @@ impl Desk {
 
     /// The whole desk for a remote interface working as `actor`, or `None` when nothing
     /// changed since `since`. Reads the file again first, so another process's changes show.
+    /// With no `actor` the snapshot names the desk's own, the one commands then run as.
     pub fn snapshot(&mut self, since: u64, actor: &str) -> Result<Option<Snapshot>> {
         self.reload_if_changed()?;
         if since == self.revision {
             return Ok(None);
         }
+        let actor = remotecraft_core::line(actor);
         Ok(Some(Snapshot {
             revision: self.revision,
             data: self.data.clone(),
-            actor: remotecraft_core::line(actor),
+            actor: if actor.is_empty() { self.actor.clone() } else { actor },
             problems: self.problems.clone(),
             rustdesk_host: self.rustdesk.host.clone(),
             rustdesk_key: self.rustdesk.key.clone(),
         }))
+    }
+
+    /// Reads the desk file again when another process (the MCP server, the CLI) wrote it, so
+    /// an interface that only watches shows the change; the revision moves when it does. A
+    /// cheap check of the file's modification time otherwise.
+    pub fn refresh(&mut self) -> Result<()> {
+        let Some(p) = &self.paths else { return Ok(()) };
+        let now = file_stamp(&p.desk);
+        if now.is_some() && now == self.unreadable {
+            return Ok(());
+        }
+        let r = self.reload_if_changed();
+        self.unreadable = if r.is_err() { now } else { None };
+        r
     }
 
     /// Reads the file again when another process wrote it.
@@ -386,6 +419,33 @@ fn read_tail(path: &Path, max: u64) -> String {
     let _ = f.take(max).read_to_end(&mut bytes);
     let text = String::from_utf8_lossy(&bytes).into_owned();
     if start > 0 { text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default() } else { text }
+}
+
+/// Command parameters as an object (`null` is no parameters).
+fn object_params<'a>(params: &'a Value, empty: &'a Value) -> Result<&'a Value> {
+    match params {
+        Value::Object(_) => Ok(params),
+        Value::Null => Ok(empty),
+        _ => Err(remotecraft_core::Error::Invalid("params must be an object".into()).into()),
+    }
+}
+
+/// Largest first revision: every revision stays an integer a JSON client reads exactly
+/// (below 2^53) for longer than anyone will run the desk.
+const FIRST_REVISION_MASK: u64 = (1 << 52) - 1;
+
+/// Where a new desk starts counting revisions: different in every process (and for every desk
+/// in one process), so a client that kept revision N from a server that has since restarted
+/// cannot be told `unchanged` by a new server that happens to be at N too. The time mixed with
+/// the process's random hash seed; never 0, which clients send to ask for everything.
+fn first_revision() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static OPENED: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_i64(time::now().timestamp_millis());
+    h.write_u64(OPENED.fetch_add(1, Ordering::Relaxed));
+    (h.finish() & FIRST_REVISION_MASK).max(1)
 }
 
 fn file_stamp(path: &Path) -> Option<std::time::SystemTime> {

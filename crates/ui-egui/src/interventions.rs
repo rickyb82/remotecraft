@@ -38,7 +38,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Custom…", "Personalizzato…"),
     ("From", "Dal"),
     ("To", "Al"),
-    ("The end of the period is excluded", "La fine del periodo è esclusa"),
+    ("Both days are included", "Entrambi i giorni sono inclusi"),
     ("Technician", "Tecnico"),
     ("Everyone", "Tutti"),
     ("Me", "Io"),
@@ -48,6 +48,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Running only", "Solo in corso"),
     ("Customer: {name}", "Cliente: {name}"),
     ("PC: {name}", "PC: {name}"),
+    ("Without a PC", "Senza PC"),
     ("Remove this filter", "Togli questo filtro"),
     ("{n} interventions · {hours} h · {billable} h billable", "{n} interventi · {hours} h · {billable} h fatturabili"),
     ("1 intervention · {hours} h · {billable} h billable", "1 intervento · {hours} h · {billable} h fatturabili"),
@@ -147,6 +148,10 @@ pub struct Form {
     /// not changed (the form shows minutes, the desk keeps seconds).
     pub stored_started: String,
     pub stored_ended: String,
+    /// The PC of the edited intervention when the form opened: `device` is sent only when the
+    /// picker changed it (the PC may have moved to another customer since, and naming it would
+    /// be refused).
+    pub stored_device: Option<u64>,
     pub error: String,
 }
 
@@ -194,8 +199,9 @@ pub struct State {
 
 /// The height of a row (two lines and the technician's avatar).
 const ROW_H: f32 = 52.0;
-/// Below this window width the pane replaces the list.
-const NARROW: f32 = 980.0;
+/// Below this window width the pane replaces the list: the navigation (235 px), the pane (520)
+/// and a list wide enough to read (about 480).
+const NARROW: f32 = 1240.0;
 /// The least width of the form's label column (the form's grids line up).
 const LABEL_W: f32 = 110.0;
 /// The width the hover actions cover at a row's right end.
@@ -414,6 +420,7 @@ pub fn open_edit(app: &mut DeskApp, id: u64) {
         running: i.ended_at.is_none(),
         stored_started: i.started_at,
         stored_ended: i.ended_at.unwrap_or_default(),
+        stored_device: i.device_id,
         ..Form::default()
     };
     app.interventions.form = Some(form);
@@ -461,29 +468,54 @@ fn refresh_rows(app: &mut DeskApp) {
 }
 
 /// A period bound typed in the filter, as a stamp; `None` when empty or unreadable (ignored).
-fn bound(text: &str, now: DateTime<Utc>) -> Option<String> {
+/// The end (`end`) is included: a date alone counts the whole day (`format::end_stamp_from_input`).
+fn bound(text: &str, now: DateTime<Utc>, end: bool) -> Option<String> {
     let text = text.trim();
-    if text.is_empty() { None } else { format::stamp_from_input(text, now) }
+    if text.is_empty() {
+        None
+    } else if end {
+        format::end_stamp_from_input(text, now)
+    } else {
+        format::stamp_from_input(text, now)
+    }
 }
 
 /// The interventions to list, in order (running first, then newest first), with their sums.
-/// `fq` is the folded search, matched as the engine matches (`views::intervention_matches`);
-/// the period's end is excluded, as in `intervention.list`.
+/// `fq` is the folded search, matched as the engine matches (`views::intervention_matches`,
+/// with the customers' and the PCs' names folded once here instead of looked up for each
+/// intervention); the period's end is included as a whole day, as the Reports read it.
 fn compute_rows(data: &Data, now: DateTime<Utc>, fq: &str, f: &WorkFilter) -> (Vec<u64>, Totals) {
-    let from = bound(&f.from, now);
-    let to = bound(&f.to, now);
+    let from = bound(&f.from, now, false);
+    let to = bound(&f.to, now, true);
     let technician = fold(f.technician.trim());
     let kind = InterventionKind::parse(&f.kind);
+    // The first record with an id wins, as `Data::customer` and `Data::device` find it.
+    let mut customers: HashMap<u64, String> = HashMap::new();
+    let mut devices: HashMap<u64, (String, &str)> = HashMap::new();
+    if !fq.is_empty() {
+        for c in &data.customers {
+            customers.entry(c.id).or_insert_with(|| fold(&c.name));
+        }
+        for d in &data.devices {
+            devices.entry(d.id).or_insert_with(|| (fold(&d.name), d.rustdesk_id.as_str()));
+        }
+    }
+    let matches = |i: &Intervention| {
+        let customer = customers.get(&i.customer_id).map_or("", String::as_str);
+        let device = i.device_id.and_then(|d| devices.get(&d)).map(|(name, rid)| (name.as_str(), *rid));
+        views::intervention_matches_with(i, fq, customer, device)
+    };
     let keeps = |i: &Intervention| {
         f.customer.is_none_or(|c| i.customer_id == c)
             && f.device.is_none_or(|d| i.device_id == Some(d))
+            && (!f.no_device || i.device_id.is_none())
             && (technician.is_empty() || fold(&i.technician) == technician)
             && kind.is_none_or(|k| i.kind == k)
             && from.as_ref().is_none_or(|s| i.started_at >= *s)
             && to.as_ref().is_none_or(|s| i.started_at < *s)
             && (!f.running_only || i.running())
             && (!f.billable_only || i.billable)
-            && (fq.is_empty() || views::intervention_matches(data, i, fq))
+            && (fq.is_empty() || matches(i))
     };
     let mut rows: Vec<&Intervention> = data.interventions.iter().filter(|i| keeps(i)).collect();
     rows.sort_by(|a, b| b.running().cmp(&a.running()).then_with(|| b.started_at.cmp(&a.started_at)).then(b.id.cmp(&a.id)));
@@ -605,6 +637,9 @@ fn header(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                     app.work_filter.device = None;
                 }
             }
+            if app.work_filter.no_device && removable_chip(ui, t, app.tr("Without a PC")).on_hover_text(app.tr("Remove this filter")).clicked() {
+                app.work_filter.no_device = false;
+            }
         });
     });
 }
@@ -628,7 +663,7 @@ fn days_ago(now: DateTime<Utc>, days: i64) -> String {
     (now - Duration::days(days)).with_timezone(&Local).format("%Y-%m-%d").to_string()
 }
 
-/// The form-text bounds of a preset (the end excluded); empty for All and Custom.
+/// The form-text bounds of a preset (the last day included); empty for All and Custom.
 fn period_bounds(period: Period, now: DateTime<Utc>) -> (String, String) {
     match period {
         Period::ThisMonth => format::month_bounds(now, 0),
@@ -690,10 +725,10 @@ fn period_chip(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             ui.separator();
             let (mut from, mut to) = (app.work_filter.from.clone(), app.work_filter.to.clone());
             egui::Grid::new("intervention-period-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                forms::time_field(app, ui, t, app.tr("From"), &mut from, now, false);
-                forms::time_field(app, ui, t, app.tr("To"), &mut to, now, false);
+                period_field(app, ui, t, app.tr("From"), &mut from, now, false);
+                period_field(app, ui, t, app.tr("To"), &mut to, now, true);
             });
-            ui.label(RichText::new(app.tr("The end of the period is excluded")).small().color(t.muted));
+            ui.label(RichText::new(app.tr("Both days are included")).small().color(t.muted));
             app.work_filter.from = crate::core::clip(&from, 64).to_string();
             app.work_filter.to = crate::core::clip(&to, 64).to_string();
         }
@@ -702,6 +737,31 @@ fn period_chip(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     if shown.is_none() && current_period(&app.work_filter, now) != Period::Custom {
         app.interventions.custom_period = false;
     }
+}
+
+/// A bound of the Custom period: the text, and under it what it reads as (for the end, the last
+/// day it covers) or that it cannot be read. Ends the row.
+fn period_field(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str, value: &mut String, now: DateTime<Utc>, end: bool) {
+    ui.label(RichText::new(label).color(t.muted));
+    ui.vertical(|ui| {
+        ui.add(egui::TextEdit::singleline(value).hint_text("2026-10-01").desired_width(150.0));
+        let text = value.trim();
+        if !text.is_empty() {
+            let italian = app.italian();
+            let read = if end {
+                format::end_stamp_from_input(text, now).map(|s| format::end_text(&s, italian))
+            } else {
+                format::stamp_from_input(text, now).map(|s| format::long(&s, italian))
+            };
+            match read {
+                Some(shown) => ui.label(RichText::new(shown).small().color(t.muted)),
+                None => {
+                    ui.label(RichText::new(app.tr("Not a time: use 2026-10-13 09:30, 13/10/2026 09:30 or 09:30")).small().color(widgets::danger(t)))
+                }
+            };
+        }
+    });
+    ui.end_row();
 }
 
 /// The Technician chip and its menu: everyone, me, each technician of the desk.
@@ -1093,13 +1153,29 @@ fn ask_delete(app: &mut DeskApp, id: u64) {
 // ---------------------------------------------------------------------------------------------
 // The form
 
-/// The consent gate of the form: when logging remote work for a customer whose
-/// remote-assistance consent is not given, the state and whether it blocks (`require_consent`;
-/// a reason then overrides). Edits are not gated: the engine checks the consent when work is
-/// started or logged.
+/// The `device` an edit sends: `Some(new)` when the picker changed the PC (`Some(None)` for No
+/// PC), `None` when it was left as it was (not sent, so a PC moved to another customer since
+/// stays linked).
+fn sent_device(f: &Form) -> Option<Option<u64>> {
+    (f.id.is_some() && f.device.id != f.stored_device).then_some(f.device.id)
+}
+
+/// The consent gate of the form, where the engine checks the consent: logging remote work, or
+/// an edit that makes an intervention remote or moves remote work to another PC
+/// (`intervention.update`). For a customer whose remote-assistance consent is not given, the
+/// state and whether it blocks (`require_consent`; a reason then overrides).
 fn gate(app: &DeskApp, f: &Form) -> Option<(PurposeState, bool)> {
-    if f.id.is_some() || f.kind != InterventionKind::Remote {
+    if f.kind != InterventionKind::Remote {
         return None;
+    }
+    if let Some(id) = f.id {
+        // As the engine compares: with the intervention as the desk holds it now.
+        let stored = app.data().intervention(id)?;
+        let device = sent_device(f).unwrap_or(stored.device_id);
+        let moved = device.is_some() && device != stored.device_id;
+        if stored.kind.is_remote() && !moved {
+            return None;
+        }
     }
     let customer = f.customer.id.or_else(|| f.device.id.and_then(|d| app.data().device(d)).map(|d| d.customer_id))?;
     let state = app.derived.gate(customer).0;
@@ -1173,8 +1249,10 @@ fn blocker(app: &DeskApp, f: &Form) -> Option<Blocker> {
     None
 }
 
-/// Sends the form: `intervention.add`, or `intervention.update` with every field (`device: null`
-/// for No PC). Nothing is sent while the form is incomplete or a save is in flight.
+/// Sends the form: `intervention.add`, or `intervention.update` with every field but the PC,
+/// sent only when the picker changed it (`device: null` for No PC); the reason for remote work
+/// without consent when the gate asked for one. Nothing is sent while the form is incomplete or
+/// a save is in flight.
 fn submit(app: &mut DeskApp) {
     let Some(f) = app.interventions.form.clone() else { return };
     if app.interventions.busy.is_some() || blocker(app, &f).is_some() {
@@ -1200,7 +1278,9 @@ fn submit(app: &mut DeskApp) {
     let intent = match f.id {
         Some(id) => {
             params["id"] = json!(id);
-            params["device"] = f.device.id.map_or(Value::Null, |d| json!(d));
+            if let Some(device) = sent_device(&f) {
+                params["device"] = device.map_or(Value::Null, |d| json!(d));
+            }
             // A running intervention left running counts no minutes yet.
             if let Some(m) = f.minutes.filter(|_| !(f.running && ended.is_empty())) {
                 params["minutes"] = json!(m.min(MAX_MINUTES));
@@ -1217,13 +1297,13 @@ fn submit(app: &mut DeskApp) {
             if let Some(m) = f.minutes {
                 params["minutes"] = json!(m.min(MAX_MINUTES));
             }
-            let reason = f.consent_override.trim();
-            if f.proceed && !reason.is_empty() && gate(app, &f).is_some() {
-                params["consent_override"] = json!(reason);
-            }
             Intent::Logged
         }
     };
+    let reason = f.consent_override.trim();
+    if f.proceed && !reason.is_empty() && gate(app, &f).is_some() {
+        params["consent_override"] = json!(reason);
+    }
     let command = if f.id.is_some() { "intervention.update" } else { "intervention.add" };
     let job = app.run_as(command, params, crate::Intent::Interventions(intent));
     app.interventions.busy = Some(job);
@@ -1708,7 +1788,7 @@ mod tests {
         app.work_filter = WorkFilter { technician: "RICCARDO".into(), ..WorkFilter::default() };
         refresh_rows(&mut app);
         assert_eq!(app.interventions.rows.len(), 11);
-        // The last 30 days: 20 days ago and newer (the end excluded, none given).
+        // The last 30 days: 20 days ago and newer (no end given).
         app.work_filter = WorkFilter::default();
         let (from, to) = period_bounds(Period::Last30, app.now());
         app.work_filter.from = from;
@@ -1991,5 +2071,208 @@ mod tests {
         frame(&mut app);
         assert!(close(&mut app));
         assert!(!close(&mut app));
+    }
+
+    /// The texts painted in one frame of the app at `w`×`h`, with their rects.
+    fn texts_at(app: &mut DeskApp, w: f32, h: f32) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(w, h))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        let mut out = Vec::new();
+        for c in &output.shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn an_intervention_on_a_pc_moved_to_another_customer_is_still_saved() {
+        let mut app = app();
+        // The PC segreteria (1) of Lunaria goes to Ferramenta Corvo; intervention 1 stays Lunaria's.
+        app.run("device.update", json!({"device": 1, "customer": 2}));
+        frame(&mut app);
+        assert!(app.data().device(1).is_some_and(|d| d.customer_id == 2));
+        open_edit(&mut app, 1);
+        let f = app.interventions.form.as_mut().expect("the form");
+        assert_eq!((f.device.id, f.stored_device), (Some(1), Some(1)));
+        f.summary = "Stampante sistemata".into();
+        let f = f.clone();
+        assert_eq!(sent_device(&f), None, "the PC was not changed: not sent");
+        assert_eq!(blocker(&app, &f), None);
+        submit(&mut app);
+        frame(&mut app);
+        assert!(app.interventions.form.is_none(), "saved: {:?}", app.interventions.form.as_ref().map(|f| f.error.clone()));
+        let i = app.data().intervention(1).expect("still there");
+        assert_eq!((i.summary.as_str(), i.customer_id, i.device_id), ("Stampante sistemata", 1, Some(1)));
+        // Choosing No PC still sends `device: null`.
+        open_edit(&mut app, 1);
+        if let Some(f) = app.interventions.form.as_mut() {
+            f.device = Picker::default();
+            assert_eq!(sent_device(f), Some(None));
+        }
+        submit(&mut app);
+        frame(&mut app);
+        assert_eq!(app.data().intervention(1).map(|i| i.device_id), Some(None));
+    }
+
+    #[test]
+    fn making_an_intervention_remote_passes_the_consent_gate() {
+        let mut app = app();
+        // Intervention 7: lab work on Elio Brina's notebook (5); Elio has no remote-assistance consent.
+        open_edit(&mut app, 7);
+        let f = app.interventions.form.as_mut().expect("the form");
+        assert_eq!(f.kind, InterventionKind::Lab);
+        let lab = f.clone();
+        assert_eq!(gate(&app, &lab), None, "not remote: no gate");
+        let f = app.interventions.form.as_mut().expect("the form");
+        f.kind = InterventionKind::Remote;
+        let f = f.clone();
+        assert_eq!(gate(&app, &f), Some((PurposeState::Missing, true)));
+        assert_eq!(blocker(&app, &f), Some(Blocker::Gate));
+        submit(&mut app);
+        assert!(app.interventions.busy.is_none(), "not sent without a reason");
+        frame(&mut app);
+        // The engine refuses it too (a form sent without the gate, e.g. a stale mirror).
+        let job = app.run_as("intervention.update", json!({"id": 7, "kind": "remote"}), crate::Intent::Interventions(Intent::Saved));
+        app.interventions.busy = Some(job);
+        frame(&mut app);
+        assert!(app.interventions.form.as_ref().is_some_and(|f| !f.error.is_empty()), "the refusal shows in the form");
+        assert_eq!(app.data().intervention(7).map(|i| i.kind), Some(InterventionKind::Lab));
+        // With a reason it goes through, and the reason is kept.
+        if let Some(f) = app.interventions.form.as_mut() {
+            f.proceed = true;
+            f.consent_override = "Ha acconsentito al telefono".into();
+        }
+        let f = app.interventions.form.clone().expect("the form");
+        assert_eq!(blocker(&app, &f), None);
+        submit(&mut app);
+        frame(&mut app);
+        assert!(app.interventions.form.is_none());
+        let i = app.data().intervention(7).expect("there");
+        assert_eq!((i.kind, i.consent_override.as_str()), (InterventionKind::Remote, "Ha acconsentito al telefono"));
+        // Remote already, on the same PC: an edit is not gated again.
+        open_edit(&mut app, 7);
+        let f = app.interventions.form.clone().expect("the form");
+        assert_eq!(gate(&app, &f), None);
+        // Remote work moved to another PC is.
+        app.run("device.add", json!({"customer": 3, "name": "PC fisso", "rustdesk_id": "300400501"}));
+        frame(&mut app);
+        let other = app.data().devices.iter().find(|d| d.name == "PC fisso").map(|d| d.id).expect("added");
+        open_edit(&mut app, 7);
+        let f = app.interventions.form.as_mut().expect("the form");
+        f.device = Picker { text: "PC fisso".into(), id: Some(other) };
+        let f = f.clone();
+        assert_eq!(gate(&app, &f), Some((PurposeState::Missing, true)));
+        // Taking the PC off is no new remote access.
+        let mut off = f.clone();
+        off.device = Picker::default();
+        assert_eq!(gate(&app, &off), None);
+        // Consent given (Lunaria): an edit to remote is not gated.
+        open_edit(&mut app, 3);
+        let f = app.interventions.form.as_mut().expect("the form");
+        f.kind = InterventionKind::Remote;
+        let f = f.clone();
+        assert_eq!(gate(&app, &f), None);
+    }
+
+    #[test]
+    fn the_no_pc_filter_lists_only_work_without_a_pc() {
+        let mut app = app();
+        app.work_filter = WorkFilter { no_device: true, ..WorkFilter::default() };
+        refresh_rows(&mut app);
+        assert_eq!(app.interventions.rows, vec![6], "the phone call is the only one without a PC");
+        assert_eq!(app.interventions.totals.count, 1);
+        app.work_filter.customer = Some(1);
+        refresh_rows(&mut app);
+        assert!(app.interventions.rows.is_empty());
+        // The chip shows and removes it.
+        app.work_filter.customer = None;
+        let shown = texts_at(&mut app, 1440.0, 900.0);
+        assert!(shown.iter().any(|(text, _)| text == app.tr("Without a PC")));
+        app.work_filter.no_device = false;
+        refresh_rows(&mut app);
+        assert_eq!(app.interventions.rows.len(), 10);
+    }
+
+    #[test]
+    fn the_end_of_the_period_is_included_as_a_whole_day() {
+        let mut app = app();
+        // From and To on the day intervention 10 started: it is listed.
+        let started = app.data().intervention(10).map(|i| format::input(&i.started_at)).expect("intervention 10");
+        let day = started.get(..10).expect("a date").to_string();
+        app.work_filter.from.clone_from(&day);
+        app.work_filter.to.clone_from(&day);
+        refresh_rows(&mut app);
+        assert!(app.interventions.rows.contains(&10), "{day}: {:?}", app.interventions.rows);
+        assert!(
+            app.data()
+                .interventions
+                .iter()
+                .filter(|i| app.interventions.rows.contains(&i.id))
+                .all(|i| format::input(&i.started_at).starts_with(&day))
+        );
+        // The presets end on the last day of the month.
+        let (from, to) = period_bounds(Period::ThisMonth, app.now());
+        assert!(from.ends_with("-01") && !to.ends_with("-01") && from < to, "{from} {to}");
+        app.work_filter.from = from;
+        app.work_filter.to = to;
+        assert_eq!(current_period(&app.work_filter, app.now()), Period::ThisMonth);
+        // A time keeps its moment: an end at the start of intervention 10 leaves it out.
+        app.work_filter.from.clone_from(&day);
+        app.work_filter.to = started;
+        refresh_rows(&mut app);
+        assert!(!app.interventions.rows.contains(&10));
+        // The Custom fields render with readable, unreadable and empty bounds.
+        app.interventions.custom_period = true;
+        for to in ["2026-10-31", "ieri", ""] {
+            app.work_filter.to = to.into();
+            frame(&mut app);
+        }
+    }
+
+    #[test]
+    fn the_search_matches_as_the_engine_with_the_names_folded_once() {
+        let app = app();
+        let data = app.data();
+        for q in ["", "stampante", "STUDIO", "lunaria", "corvo", "brina", "100200300", "100 200 300", "nas", "riccardo", "plotter", "pc", "zzz", "é"]
+        {
+            let fq = fold(q);
+            let (rows, _) = compute_rows(data, app.now(), &fq, &WorkFilter::default());
+            let mut rows = rows;
+            rows.sort_unstable();
+            let mut expected: Vec<u64> =
+                data.interventions.iter().filter(|i| fq.is_empty() || views::intervention_matches(data, i, &fq)).map(|i| i.id).collect();
+            expected.sort_unstable();
+            assert_eq!(rows, expected, "{q}");
+        }
+        assert_eq!(compute_rows(data, app.now(), "lunaria", &WorkFilter::default()).0.len(), 6, "the customer's name matches");
+        assert_eq!(compute_rows(data, app.now(), "100200300", &WorkFilter::default()).0, vec![8, 1], "the PC's RustDesk ID matches");
+        // The matcher with the names given answers as the one that looks them up.
+        let i = data.intervention(6).cloned().expect("the phone call");
+        assert!(views::intervention_matches_with(&i, "corvo", "ferramenta corvo", None));
+        assert!(!views::intervention_matches_with(&i, "corvo", "", None));
+        assert!(views::intervention_matches_with(&i, "cassa", "", Some(("pc cassa", "200300400"))));
+        assert!(views::intervention_matches_with(&i, "200300400", "", Some(("pc cassa", "200300400"))));
+        assert!(!views::intervention_matches_with(&i, "200300", "", Some(("pc cassa", "200300400"))), "the ID matches whole");
+    }
+
+    #[test]
+    fn the_pane_replaces_the_list_until_both_fit() {
+        let mut app = app();
+        app.selected_intervention = Some(3);
+        let log = app.tr("Log work").to_string();
+        let listed = |texts: &[(String, Rect)]| texts.iter().any(|(text, _)| *text == log);
+        assert!(listed(&texts_at(&mut app, 1440.0, 900.0)), "wide: the list next to the pane");
+        assert!(!listed(&texts_at(&mut app, 1100.0, 900.0)), "the list would be squeezed under the pane: the pane alone");
+        app.selected_intervention = None;
+        assert!(listed(&texts_at(&mut app, 1100.0, 900.0)), "nothing open: the list");
     }
 }

@@ -1,6 +1,6 @@
 # API HTTP e comandi
 
-> **Ultimo aggiornamento:** 2026-10-13
+> **Ultimo aggiornamento:** 2026-10-14
 
 Tutto passa da `POST /api/cmd {"command", "params"}`. Le rotte `GET` sono scorciatoie di sola
 lettura sugli stessi comandi: i parametri della query string diventano `params`.
@@ -69,6 +69,31 @@ L'elenco sempre aggiornato è `remotecraft-cli commands` (o `GET /api/commands`)
 
 {"command": "report.time", "params": {"from": "2026-10-01", "to": "2026-11-01", "group_by": "customer"}}
 ```
+
+### Regole da sapere
+
+- **Consenso anche in modifica.** `intervention.update` che trasforma un intervento in remoto
+  (`kind: "remote"` su uno che non lo era) o sposta un intervento remoto su un altro PC fa gli
+  stessi controlli di `intervention.add`: con `require_consent` e senza consenso
+  `remote_assistance` valido viene rifiutato (409), a meno di `consent_override` con il motivo,
+  che resta sull'intervento e nel registro di audit. La risposta porta gli avvisi in `warnings`.
+  Le altre correzioni (orari, note, togliere il PC) non chiedono nulla.
+
+  ```json
+  {"command": "intervention.update", "params": {"id": 41, "kind": "remote", "consent_override": "Ha accettato al telefono, modulo da firmare"}}
+  → {"intervention": {..., "consent_override": "Ha accettato al telefono, modulo da firmare"}, "warnings": ["remote_assistance consent is missing"]}
+  ```
+- **Un ID RustDesk, un PC in servizio.** `device.retire` con `retired: false` (rimettere in
+  servizio) viene rifiutato se un altro PC in servizio ha lo stesso ID RustDesk; il messaggio
+  dice quale: va dismesso prima quello.
+- **`rustdesk.check`** prova le tre porte in parallelo (al massimo una attesa di connessione,
+  non tre); il server lo esegue senza bloccare le altre richieste, l'app desktop senza bloccare
+  la finestra.
+- **`GET /api/snapshot?since=N`** risponde `{"unchanged": true}` solo se la revisione è ancora
+  `N`. Ogni avvio del server parte da una revisione diversa, quindi un client rimasto alla
+  revisione di prima di un riavvio riceve sempre il gestionale nuovo. `actor` è il tecnico per
+  cui lavorano i comandi dello stesso client: quello del token, quello di `X-Remotecraft-User`,
+  altrimenti il tecnico del server.
 
 ## Preferenze
 

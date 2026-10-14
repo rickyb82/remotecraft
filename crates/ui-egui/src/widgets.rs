@@ -107,18 +107,22 @@ pub fn tone_chip(ui: &mut Ui, t: &Tokens, text: &str, tone: Tone) -> Response {
     chip(ui, text, fill, color)
 }
 
-/// The red of errors and danger buttons.
+/// The red of errors (text, icons, outlines): lighter in the dark theme, to read on dark
+/// surfaces.
 pub fn danger(t: &Tokens) -> Color32 {
-    if t.dark { Color32::from_rgb(0xff, 0x7a, 0x7e) } else { Color32::from_rgb(0xc5, 0x22, 0x1f) }
+    if t.dark { Color32::from_rgb(0xff, 0x7a, 0x7e) } else { DANGER_FILL }
 }
 
+/// The fill of danger buttons in both themes: deep enough for their white label (about 5.6:1),
+/// which the dark theme's lighter [`danger`] red is not (about 2.5:1).
+const DANGER_FILL: Color32 = Color32::from_rgb(0xc5, 0x22, 0x1f);
+
 /// A filled red button for actions that cannot be undone.
-pub fn danger_button(ui: &mut Ui, t: &Tokens, text: &str) -> Response {
+pub fn danger_button(ui: &mut Ui, _t: &Tokens, text: &str) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(14.0), Color32::WHITE);
     let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 28.0, 34.0), Sense::click());
     let p = ui.painter();
-    let red = danger(t);
-    p.rect_filled(rect, 8.0, if resp.hovered() { red.gamma_multiply(0.9) } else { red });
+    p.rect_filled(rect, 8.0, if resp.hovered() { DANGER_FILL.gamma_multiply(0.9) } else { DANGER_FILL });
     p.galley(egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
     resp
 }
@@ -312,4 +316,66 @@ pub fn copy_button(ui: &mut Ui, t: &Tokens, tip: &str, text: &str) -> bool {
         return true;
     }
     false
+}
+
+/// The WCAG contrast ratio of two opaque colours (1 to 21; body text wants 4.5).
+#[cfg(test)]
+pub(crate) fn contrast(a: Color32, b: Color32) -> f32 {
+    let luminance = |c: Color32| {
+        let lin = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    };
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rectangle fills and the text colours `paint` draws in one frame in theme `t`.
+    fn painted(t: &Tokens, mut paint: impl FnMut(&mut Ui, &Tokens)) -> (Vec<Color32>, Vec<Color32>) {
+        fn walk(shape: &egui::Shape, fills: &mut Vec<Color32>, texts: &mut Vec<Color32>) {
+            match shape {
+                egui::Shape::Rect(r) => fills.push(r.fill),
+                egui::Shape::Text(s) => texts.extend(s.galley.job.sections.iter().map(|x| x.format.color)),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, fills, texts)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| paint(ui, t));
+        output.textures_delta.clear();
+        let (mut fills, mut texts) = (Vec::new(), Vec::new());
+        for c in &output.shapes {
+            walk(&c.shape, &mut fills, &mut texts);
+        }
+        (fills, texts)
+    }
+
+    #[test]
+    fn contrast_follows_the_wcag_formula() {
+        assert!((contrast(Color32::WHITE, Color32::BLACK) - 21.0).abs() < 0.01);
+        assert!((contrast(Color32::WHITE, Color32::WHITE) - 1.0).abs() < 0.01);
+        // The review's figure for the old dark danger fill.
+        assert!((contrast(Color32::WHITE, Color32::from_rgb(0xff, 0x7a, 0x7e)) - 2.5).abs() < 0.1);
+    }
+
+    #[test]
+    fn a_danger_button_label_reads_in_both_themes() {
+        for t in [Tokens::LIGHT, Tokens::DARK] {
+            let (fills, texts) = painted(&t, |ui, t| {
+                danger_button(ui, t, "Cancella");
+            });
+            let fill = fills.iter().copied().find(|f| f.a() == 255 && f.r() > f.g()).unwrap();
+            let label = texts.first().copied().unwrap();
+            assert!(contrast(fill, label) >= 4.5, "dark {}: {:.2}", t.dark, contrast(fill, label));
+            // The error red stays light enough for text on the dark theme's surfaces.
+            assert!(contrast(danger(&t), t.card) >= 4.5, "dark {}: {:.2}", t.dark, contrast(danger(&t), t.card));
+        }
+    }
 }

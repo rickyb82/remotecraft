@@ -1,5 +1,9 @@
 //! Italian interface labels.
 
+/// Leading phrases followed by text a person typed (the audit log's details): only the phrase
+/// is translated, the rest is shown as typed.
+pub(super) const VERBATIM: &[(&str, &str)] = &[("erasure: ", "cancellazione: "), ("consent override: ", "consenso forzato: ")];
+
 /// Engine messages by their leading phrase (longer prefixes first).
 pub(super) const MESSAGES: &[(&str, &str)] = &[
     ("the customer's remote_assistance consent is ", "il consenso del cliente all'assistenza remota è "),
@@ -53,6 +57,15 @@ pub(super) const MESSAGES: &[(&str, &str)] = &[
     ("bad answer from the server", "risposta non valida dal server"),
     ("unknown token", "token sconosciuto"),
     ("missing token", "token mancante"),
+    // A remote desk's problems, by class (the status bar shows the detail on its own).
+    ("unauthorized: ", "non autorizzato: "),
+    ("incompatible: ", "incompatibile: "),
+    ("unreachable: ", "non raggiungibile: "),
+    ("bad snapshot: ", "snapshot non valido: "),
+    ("the snapshot is too large", "lo snapshot è troppo grande"),
+    ("bad answer: ", "risposta non valida: "),
+    ("the answer is too large", "la risposta è troppo grande"),
+    ("server answered ", "il server ha risposto "),
 ];
 
 /// Engine phrases found inside a message (after a name or a number), replaced wherever they
@@ -74,6 +87,12 @@ pub(super) const INFIX: &[(&str, &str)] = &[
         "has unattended access but the customer's unattended_access consent is ",
         "ha l'accesso non presidiato ma il consenso del cliente all'accesso non presidiato è ",
     ),
+    ("` of ", "` di "),
+    (": update or retire that one first", ": aggiorna o dismetti prima quel PC"),
+    (": retire that one first", ": dismetti prima quel PC"),
+    ("(e.g. the person agreed on the phone)", "(ad esempio la persona ha acconsentito al telefono)"),
+    (" or RFC 3339", " o RFC 3339"),
+    (": use ", ": usa "),
     ("missing", "mancante"),
     ("withdrawn", "revocato"),
     ("expired", "scaduto"),
@@ -110,15 +129,25 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Server unreachable ({url}): {error}. Start it with: remotecraft-cli serve" => {
             "Server non raggiungibile ({url}): {error}. Avvialo con: remotecraft-cli serve"
         }
+        "The server refused the token ({url}): {error}. Open RemoteCraft again from the framework's link, or check the token" => {
+            "Il server ha rifiutato il token ({url}): {error}. Riapri RemoteCraft dal link del framework, oppure controlla il token"
+        }
+        "The server and this app are different versions ({url}): {error}. Reload the page or update the app" => {
+            "Il server e questa app sono di versioni diverse ({url}): {error}. Ricarica la pagina o aggiorna l'app"
+        }
+        "Server problem ({url}): {error}" => "Problema con il server ({url}): {error}",
         "Working as {actor}" => "Al lavoro come {actor}",
         "{n} customers" => "{n} clienti",
+        "1 device" => "1 PC",
         "{n} devices" => "{n} PC",
+        "1 intervention" => "1 intervento",
         "{n} interventions" => "{n} interventi",
         "Keyboard shortcuts" => "Scorciatoie da tastiera",
         "Nothing here yet" => "Ancora niente qui",
         "Start intervention" => "Avvia intervento",
         "No running interventions" => "Nessun intervento in corso",
         "Export saved (recorded in the audit log)" => "Esportazione salvata (registrata nell'audit)",
+        "Privacy review: 1 finding" => "Revisione privacy: 1 segnalazione",
         "Privacy review: {n} findings" => "Revisione privacy: {n} segnalazioni",
         "Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}" => {
             "Apro RustDesk… Se non succede niente, installa il client RustDesk oppure esegui: {command}"

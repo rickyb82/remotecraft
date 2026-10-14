@@ -118,3 +118,18 @@ fn stdio_lines_batches_and_garbage() {
     assert_eq!(lines[1]["error"]["code"], -32700);
     assert_eq!(lines[2].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn an_agent_correcting_work_into_remote_work_needs_consent_or_a_reason() {
+    let mut s = server();
+    let logged = call(
+        &mut s,
+        "log_intervention",
+        json!({"customer": 3, "kind": "onsite", "summary": "Visita", "started_at": "2026-10-12 10:00", "minutes": 30}),
+    );
+    let id = logged["intervention"]["id"].clone();
+    assert!(fails(&mut s, "update_intervention", json!({"id": id, "kind": "remote"})).contains("consent"));
+    // consent_override is declared, so it reaches the engine instead of being dropped.
+    let u = call(&mut s, "update_intervention", json!({"id": id, "kind": "remote", "consent_override": "Ha accettato al telefono"}));
+    assert_eq!(u["intervention"]["consent_override"], "Ha accettato al telefono");
+}

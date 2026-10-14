@@ -235,7 +235,8 @@ pub enum FormAction {
 }
 
 /// The bottom row of a form: Cancel and the accent Save (`Saving…` and disabled while
-/// `busy`); `Cmd+Enter` anywhere in the window saves too.
+/// `busy`); `Cmd+Enter` saves too while one of the form's own fields has the focus (call it in
+/// the `ui` that holds the form's fields, after them).
 pub fn submit_row(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, save_label: &str, busy: bool, enabled: bool) -> FormAction {
     let mut action = FormAction::None;
     ui.add_space(8.0);
@@ -255,10 +256,23 @@ pub fn submit_row(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, save_label: &str
             }
         });
     });
-    if action == FormAction::None && !busy && enabled && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
+    if action == FormAction::None
+        && !busy
+        && enabled
+        && focus_inside(ui)
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
+    {
         action = FormAction::Save;
     }
     action
+}
+
+/// Whether the focused widget lies in `ui` (its layer, its rectangle so far): `Cmd+Enter` typed
+/// in the work card, the search box or another pane is not this form's.
+fn focus_inside(ui: &egui::Ui) -> bool {
+    let ctx = ui.ctx();
+    let Some(id) = ctx.memory(|m| m.focused()) else { return false };
+    ctx.read_response(id).is_some_and(|r| r.layer_id == ui.layer_id() && ui.min_rect().contains(r.rect.center()))
 }
 
 /// The message of a refusal or an error, translated, or `None` on success.
@@ -316,5 +330,52 @@ mod tests {
         assert_eq!(Picker::device(&app, None), Picker::default());
         assert_eq!(new_id(&serde_json::json!({"customer": {"id": 7}}), "customer"), Some(7));
         assert_eq!(warnings(&app, &serde_json::json!({"warnings": ["the customer is archived"]})).len(), 1);
+    }
+
+    #[test]
+    fn cmd_enter_saves_only_from_the_forms_own_fields() {
+        let app = DeskApp::demo();
+        let t = Tokens::for_dark_mode(false);
+        let ctx = egui::Context::default();
+        let (inside, before, over) = (egui::Id::new("form-field"), egui::Id::new("search-field"), egui::Id::new("card-field"));
+        let ctrl_enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE },
+        };
+        // One frame: a box above the form, the form (a box and the row), and a box floating
+        // over the form in its own layer (the work card); `focus` is given at the end.
+        let run = |focus: Option<egui::Id>, events: Vec<egui::Event>| {
+            let mut action = FormAction::None;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let (mut a, mut b, mut c) = (String::new(), String::new(), String::new());
+                ui.add(egui::TextEdit::singleline(&mut b).id(before));
+                let form = ui.group(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut a).id(inside));
+                    action = submit_row(&app, ui, &t, "Save", false, true);
+                });
+                egui::Area::new(egui::Id::new("card")).fixed_pos(form.response.rect.min).show(ui.ctx(), |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut c).id(over));
+                });
+                if let Some(f) = focus {
+                    ui.memory_mut(|m| m.request_focus(f));
+                }
+            });
+            output.textures_delta.clear();
+            action
+        };
+        run(None, Vec::new());
+        assert_eq!(run(None, vec![ctrl_enter.clone()]), FormAction::None, "nothing focused");
+        for (focus, expected) in [(before, FormAction::None), (over, FormAction::None), (inside, FormAction::Save)] {
+            run(Some(focus), Vec::new());
+            assert_eq!(run(None, vec![ctrl_enter.clone()]), expected, "{focus:?}");
+        }
     }
 }

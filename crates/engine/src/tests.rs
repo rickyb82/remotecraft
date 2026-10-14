@@ -435,3 +435,149 @@ fn rustdesk_setup_and_check() {
     let c = run(&mut d, "rustdesk.check", json!({"host": "elsewhere"}));
     assert_eq!(c["ports"][2]["ok"], false);
 }
+
+#[test]
+fn rustdesk_check_probes_the_ports_in_parallel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Each probe waits (at most 5 s) until all three run at once: one after the other, a host
+    // that drops the packets would cost three timeouts.
+    let active = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = active.clone();
+    let mut d = empty();
+    d.set_rustdesk_probe(
+        "127.0.0.1",
+        Box::new(move |_: &str, port: u16| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..500 {
+                if seen.load(Ordering::SeqCst) >= 3 {
+                    return Ok(u64::from(port));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err("alone".into())
+        }),
+    );
+    let c = run(&mut d, "rustdesk.check", json!({}));
+    let ports = c["ports"].as_array().unwrap();
+    assert_eq!(ports.len(), 3);
+    assert!(ports.iter().all(|p| p["ok"] == true), "{c}");
+    assert_eq!(ports[0]["ms"], 21115);
+    assert_eq!(ports[2]["ms"], 21117);
+    // The prepared check answers the same as the command.
+    let prepared = d.prepare_rustdesk_check(&json!({"host": "127.0.0.1"})).unwrap();
+    assert_eq!(prepared.host(), "127.0.0.1");
+    assert_eq!(prepared.run()["ports"].as_array().unwrap().len(), 3);
+    assert!(d.prepare_rustdesk_check(&json!("x")).is_err());
+    assert!(d.prepare_rustdesk_check(&json!({"host": "a/b"})).is_err());
+    // A probe that panics is a failed port, not a crash.
+    d.set_rustdesk_probe("127.0.0.1", Box::new(|_: &str, port: u16| if port == 21116 { panic!("probe bug") } else { Ok(1) }));
+    let c = run(&mut d, "rustdesk.check", json!({}));
+    assert_eq!(c["ports"][1]["ok"], false);
+    assert_eq!(c["ports"][0]["ok"], true);
+}
+
+#[test]
+fn putting_a_pc_back_in_service_keeps_rustdesk_ids_unique() {
+    let mut d = demo();
+    let old = run(&mut d, "device.add", json!({"customer": 3, "name": "Vecchio PC", "rustdesk_id": "111222333"}))["device"]["id"].clone();
+    run(&mut d, "device.retire", json!({"device": old}));
+    // The RustDesk ID went to the new PC.
+    let new = run(&mut d, "device.add", json!({"customer": 3, "name": "Nuovo PC", "rustdesk_id": "111 222 333"}))["device"]["id"].clone();
+    let before = d.data().clone();
+    let err = fails(&mut d, "device.retire", json!({"device": old, "retired": false}));
+    assert!(err.contains("111 222 333") && err.contains(&format!("device {new} `Nuovo PC`")) && err.contains("Elio Brina"), "{err}");
+    assert_eq!(d.data(), &before);
+    // Retiring again is always allowed; so is putting back once the other one is retired.
+    run(&mut d, "device.retire", json!({"device": old}));
+    run(&mut d, "device.retire", json!({"device": new}));
+    run(&mut d, "device.retire", json!({"device": old, "retired": false}));
+    assert!(!d.data().device(old.as_u64().unwrap()).unwrap().retired);
+    // A PC without a RustDesk ID never clashes.
+    let bare = run(&mut d, "device.add", json!({"customer": 3, "name": "Senza ID"}))["device"]["id"].clone();
+    run(&mut d, "device.retire", json!({"device": bare}));
+    run(&mut d, "device.retire", json!({"device": bare, "retired": false}));
+}
+
+#[test]
+fn an_unchanged_rustdesk_id_is_not_a_clash() {
+    // Two PCs in service with one ID (a desk written before put-backs were checked).
+    let mut data = remotecraft_core::mock::demo(now());
+    let rid = data.devices.first().map(|x| x.rustdesk_id.clone()).unwrap();
+    let mut twin = data.devices.first().cloned().unwrap();
+    twin.id = data.devices.iter().map(|x| x.id).max().unwrap() + 1;
+    twin.name = "Gemello".into();
+    data.devices.push(twin.clone());
+    let mut d = Desk::in_memory(data);
+    d.set_clock(now());
+    // Saving either one with every field, the ID unchanged, goes through.
+    let v = run(&mut d, "device.update", json!({"device": twin.id, "name": "Gemello 2", "rustdesk_id": remotecraft_core::rustdesk::display(&rid)}));
+    assert_eq!(v["device"]["name"], "Gemello 2");
+    run(&mut d, "device.update", json!({"device": 1, "rustdesk_id": rid}));
+    // Taking an ID another PC in service holds is still refused.
+    let other = run(&mut d, "device.add", json!({"customer": 3, "name": "Altro", "rustdesk_id": "999888777"}))["device"]["id"].clone();
+    let err = fails(&mut d, "device.update", json!({"device": other, "rustdesk_id": rid}));
+    assert!(err.contains("already on device"), "{err}");
+}
+
+#[test]
+fn editing_work_into_remote_work_checks_consent() {
+    let mut d = demo();
+    // Elio Brina (3) gave no remote consent: on-site work is fine.
+    let v = run(
+        &mut d,
+        "intervention.add",
+        json!({"customer": 3, "kind": "onsite", "summary": "Visita", "started_at": "2026-10-12T10:00:00Z", "minutes": 30}),
+    );
+    let id = v["intervention"]["id"].as_u64().unwrap();
+    // Turning it into remote work is refused like logging remote work.
+    let before = d.data().clone();
+    let err = fails(&mut d, "intervention.update", json!({"id": id, "kind": "remote"}));
+    assert!(err.contains("remote_assistance consent is missing"), "{err}");
+    assert_eq!(d.data(), &before);
+    // With the reason it goes ahead: kept on the intervention and in the audit log.
+    let u = run(&mut d, "intervention.update", json!({"id": id, "kind": "remote", "consent_override": "Consenso a voce al telefono"}));
+    assert_eq!(u["intervention"]["kind"], "remote");
+    assert_eq!(u["intervention"]["consent_override"], "Consenso a voce al telefono");
+    assert!(u["warnings"][0].as_str().unwrap().contains("missing"), "{u}");
+    assert!(d.audit_entries(1)[0].detail.contains("consent override"));
+    // Other edits of remote work do not ask again, and keep the reason.
+    let u = run(&mut d, "intervention.update", json!({"id": id, "summary": "Visita e controllo"}));
+    assert_eq!(u["intervention"]["consent_override"], "Consenso a voce al telefono");
+    assert_eq!(u["warnings"], json!([]));
+    // Remote work moved to a PC asks again.
+    assert!(fails(&mut d, "intervention.update", json!({"id": id, "device": "300400500"})).contains("consent"));
+    let u = run(&mut d, "intervention.update", json!({"id": id, "device": "300400500", "consent_override": "Ha accettato al telefono"}));
+    assert_eq!(u["intervention"]["device_id"], 5);
+    assert_eq!(u["intervention"]["consent_override"], "Ha accettato al telefono");
+    // Naming the same PC again, or taking the PC off, is no new remote access.
+    run(&mut d, "intervention.update", json!({"id": id, "device": 5}));
+    run(&mut d, "intervention.update", json!({"id": id, "device": null}));
+    // With the consent recorded nothing is asked, and no reason is needed.
+    let w = run(
+        &mut d,
+        "intervention.add",
+        json!({"customer": 1, "kind": "phone", "summary": "Telefonata", "started_at": "2026-10-12T11:00:00Z", "minutes": 5}),
+    );
+    let u = run(&mut d, "intervention.update", json!({"id": w["intervention"]["id"], "kind": "remote"}));
+    assert_eq!(u["intervention"]["consent_override"], "");
+}
+
+#[test]
+fn every_desk_starts_at_its_own_revision() {
+    let dir = std::env::temp_dir().join(format!("remotecraft-revision-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let paths = Paths::under(&dir);
+    let mut a = Desk::open(paths.clone()).unwrap();
+    a.execute("customer.add", &json!({"name": "Uno"})).unwrap();
+    // The same file opened again (a server restarted) does not reuse the revisions: a client
+    // still holding the old one gets the desk, not `unchanged`.
+    let mut b = Desk::open(paths).unwrap();
+    assert_ne!(a.revision(), b.revision());
+    assert!(b.snapshot(a.revision(), "x").unwrap().is_some());
+    let c = Desk::in_memory(Data::new());
+    for r in [a.revision(), b.revision(), c.revision()] {
+        assert!(r > 0 && r < 1 << 53, "{r}");
+    }
+    assert_ne!(Desk::in_memory(Data::new()).revision(), c.revision());
+    let _ = std::fs::remove_dir_all(&dir);
+}

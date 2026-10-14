@@ -64,6 +64,11 @@ impl Language {
         if self == Self::En {
             return text.to_string();
         }
+        // A leading phrase followed by what a person typed (an erasure's reason): the text is
+        // shown as typed.
+        if let Some(out) = it::VERBATIM.iter().find_map(|(en, itx)| text.strip_prefix(en).map(|rest| format!("{itx}{rest}"))) {
+            return out;
+        }
         let mut out =
             it::MESSAGES.iter().find_map(|(en, itx)| text.strip_prefix(en).map(|rest| format!("{itx}{rest}"))).unwrap_or_else(|| text.to_string());
         // Phrases after a name or a number (`x` is not a time, intervention 5 is already closed).
@@ -106,9 +111,14 @@ pub const LABELS: &[&str] = &[
     "Delete",
     "Connecting…",
     "Server unreachable ({url}): {error}. Start it with: remotecraft-cli serve",
+    "The server refused the token ({url}): {error}. Open RemoteCraft again from the framework's link, or check the token",
+    "The server and this app are different versions ({url}): {error}. Reload the page or update the app",
+    "Server problem ({url}): {error}",
     "Working as {actor}",
     "{n} customers",
+    "1 device",
     "{n} devices",
+    "1 intervention",
     "{n} interventions",
     "Keyboard shortcuts",
     "Nothing here yet",
@@ -116,6 +126,7 @@ pub const LABELS: &[&str] = &[
     "Running",
     "No running interventions",
     "Export saved (recorded in the audit log)",
+    "Privacy review: 1 finding",
     "Privacy review: {n} findings",
     "Opening RustDesk… If nothing happens, install the RustDesk client or run: {command}",
     "Privacy notice not delivered",
@@ -192,15 +203,35 @@ mod tests {
         assert_eq!(Language::En.tr("Customers"), "Customers");
         assert_eq!(Language::It.fill("{n} customers", &[("n", "3")]), "3 clienti");
         assert_eq!(Language::It.tr_message("no customer 7"), "nessun cliente 7");
-        assert_eq!(Language::It.tr_message("`ieri` is not a time: use 2026-10-13 09:30"), "`ieri` non è un orario: use 2026-10-13 09:30");
+        assert_eq!(
+            Language::It.tr_message("`ieri` is not a time: use 2026-10-13 09:30, 13/10/2026 09:30, 09:30 or RFC 3339"),
+            "`ieri` non è un orario: usa 2026-10-13 09:30, 13/10/2026 09:30, 09:30 o RFC 3339"
+        );
+        assert_eq!(
+            Language::It.tr_message("RustDesk ID 111 222 333 is already on device 5 `Nuovo PC` of Elio Brina: retire that one first"),
+            "L'ID RustDesk 111 222 333 è già sul PC 5 `Nuovo PC` di Elio Brina: dismetti prima quel PC"
+        );
+        assert!(
+            Language::It
+                .tr_message("RustDesk ID 1 is already on device 2 `A` of B: update or retire that one first")
+                .ends_with("di B: aggiorna o dismetti prima quel PC")
+        );
         assert!(
             Language::It.tr_message("intervention 5 is already closed (intervention.update to change it)").starts_with("intervento 5 è già chiuso (")
         );
         assert_eq!(
             Language::It.tr_message("the customer's remote_assistance consent is missing: record it first (privacy.consent), or give consent_override with the reason (e.g. the person agreed on the phone)"),
-            "il consenso del cliente all'assistenza remota è mancante: registralo prima, oppure indica il motivo per procedere (e.g. the person agreed on the phone)"
+            "il consenso del cliente all'assistenza remota è mancante: registralo prima, oppure indica il motivo per procedere (ad esempio la persona ha acconsentito al telefono)"
         );
         assert_eq!(Language::En.tr_message("intervention 5 is already closed"), "intervention 5 is already closed");
+        // The audit log's details: the reason typed stays as typed.
+        assert_eq!(Language::It.tr_message("erasure: richiesta"), "cancellazione: richiesta");
+        assert_eq!(Language::It.tr_message("consent override: contract expired, missing form"), "consenso forzato: contract expired, missing form");
+        assert_eq!(Language::En.tr_message("erasure: request"), "erasure: request");
+        assert_eq!(Language::It.fill("Privacy review: 1 finding", &[]), "Revisione privacy: 1 segnalazione");
+        assert_eq!(Language::It.tr("1 intervention"), "1 intervento");
+        // The status bar's "1 customer" is the Customers screen's label.
+        assert_eq!(Language::It.tr("1 customer"), "1 cliente");
         assert_eq!(Language::parse("it-IT"), Some(Language::It));
         assert_eq!(Language::parse("de"), None);
     }

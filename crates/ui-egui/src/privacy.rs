@@ -57,6 +57,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Record consent", "Registra consenso"),
     ("Erase personal data…", "Cancella i dati personali…"),
     ("Open intervention", "Apri l'intervento"),
+    ("No finding matches \"{query}\"", "Nessuna segnalazione corrisponde a \"{query}\""),
     // The privacy strip of a customer card.
     ("Notice {version} delivered on {date} ({method})", "Informativa {version} consegnata il {date} ({method})"),
     ("Received notice {old}, current is {new}", "Ha ricevuto l'informativa {old}, l'attuale è la {new}"),
@@ -94,11 +95,13 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Created by {who} on {date}", "Creata da {who} il {date}"),
     ("Current", "Attuale"),
     ("Scheduled", "Programmata"),
+    ("1 customer received it", "Ricevuta da 1 cliente"),
     ("{n} customers received it", "Ricevuta da {n} clienti"),
     ("Versions never change: a new text is a new version.", "Le versioni non cambiano mai: un testo nuovo è una nuova versione."),
     ("This version exists", "Questa versione esiste già"),
     ("Notice version added", "Versione dell'informativa aggiunta"),
     ("No privacy notice yet", "Ancora nessuna informativa"),
+    ("No notice matches \"{query}\"", "Nessuna informativa corrisponde a \"{query}\""),
     (
         "Add the text you give customers (art. 13): deliveries and consents refer to its version.",
         "Aggiungi il testo che dai ai clienti (art. 13): consegne e consensi fanno riferimento alla sua versione.",
@@ -127,6 +130,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Also record the notice delivery (one signed form)", "Registra anche la consegna dell'informativa (un solo modulo firmato)"),
     ("Records the delivery of notice {version} together with the consent", "Registra la consegna dell'informativa {version} insieme al consenso"),
     ("Notice delivery recorded", "Consegna dell'informativa registrata"),
+    ("Consent recorded (1 event)", "Consenso registrato (1 evento)"),
     ("Consent recorded ({n} events)", "Consenso registrato ({n} eventi)"),
     ("No notice delivery recorded: consent must be informed", "Nessuna consegna dell'informativa registrata: il consenso deve essere informato"),
     ("This adds a withdrawal event; the history is kept.", "Si aggiunge un evento di revoca; lo storico resta."),
@@ -143,6 +147,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Every technician", "Tutti i tecnici"),
     ("Targets", "Elementi"),
     ("Detail", "Dettaglio"),
+    ("1 entry", "1 voce"),
     ("{n} entries", "{n} voci"),
     ("No audit entries", "Nessuna voce di audit"),
     ("Show more", "Mostra altre"),
@@ -153,8 +158,12 @@ pub const LABELS_IT: &[(&str, &str)] = &[
 const ROW_H: f32 = 40.0;
 /// Row height of the Notices list (two lines).
 const NOTICE_ROW_H: f32 = 56.0;
-/// Below this window width the right pane replaces the list.
-const NARROW: f32 = 980.0;
+/// Below this window width the right pane replaces the list: the nav (235 px), the pane (520 px)
+/// and a list of about 480 px.
+const NARROW: f32 = 1240.0;
+/// How long a notice just added may stay missing from a remote desk's mirror (its snapshot
+/// comes after the answer) before its selection is dropped.
+const PENDING_NOTICE_SECS: u64 = 10;
 /// Width of the label column of the forms.
 const LABEL_W: f32 = 110.0;
 /// How many audit entries the log asks for first, and how many more "Show more" adds.
@@ -336,8 +345,11 @@ pub struct State {
     pub history_open: Option<u64>,
     /// The warnings of the consent just recorded, for that customer's strip.
     pub consent_warnings: Option<(u64, Vec<String>)>,
-    /// The notice form was cancelled on an empty Notices tab: do not open it again by itself.
+    /// The notice form was cancelled on an empty Notices tab, or a notice was added: do not
+    /// open it again by itself.
     notice_dismissed: bool,
+    /// The notice just added and when: selected before a remote desk's mirror holds it.
+    pending_notice: Option<(u64, Instant)>,
     /// The Review rows, keyed by the derived build and the search.
     review: Vec<ReviewRow>,
     /// The detail of each finding (aligned with `derived.findings`), built with the rows.
@@ -843,7 +855,8 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
         Intent::Delivered(_) => app.toast(app.tr("Notice delivery recorded").to_string()),
         Intent::Consented(customer) => {
             let n = v["events"].as_array().map_or(0, Vec::len);
-            app.toast(app.language.fill("Consent recorded ({n} events)", &[("n", &n.to_string())]));
+            let text = if n == 1 { "Consent recorded (1 event)" } else { "Consent recorded ({n} events)" };
+            app.toast(app.language.fill(text, &[("n", &n.to_string())]));
             let warnings = forms::warnings(app, v);
             if !warnings.is_empty() {
                 app.privacy.consent_warnings = Some((customer, warnings));
@@ -860,8 +873,12 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
         }
         Intent::NoticeAdded => {
             app.toast(app.tr("Notice version added").to_string());
+            // The desk has a notice now, even while a remote desk's mirror still shows none:
+            // the empty Notices tab must not open a blank form again.
+            app.privacy.notice_dismissed = true;
             if let Some(id) = forms::new_id(v, "notice") {
                 app.privacy.selected_notice = Some(id);
+                app.privacy.pending_notice = Some((id, Instant::now()));
                 app.privacy.tab = Tab::Notices;
             }
         }
@@ -1463,10 +1480,18 @@ pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         let params = app.privacy.audit_filter.params();
         derived::refresh(app, |a| &mut a.privacy.audit, "audit.list", params, crate::Intent::Privacy(Intent::Audit));
     }
-    if app.privacy.tab == Tab::Notices && app.data().notices.is_empty() && app.privacy.form.is_none() && !app.privacy.notice_dismissed {
+    settle_pending_notice(app);
+    if app.privacy.tab == Tab::Notices
+        && app.data().notices.is_empty()
+        && app.privacy.form.is_none()
+        && !app.privacy.notice_dismissed
+        && app.privacy.busy.is_none()
+        && app.privacy.pending_notice.is_none()
+    {
         open_notice(app);
     }
-    if app.privacy.selected_notice.is_some_and(|id| notice_of(app.data(), id).is_none()) {
+    let pending = app.privacy.pending_notice.map(|(id, _)| id);
+    if app.privacy.selected_notice.is_some_and(|id| pending != Some(id) && notice_of(app.data(), id).is_none()) {
         app.privacy.selected_notice = None;
     }
     let pane = match (&app.privacy.form, app.privacy.tab, app.privacy.selected_notice) {
@@ -1496,6 +1521,16 @@ pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             Tab::Audit => audit_list(app, ui, t),
         }
     });
+}
+
+/// Forgets the notice just added once the data holds it, or after [`PENDING_NOTICE_SECS`] (a
+/// snapshot that never came: its selection then goes like any unknown one's).
+fn settle_pending_notice(app: &mut DeskApp) {
+    if let Some((id, since)) = app.privacy.pending_notice
+        && (notice_of(app.data(), id).is_some() || since.elapsed().as_secs() >= PENDING_NOTICE_SECS)
+    {
+        app.privacy.pending_notice = None;
+    }
 }
 
 fn pane_ui(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, pane: Pane) {
@@ -1553,10 +1588,13 @@ fn header(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     let mut new_notice = false;
     egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
+        // Wrapped: when the pane narrows the list, the tabs go to a second line instead of
+        // under the pane, where they could not be reached.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
             let q = app.search.trim();
             let title = if q.is_empty() { app.tr("Privacy").to_string() } else { format!("{} · \"{}\"", app.tr("Privacy"), format::clipped(q, 24)) };
-            ui.label(RichText::new(title).strong().color(t.ui_text));
+            ui.add(egui::Label::new(RichText::new(title).strong().color(t.ui_text)).truncate());
             widgets::divider(ui, t);
             let findings = app.derived.findings.len();
             for (tab, icon, label, count) in [
@@ -1569,35 +1607,43 @@ fn header(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                     tab_pick = Some(tab);
                 }
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match app.privacy.tab {
+            // The tab's own control at the right end of the row (`available_size_before_wrap`
+            // is what is left of it).
+            let gap = ui.spacing().item_spacing.x;
+            match app.privacy.tab {
                 Tab::Review => {
                     let age = Duration::from_std(app.derived.built.elapsed()).unwrap_or(Duration::zero());
                     if let Some(at) = app.now().checked_sub_signed(age) {
                         let text = app.language.fill("Last check {time}", &[("time", &format::clock(&time::stamp(at)))]);
-                        let wide = ui.painter().layout_no_wrap(text.clone(), FontId::proportional(12.0), t.muted).size().x + 12.0;
-                        if ui.available_width() >= wide {
-                            ui.label(RichText::new(text).small().color(t.muted));
+                        let wide = ui.painter().layout_no_wrap(text.clone(), FontId::proportional(12.0), t.muted).size().x + 12.0 + gap;
+                        if ui.available_size_before_wrap().x >= wide {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add(egui::Label::new(RichText::new(text).small().color(t.muted)).extend());
+                            });
                         }
                     }
                 }
                 Tab::Notices => {
                     // The accent button when it fits, else its icon (the pane narrows the list).
-                    let label = app.tr("New notice version");
-                    let wide = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(14.0), t.on_accent).size().x + 60.0;
-                    new_notice = if ui.available_width() >= wide {
-                        widgets::primary_button(ui, t, Some(Icon::Plus), label).on_hover_text(app.tip("notice.add")).clicked()
-                    } else {
-                        widgets::icon_button(ui, t, Icon::Plus, label, true, false).clicked()
-                    };
+                    new_notice = crate::customers::header_action(ui, t, Icon::Plus, app.tr("New notice version"), &app.tip("notice.add"));
                 }
                 Tab::Audit => {
-                    if app.privacy.audit.loading() {
-                        ui.add(egui::Spinner::new().size(16.0).color(t.accent));
-                    }
+                    let loading = app.privacy.audit.loading();
                     let n = app.privacy.audit_rows.len();
-                    ui.label(RichText::new(app.language.fill("{n} entries", &[("n", &n.to_string())])).small().color(t.muted));
+                    let text = app.language.fill(if n == 1 { "1 entry" } else { "{n} entries" }, &[("n", &n.to_string())]);
+                    let spinner = if loading { 16.0 + gap } else { 0.0 };
+                    let wide = ui.painter().layout_no_wrap(text.clone(), FontId::proportional(12.0), t.muted).size().x + spinner + gap;
+                    if ui.available_size_before_wrap().x < wide {
+                        ui.end_row();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if loading {
+                            ui.add(egui::Spinner::new().size(16.0).color(t.accent));
+                        }
+                        ui.add(egui::Label::new(RichText::new(text).small().color(t.muted)).extend());
+                    });
                 }
-            });
+            }
         });
         if app.privacy.tab == Tab::Audit {
             ui.add_space(2.0);
@@ -1802,6 +1848,10 @@ fn review_list(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     if app.privacy.review.is_empty() {
         if app.derived.findings.is_empty() {
             widgets::empty_state(ui, t, Icon::ShieldCheck, app.tr("Nothing to do: the GDPR record is complete"), "");
+        } else if !app.query().is_empty() {
+            // The search hides every finding: say so, not that there is nothing to review.
+            let text = app.language.fill("No finding matches \"{query}\"", &[("query", &format::clipped(app.search.trim(), 60))]);
+            widgets::empty_state(ui, t, Icon::Search, &text, "");
         } else {
             widgets::empty_state(ui, t, Icon::Search, app.tr("Nothing here yet"), "");
         }
@@ -1993,7 +2043,9 @@ fn notices_list(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         })
         .collect();
     if rows.is_empty() {
-        widgets::empty_state(ui, t, Icon::Search, app.tr("Nothing here yet"), "");
+        // Only the search can hide every notice.
+        let text = app.language.fill("No notice matches \"{query}\"", &[("query", &format::clipped(app.search.trim(), 60))]);
+        widgets::empty_state(ui, t, Icon::Search, &text, "");
         return;
     }
     let mut picked = None;
@@ -2016,6 +2068,12 @@ fn notices_list(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         app.privacy.selected_notice = Some(id);
         app.privacy.deliver_to = None;
     }
+}
+
+/// How many customers received a notice version.
+fn received(app: &DeskApp, n: usize) -> String {
+    let text = if n == 1 { "1 customer received it" } else { "{n} customers received it" };
+    app.language.fill(text, &[("n", &n.to_string())])
 }
 
 /// A notice version: the version, its chips and title; when it applies and how many received
@@ -2058,7 +2116,7 @@ fn notice_row(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, n: &NoticeRow) -> eg
     let line = format!(
         "{} · {}",
         app.language.fill("Effective from {date}", &[("date", &format::date(&n.effective, italian))]),
-        app.language.fill("{n} customers received it", &[("n", &n.delivered.to_string())]),
+        received(app, n.delivered),
     );
     let g = widgets::truncate(&p, &line, FontId::proportional(12.5), t.muted, (right - x0).max(20.0));
     p.galley(pos2(x0, y2 - g.size().y / 2.0), g, t.muted);
@@ -2070,7 +2128,15 @@ fn notice_row(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, n: &NoticeRow) -> eg
 fn notice_pane(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, id: u64) {
     let now = app.now();
     let italian = app.italian();
-    let Some(n) = notice_of(app.data(), id) else { return };
+    let Some(n) = notice_of(app.data(), id) else {
+        // A notice just added, before a remote desk's snapshot brings it.
+        ui.add_space(40.0);
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Spinner::new().size(18.0).color(t.accent));
+            ui.label(RichText::new(app.tr("Loading…")).color(t.muted));
+        });
+        return;
+    };
     let (version, title, effective, created_by, created_at) =
         (n.version.clone(), n.title.clone(), n.effective_from.clone(), n.created_by.clone(), n.created_at.clone());
     let current = privacy::current_notice(&app.data().notices, now).map(|c| c.id) == Some(id);
@@ -2124,7 +2190,7 @@ fn notice_pane(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, id: u64) {
     ui.add_space(6.0);
     widgets::key_value(ui, t, app.tr("Effective from"), &format::long(&effective, italian));
     note(ui, &app.language.fill("Created by {who} on {date}", &[("who", &created_by), ("date", &format::long(&created_at, italian))]), t.muted);
-    note(ui, &app.language.fill("{n} customers received it", &[("n", &delivered.to_string())]), t.muted);
+    note(ui, &received(app, delivered), t.muted);
     widgets::section(ui, t, app.tr("Text"));
     let mut text_copy = None;
     {
@@ -2494,16 +2560,19 @@ fn audit_row(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, row: &AuditRow, i: us
         p.text(pos2(x + 2.0, cy), Align2::LEFT_CENTER, format!("+{hidden}"), FontId::proportional(11.5), t.muted);
     }
     if !row.detail.is_empty() {
-        let g = widgets::truncate(&p, &row.detail, FontId::proportional(12.5), t.muted, rect.right() - 12.0 - c_detail);
+        // The engine's phrase in the interface language (`erasure: {reason}`), for display only:
+        // the entry and the search keep the stored text.
+        let detail = app.language.tr_message(&row.detail);
+        let g = widgets::truncate(&p, &detail, FontId::proportional(12.5), t.muted, rect.right() - 12.0 - c_detail);
         let r = Rect::from_min_size(pos2(c_detail, cy - g.size().y / 2.0), g.size());
         p.galley(r.min, g, t.muted);
-        ui.interact(r, ui.id().with(("privacy-audit-detail", i)), Sense::hover()).on_hover_text(&row.detail);
+        ui.interact(r, ui.id().with(("privacy-audit-detail", i)), Sense::hover()).on_hover_text(detail);
     }
     open
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Language;
 
@@ -2512,6 +2581,98 @@ mod tests {
         let mut app = DeskApp::demo();
         app.language = Language::En;
         app
+    }
+
+    /// A desk seen through a mirror, like a remote desk: commands run on the desk at once and
+    /// their answers come on `pump`, the mirror catches up on `pump` unless held back (the
+    /// snapshot comes after the answer).
+    struct Mirror {
+        desk: crate::Session,
+        data: Data,
+        revision: u64,
+        hold: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl crate::DeskSession for Mirror {
+        fn data(&self) -> &Data {
+            &self.data
+        }
+        fn actor(&self) -> &str {
+            self.desk.actor()
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.desk.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.desk.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            let done = self.desk.pump();
+            if !self.hold.get() && self.revision != self.desk.revision() {
+                self.data = self.desk.data().clone();
+                self.revision = self.desk.revision();
+            }
+            done
+        }
+        fn jobs_pending(&self) -> usize {
+            0
+        }
+        fn revision(&self) -> u64 {
+            self.revision
+        }
+        fn server(&self) -> String {
+            "http://mirror.test".into()
+        }
+    }
+
+    /// A desk holding `data` behind a mirror, in English, and the switch that holds it back.
+    fn mirrored(data: Data) -> (DeskApp, std::rc::Rc<std::cell::Cell<bool>>) {
+        use crate::DeskSession;
+        let desk = crate::Session::new(remotecraft_engine::Desk::in_memory(data));
+        let hold = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mirror = Mirror { data: desk.data().clone(), revision: desk.revision(), desk, hold: hold.clone() };
+        let mut app = DeskApp::new(Box::new(mirror));
+        app.language = Language::En;
+        (app, hold)
+    }
+
+    /// The texts a frame at `w`×900 draws: each text, where it is and the clip it is drawn in
+    /// (a text not inside its clip is cut off, e.g. under the right pane).
+    pub(crate) fn texts_at(app: &mut DeskApp, w: f32) -> Vec<(String, Rect, Rect)> {
+        texts_in(app, w, 900.0)
+    }
+
+    /// The texts a frame at `w`×`h` draws (see [`texts_at`]).
+    pub(crate) fn texts_in(app: &mut DeskApp, w: f32, h: f32) -> Vec<(String, Rect, Rect)> {
+        fn walk(shape: &egui::Shape, clip: Rect, out: &mut Vec<(String, Rect, Rect)>) {
+            match shape {
+                egui::Shape::Text(s) => out.push((s.galley.text().to_string(), s.galley.rect.translate(s.pos.to_vec2()), clip)),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, clip, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(w, h))), ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+            output.textures_delta.clear();
+            out.clear();
+            for c in &output.shapes {
+                walk(&c.shape, c.clip_rect, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The drawn text equal to `text`, if any.
+    pub(crate) fn find<'a>(texts: &'a [(String, Rect, Rect)], text: &str) -> Option<&'a (String, Rect, Rect)> {
+        texts.iter().find(|(s, _, _)| s == text)
+    }
+
+    /// Whether a drawn text shows whole: inside its clip, so nothing covers or cuts it.
+    pub(crate) fn whole(entry: &(String, Rect, Rect)) -> bool {
+        entry.2.expand(0.5).contains_rect(entry.1)
     }
 
     /// Renders one frame of the app at `w`×900 (no window, no GPU).
@@ -2601,7 +2762,7 @@ mod tests {
         frame(&mut app);
         assert!(app.privacy.form.is_none(), "{}", app.privacy.error);
         assert!(app.privacy.busy.is_none());
-        assert_eq!(toast(&app), "Consent recorded (1 events)");
+        assert_eq!(toast(&app), "Consent recorded (1 event)", "one event: singular");
         assert_eq!(app.derived.gate(3).0, PurposeState::Given);
         assert!(app.derived.findings.iter().all(|f| f.customer != Some(3)), "the review settled");
     }
@@ -2933,6 +3094,152 @@ mod tests {
         assert!(outline(&it).starts_with("1. Titolare del trattamento"));
         for label in ["Purposes", "Customer", "Copied", "Close", "Remote assistance consent missing"] {
             assert_ne!(Language::It.tr(label), label, "{label} has a shared translation");
+        }
+    }
+
+    #[test]
+    fn the_first_notice_on_a_lagging_desk_stays_selected_and_no_blank_form_reopens() {
+        // A remote desk answers `notice.add` before the snapshot that holds the notice.
+        let (mut app, hold) = mirrored(Data::new());
+        app.go(Screen::Privacy);
+        app.privacy.tab = Tab::Notices;
+        frame(&mut app);
+        let Some(Form::Notice(f)) = app.privacy.form.as_mut() else { panic!("an empty Notices tab opens the form") };
+        f.version = "2026-10".into();
+        f.text = "Testo".into();
+        hold.set(true);
+        submit(&mut app);
+        assert!(app.privacy.form.is_some(), "no auto-open while the command is in flight");
+        frame(&mut app);
+        assert_eq!(toast(&app), "Notice version added");
+        assert!(app.data().notices.is_empty(), "the mirror lags");
+        assert!(app.privacy.form.is_none(), "no blank form again: {:?}", app.privacy.form);
+        let id = app.privacy.selected_notice.expect("the new notice stays selected");
+        // Frames before the snapshot, wide and narrow: the pane waits for the notice.
+        frame(&mut app);
+        frame_at(&mut app, 1000.0);
+        assert!(app.privacy.form.is_none());
+        assert_eq!(app.privacy.selected_notice, Some(id));
+        // The snapshot arrives: the notice is there, still selected.
+        hold.set(false);
+        frame(&mut app);
+        assert_eq!(app.data().notices.len(), 1);
+        assert_eq!(app.privacy.selected_notice, Some(id));
+        assert!(app.privacy.pending_notice.is_none(), "settled");
+        assert!(app.privacy.form.is_none());
+        // A snapshot that never comes: the selection goes after a while, no form opens.
+        let (mut app, hold) = mirrored(Data::new());
+        app.go(Screen::Privacy);
+        open_notice(&mut app);
+        hold.set(true);
+        submit(&mut app);
+        frame(&mut app);
+        let id = app.privacy.selected_notice.expect("selected");
+        let old = Instant::now().checked_sub(std::time::Duration::from_secs(PENDING_NOTICE_SECS + 1)).expect("a clock older than 11 s");
+        app.privacy.pending_notice = Some((id, old));
+        frame(&mut app);
+        assert!(app.privacy.pending_notice.is_none());
+        assert_eq!(app.privacy.selected_notice, None, "an unknown notice is not kept for ever");
+        assert!(app.privacy.form.is_none(), "the desk has a notice: no blank form");
+    }
+
+    #[test]
+    fn a_search_that_hides_every_finding_or_notice_says_so() {
+        let mut app = demo();
+        app.go(Screen::Privacy);
+        app.search = "zzz".into();
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(!app.derived.findings.is_empty(), "the findings are there, only hidden");
+        assert!(find(&texts, "No finding matches \"zzz\"").is_some(), "{texts:?}");
+        assert!(find(&texts, "Nothing here yet").is_none());
+        app.privacy.tab = Tab::Notices;
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(find(&texts, "No notice matches \"zzz\"").is_some(), "{texts:?}");
+        app.language = Language::It;
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(find(&texts, "Nessuna informativa corrisponde a \"zzz\"").is_some(), "{texts:?}");
+        app.privacy.tab = Tab::Review;
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(find(&texts, "Nessuna segnalazione corrisponde a \"zzz\"").is_some(), "{texts:?}");
+        // Without a search the list is back.
+        app.search.clear();
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(find(&texts, "Elio Brina").is_some());
+    }
+
+    #[test]
+    fn the_audit_detail_shows_in_the_interface_language() {
+        let mut app = demo();
+        app.language = Language::It;
+        app.run("gdpr.erase", json!({"customer": 3, "confirm": true, "reason": "richiesta"}));
+        frame(&mut app);
+        app.go(Screen::Privacy);
+        app.privacy.tab = Tab::Audit;
+        app.privacy.audit_filter.command = "gdpr".into();
+        for _ in 0..3 {
+            frame(&mut app);
+        }
+        assert_eq!(app.privacy.audit_rows.len(), 1);
+        assert_eq!(app.privacy.audit_rows.first().map(|r| r.detail.as_str()), Some("erasure: richiesta"), "stored as written");
+        // The search still matches the stored text.
+        app.search = "erasure".into();
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(find(&texts, "cancellazione: richiesta").is_some(), "{texts:?}");
+        assert!(find(&texts, "erasure: richiesta").is_none());
+        assert!(find(&texts, "1 voce").is_some(), "one entry: singular");
+        app.language = Language::En;
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(find(&texts, "erasure: richiesta").is_some());
+        assert!(find(&texts, "1 entry").is_some());
+    }
+
+    #[test]
+    fn counts_of_one_are_singular() {
+        let mut app = demo();
+        assert_eq!(received(&app, 1), "1 customer received it");
+        assert_eq!(received(&app, 0), "0 customers received it");
+        assert_eq!(received(&app, 3), "3 customers received it");
+        app.language = Language::It;
+        assert_eq!(received(&app, 1), "Ricevuta da 1 cliente");
+        assert_eq!(received(&app, 2), "Ricevuta da 2 clienti");
+        assert_eq!(Language::It.tr("Consent recorded (1 event)"), "Consenso registrato (1 evento)");
+    }
+
+    #[test]
+    fn the_tabs_stay_reachable_next_to_the_pane() {
+        for lang in Language::ALL {
+            let mut app = demo();
+            app.language = lang;
+            app.go(Screen::Privacy);
+            open_notice(&mut app);
+            let tabs: Vec<String> = ["Review", "Notices", "Audit log"].iter().map(|l| app.tr(l).to_string()).collect();
+            let action = app.tr("New notice version").to_string();
+            for w in [1240.0, 1300.0, 1440.0, 1800.0] {
+                let texts = texts_at(&mut app, w);
+                let shown: Vec<&(String, Rect, Rect)> =
+                    tabs.iter().filter_map(|tab| texts.iter().find(|(s, _, _)| s.starts_with(tab.as_str()))).collect();
+                assert_eq!(shown.len(), 3, "{lang:?} at {w}: every tab is drawn: {texts:?}");
+                for t in &shown {
+                    assert!(whole(t), "{lang:?} at {w}: {t:?} is cut off");
+                }
+                // The header's button (the form's title says the same, in the pane).
+                let buttons: Vec<&(String, Rect, Rect)> = texts.iter().filter(|(s, _, _)| *s == action).collect();
+                for b in &buttons {
+                    assert!(whole(b), "{lang:?} at {w}: {b:?} is cut off");
+                    for t in &shown {
+                        assert!(!b.1.shrink(1.0).intersects(t.1.shrink(1.0)), "{lang:?} at {w}: {b:?} over {t:?}");
+                    }
+                }
+            }
+            // Narrower, the form takes the whole width: the tabs come back when it closes.
+            for w in [1000.0, 1200.0] {
+                let texts = texts_at(&mut app, w);
+                assert!(
+                    tabs.iter().all(|tab| !texts.iter().any(|(s, _, _)| s.starts_with(tab.as_str()))),
+                    "{lang:?} at {w}: the pane replaces the list"
+                );
+                assert!(find(&texts, &action).is_some_and(whole), "{lang:?} at {w}: the form shows");
+            }
         }
     }
 }

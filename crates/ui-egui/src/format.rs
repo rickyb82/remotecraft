@@ -2,7 +2,7 @@
 //! interface. Stamps are UTC RFC 3339 (`core::time`); they are shown in the local time zone
 //! of the machine (the browser's on the web).
 
-use remotecraft_engine::core::chrono::{DateTime, Datelike, Local, Utc};
+use remotecraft_engine::core::chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Utc};
 use remotecraft_engine::core::time;
 
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -89,14 +89,52 @@ pub fn stamp_from_input(text: &str, now: DateTime<Utc>) -> Option<String> {
     time::input_stamp(text, now).ok()
 }
 
-/// The first and the day after the last of the month of `now`, as form inputs.
+/// The end of a period typed in a form (`To`, included) as the stamp the engine compares with,
+/// which is excluded: a date alone (`2026-10-31`, `31/10/2026`) counts the whole day, so it
+/// sends the start of the next day; a time (`2026-10-31 18:00`) is that moment. `None` when
+/// unreadable.
+pub fn end_stamp_from_input(text: &str, now: DateTime<Utc>) -> Option<String> {
+    let t = text.trim();
+    // The date-only forms `core::time::parse_input` reads (at local midnight).
+    for f in ["%Y-%m-%d", "%d/%m/%Y"] {
+        if let Ok(day) = NaiveDate::parse_from_str(t, f) {
+            let next = day.succ_opt()?;
+            return stamp_from_input(&next.format("%Y-%m-%d").to_string(), now);
+        }
+    }
+    stamp_from_input(t, now)
+}
+
+/// The end an excluded stamp stands for, for people: a local midnight is the end of the day
+/// before (`2026-11-01T00:00` local → `31 Oct 2026`, what `2026-10-31` was typed as); any other
+/// time is shown with its date and time. Empty when unreadable.
+pub fn end_text(stamp: &str, italian: bool) -> String {
+    let Some(t) = local(stamp) else { return String::new() };
+    if t.time() != NaiveTime::MIN {
+        return long(stamp, italian);
+    }
+    let day = t.date_naive().pred_opt().unwrap_or_else(|| t.date_naive());
+    format!("{} {} {}", day.day(), month_name(day.month(), italian), day.year())
+}
+
+/// The days of month `month` (1–12) of `year` (31 for a month out of range).
+pub fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// The first and the last day of the month `months_ago` months before `now`'s, as form inputs
+/// (the end included, as the `To` fields read it).
 pub fn month_bounds(now: DateTime<Utc>, months_ago: u32) -> (String, String) {
     let n = now.with_timezone(&Local);
     let total = i64::from(n.year()) * 12 + i64::from(n.month0()) - i64::from(months_ago);
     let (y, m0) = (total.div_euclid(12), total.rem_euclid(12));
-    let next = total + 1;
-    let (ny, nm0) = (next.div_euclid(12), next.rem_euclid(12));
-    (format!("{y:04}-{:02}-01", m0 + 1), format!("{ny:04}-{:02}-01", nm0 + 1))
+    let m = u32::try_from(m0 + 1).unwrap_or(1);
+    (format!("{y:04}-{m:02}-01"), format!("{y:04}-{m:02}-{:02}", days_in_month(y, m)))
 }
 
 /// `h:mm:ss` from a stamp to `now` (`0:00:00` when unreadable or in the future).
@@ -111,8 +149,7 @@ pub fn elapsed_short(started_at: &str, now: DateTime<Utc>) -> String {
     format!("{}:{:02}", secs / 3600, (secs / 60) % 60)
 }
 
-/// The bounds of the month of a stamp (local), as form inputs: `(first day, first day of the
-/// next month)`.
+/// The bounds of the month of a stamp (local), as form inputs: `(first day, last day)`.
 pub fn month_of(stamp: &str) -> Option<(String, String)> {
     let t = local(stamp)?;
     Some(month_bounds(t.with_timezone(&Utc), 0))
@@ -171,9 +208,10 @@ mod tests {
         assert_eq!(month_title("x", false), "x");
         assert_eq!(month_title("2026-13", false), "December 2026");
         let (from, to) = month_bounds(now, 0);
-        assert!(from.ends_with("-01") && to.ends_with("-01") && from < to, "{from} {to}");
-        let (from, _) = month_bounds(now, 1);
-        assert!(from.starts_with("2026-09"));
+        assert_eq!((from.as_str(), to.as_str()), ("2026-10-01", "2026-10-31"));
+        assert_eq!(month_bounds(now, 1), ("2026-09-01".to_string(), "2026-09-30".to_string()));
+        assert_eq!(month_bounds(now, 8), ("2026-02-01".to_string(), "2026-02-28".to_string()));
+        assert_eq!(month_bounds(now, 10), ("2025-12-01".to_string(), "2025-12-31".to_string()));
         assert_eq!(initials("Studio Tecnico Lunaria"), "SL");
         assert_eq!(initials("  "), "?");
         assert_eq!(initials("élio"), "É");
@@ -185,9 +223,34 @@ mod tests {
         assert_eq!(elapsed("2026-10-13T13:00:00Z", now), "0:00:00");
         assert_eq!(elapsed("bad", now), "0:00:00");
         assert_eq!(elapsed_short("2026-10-13T10:58:30Z", now), "1:01");
-        assert!(month_of("2026-10-13T12:00:00Z").is_some_and(|(a, b)| a.starts_with("2026-10-01") && b.starts_with("2026-11-01")));
+        assert!(month_of("2026-10-13T12:00:00Z").is_some_and(|(a, b)| a == "2026-10-01" && b == "2026-10-31"));
         assert!(month_of("x").is_none());
         assert_eq!(csv_line(&["a".into(), "b;c".into()]), "a;\"b;c\"");
         assert!(stamp_from_input("ieri", now).is_none());
+    }
+
+    #[test]
+    fn a_period_end_typed_as_a_date_counts_the_whole_day() {
+        let now = time::parse_stamp("2026-10-13T12:00:00Z").unwrap();
+        let next_day = stamp_from_input("2026-11-01", now);
+        assert!(next_day.is_some());
+        assert_eq!(end_stamp_from_input("2026-10-31", now), next_day);
+        assert_eq!(end_stamp_from_input(" 31/10/2026 ", now), next_day);
+        assert_eq!(end_stamp_from_input("2026-12-31", now), stamp_from_input("2027-01-01", now));
+        assert_eq!(end_stamp_from_input("2028-02-28", now), stamp_from_input("2028-02-29", now));
+        // A time is the moment itself.
+        assert_eq!(end_stamp_from_input("2026-10-31 18:00", now), stamp_from_input("2026-10-31 18:00", now));
+        assert_eq!(end_stamp_from_input("ieri", now), None);
+        assert_eq!(end_stamp_from_input("9999-99-99", now), None);
+        assert_eq!(end_stamp_from_input("", now), Some(time::stamp(now)), "as stamp_from_input: callers skip an empty bound");
+        // Shown back as the day it was typed as.
+        let shown = end_text(&next_day.unwrap_or_default(), false);
+        assert_eq!(shown, "31 Oct 2026");
+        assert_eq!(end_text(&end_stamp_from_input("2026-10-01", now).unwrap_or_default(), true), "1 ott 2026");
+        let evening = stamp_from_input("2026-10-31 18:00", now).unwrap_or_default();
+        assert_eq!(end_text(&evening, false), long(&evening, false));
+        assert_eq!(end_text("bad", false), "");
+        assert_eq!((days_in_month(2026, 2), days_in_month(2028, 2), days_in_month(1900, 2), days_in_month(2000, 2)), (28, 29, 28, 29));
+        assert_eq!((days_in_month(2026, 4), days_in_month(2026, 12), days_in_month(2026, 13)), (30, 31, 31));
     }
 }

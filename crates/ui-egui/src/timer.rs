@@ -3,11 +3,14 @@
 //! starts a timer on a customer or a PC, follows the running intervention while the technician
 //! types the summary and the notes, stops it with notes and times, and logs past work. A pill
 //! in the top bar ticks while one of the technician's interventions runs. Everything goes
-//! through `intervention.start`, `intervention.stop`, `intervention.add` and `privacy.consent`;
-//! the card never touches the data itself and reads the elapsed time from the desk's clock.
+//! through `intervention.start`, `intervention.stop`, `intervention.add`, `intervention.update`
+//! (the summary and Billable typed in a card that is closed) and `privacy.consent`; the card
+//! never touches the data itself and reads the elapsed time from the desk's clock. The notes
+//! typed in a closed card wait in `State::drafts` for the stop.
 
 use egui::{Align, FontId, Key, Layout, Modifiers, Rect, Response, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::{Value, json};
+use web_time::Instant;
 
 use crate::core::chrono::{DateTime, Duration, Utc};
 use crate::core::privacy::{self, PurposeState};
@@ -97,10 +100,11 @@ pub enum Intent {
     Start { customer: Option<u64>, device: Option<u64>, opened: bool },
     /// `intervention.stop {id}`.
     Stop { id: u64 },
-    /// `intervention.add` from the Log mode.
-    Log,
-    /// `privacy.consent` recorded from the refusal panel: the refused start is sent again.
-    Consent,
+    /// `intervention.add` from the Log mode, for this customer.
+    Log { customer: Option<u64> },
+    /// `privacy.consent` recorded from the refusal panel for this customer: the refused start
+    /// is sent again (when the card still targets that customer).
+    Consent { customer: u64 },
 }
 
 /// What the card is doing.
@@ -142,6 +146,9 @@ pub struct Running {
 /// reason to go ahead anyway, or a verbal consent to record first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Refusal {
+    /// The customer the refused start (or log) was for: the panel acts only while the card
+    /// still targets it.
+    pub customer: Option<u64>,
     /// `missing`, `expired` or `withdrawn`, as the engine said.
     pub state: String,
     pub reason: String,
@@ -212,6 +219,14 @@ pub struct Card {
     pub technician: String,
     /// The intervention followed in Running and Stop mode.
     pub running: Option<Running>,
+    /// The summary and Billable of the followed intervention as last known on the desk: what
+    /// the technician typed over them is saved when the card lets it go.
+    pub saved: (String, bool),
+    /// The mirror has held the followed intervention: once it no longer does, it was deleted.
+    pub seen: bool,
+    /// Since when the mirror lacks the followed intervention (a remote mirror lags behind the
+    /// answer that started it).
+    pub missing_since: Option<Instant>,
     /// The engine's warnings of the last start, translated.
     pub warnings: Vec<String>,
     pub error: String,
@@ -242,11 +257,18 @@ impl Card {
     }
 }
 
-/// This screen's own state: the card, when open.
+/// This screen's own state: the card, when open, and the notes typed for running
+/// interventions whose card was closed (appended when they stop).
 #[derive(Default)]
 pub struct State {
     pub card: Option<Card>,
+    pub drafts: std::collections::BTreeMap<u64, String>,
 }
+
+/// How long a remote mirror may lack an intervention the engine said it started.
+const MIRROR_LAG: std::time::Duration = std::time::Duration::from_secs(10);
+/// How many closed cards' notes are kept.
+const MAX_DRAFTS: usize = 64;
 
 /// What the card's buttons asked for this frame; applied once the card is written back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +306,7 @@ pub fn open_log(app: &mut DeskApp, customer: Option<u64>, device: Option<u64>) {
 }
 
 fn open_form(app: &mut DeskApp, mode: Mode, customer: Option<u64>, device: Option<u64>) {
+    release(app);
     let customer = device.and_then(|d| app.data().device(d)).map(|d| d.customer_id).or(customer);
     let target = Target { customer, device, text: String::new() };
     let mut card = Card::new(app, mode, target);
@@ -294,8 +317,21 @@ fn open_form(app: &mut DeskApp, mode: Mode, customer: Option<u64>, device: Optio
 }
 
 /// Opens the card on a running intervention of the actor: in Running mode, or straight in Stop
-/// mode with the notes focused. Nothing happens when the mirror does not hold it.
+/// mode with the notes focused. When the mirror does not hold it (a remote desk before the
+/// snapshot, or deleted elsewhere), only the card that already follows it switches mode, from
+/// its own copy; nothing happens otherwise.
 pub fn open_running(app: &mut DeskApp, id: u64, stop: bool) {
+    let same = app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id));
+    if app.data().intervention(id).is_none() {
+        if same && let Some(card) = app.timer.card.as_mut() {
+            follow_mode(card, stop);
+        }
+        return;
+    }
+    if !same {
+        // The card followed another intervention: keep what was typed in it.
+        release(app);
+    }
     let d = app.data();
     let Some(i) = d.intervention(id) else { return };
     let running = Running {
@@ -308,17 +344,26 @@ pub fn open_running(app: &mut DeskApp, id: u64, stop: bool) {
     };
     let (summary, billable) = (i.summary.clone(), i.billable);
     let target = Target { customer: Some(i.customer_id), device: i.device_id, text: String::new() };
-    let same = app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id));
     let fresh = Card::new(app, Mode::Running, target.clone());
     let mut card = app.timer.card.take().unwrap_or(fresh);
     if !same {
+        card.saved = (summary.clone(), billable);
         card.summary = summary;
-        card.notes.clear();
+        card.notes = app.timer.drafts.remove(&id).unwrap_or_default();
         card.billable = billable;
         card.warnings.clear();
     }
     card.running = Some(running);
+    card.seen = true;
+    card.missing_since = None;
     card.target = target;
+    follow_mode(&mut card, stop);
+    app.timer.card = Some(card);
+}
+
+/// Puts a card that follows a running intervention in Running mode, or in Stop mode with the
+/// end time and the minutes cleared; expanded, the notes focused.
+fn follow_mode(card: &mut Card, stop: bool) {
     card.mode = if stop { Mode::Stop } else { Mode::Running };
     if stop {
         card.ended_at.clear();
@@ -328,7 +373,6 @@ pub fn open_running(app: &mut DeskApp, id: u64, stop: bool) {
     card.error.clear();
     card.refusal = None;
     card.refocus = Some(Field::Notes);
-    app.timer.card = Some(card);
 }
 
 /// The fast path from a row: starts the timer on a PC at once (`intervention.start {device}`,
@@ -345,17 +389,28 @@ pub fn start_now(app: &mut DeskApp, device: u64) {
     );
 }
 
-/// Stops the actor's most recent running intervention right now, without notes (the `x`
-/// shortcut): `intervention.stop {id}`. Nothing happens when none runs.
+/// Stops the actor's most recent running intervention right now: `intervention.stop {id}`,
+/// with the summary, Billable and notes typed in the card that follows it (or the notes kept
+/// from its closed card). Nothing happens when none runs.
 pub fn stop_mine(app: &mut DeskApp) {
     let Some(id) = mine_running(app.data(), app.session.actor()).first().map(|m| m.0) else { return };
     let ended = time::stamp(app.now());
+    let mut params = json!({"id": id, "ended_at": ended});
+    let mut notes = app.timer.drafts.get(&id).cloned().unwrap_or_default();
     if let Some(c) = app.timer.card.as_mut()
         && c.running.as_ref().is_some_and(|r| r.id == id)
     {
         c.busy = true;
+        notes = c.notes.trim().to_string();
+        if !c.summary.trim().is_empty() {
+            params["summary"] = json!(c.summary.trim());
+        }
+        params["billable"] = json!(c.billable);
     }
-    app.run_as("intervention.stop", json!({"id": id, "ended_at": ended}), crate::Intent::Timer(Intent::Stop { id }));
+    if !notes.trim().is_empty() {
+        params["notes"] = json!(notes.trim());
+    }
+    app.run_as("intervention.stop", params, crate::Intent::Timer(Intent::Stop { id }));
 }
 
 /// Closes an open card: minimises it when expanded, closes it when minimised (Escape, like
@@ -365,13 +420,64 @@ pub fn close(app: &mut DeskApp) -> bool {
         None => false,
         Some(c) if !c.minimized => {
             c.minimized = true;
+            save_typed(app);
             true
         }
         Some(_) => {
+            release(app);
             app.timer.card = None;
             true
         }
     }
+}
+
+/// Saves the summary and Billable typed in the card over the followed running intervention's
+/// (`intervention.update`), so they survive the card and other technicians see them. An empty
+/// summary is never sent (it would wipe the stored one), like the stop does.
+fn save_typed(app: &mut DeskApp) {
+    let Some(c) = app.timer.card.as_ref() else { return };
+    if !matches!(c.mode, Mode::Running | Mode::Stop) || c.busy {
+        return;
+    }
+    let Some(id) = c.running.as_ref().map(|r| r.id) else { return };
+    if app.data().intervention(id).is_some_and(|i| !i.running()) {
+        return;
+    }
+    let summary = c.summary.trim().to_string();
+    let billable = c.billable;
+    let mut params = json!({"id": id});
+    if !summary.is_empty() && summary != c.saved.0 {
+        params["summary"] = json!(summary);
+    }
+    if billable != c.saved.1 {
+        params["billable"] = json!(billable);
+    }
+    if params.as_object().is_some_and(|o| o.len() > 1) {
+        if let Some(c) = app.timer.card.as_mut() {
+            c.saved = (if summary.is_empty() { c.saved.0.clone() } else { summary }, billable);
+        }
+        app.run("intervention.update", params);
+    }
+}
+
+/// The card lets its running intervention go (closed, or about to follow another): the
+/// summary and Billable are saved, the notes kept for the stop (`x`, or the card reopened).
+fn release(app: &mut DeskApp) {
+    save_typed(app);
+    let Some(c) = app.timer.card.as_ref() else { return };
+    if !matches!(c.mode, Mode::Running | Mode::Stop) || c.busy {
+        return;
+    }
+    let Some(id) = c.running.as_ref().map(|r| r.id) else { return };
+    let notes = c.notes.trim().to_string();
+    if notes.is_empty() {
+        app.timer.drafts.remove(&id);
+        return;
+    }
+    if !app.timer.drafts.contains_key(&id) && app.timer.drafts.len() >= MAX_DRAFTS {
+        app.timer.drafts.pop_first();
+    }
+    app.timer.drafts.insert(id, notes);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -473,8 +579,22 @@ fn set_error(app: &mut DeskApp, text: String) {
     }
 }
 
+/// Whether the refusal panel was answered for another customer than the card now targets (the
+/// target changed after the refusal): the panel is dropped instead of acting on it.
+fn stale_refusal(app: &mut DeskApp) -> bool {
+    let Some(c) = app.timer.card.as_mut() else { return false };
+    let stale = c.refusal.as_ref().is_some_and(|r| r.customer != c.target.customer);
+    if stale {
+        c.refusal = None;
+    }
+    stale
+}
+
 /// Sends `intervention.start` from the card; `anyway` adds the refusal panel's reason.
 fn submit_start(app: &mut DeskApp, anyway: bool) {
+    if anyway && stale_refusal(app) {
+        return;
+    }
     let Some(c) = app.timer.card.clone() else { return };
     let Some(mut params) = target_params(&c) else {
         set_error(app, app.tr("Choose a customer or a PC").to_string());
@@ -532,6 +652,9 @@ fn submit_stop(app: &mut DeskApp) {
 
 /// Sends `intervention.add` from the Log mode; `anyway` adds the refusal panel's reason.
 fn submit_log(app: &mut DeskApp, anyway: bool) {
+    if anyway && stale_refusal(app) {
+        return;
+    }
     let Some(c) = app.timer.card.clone() else { return };
     let Some(mut params) = target_params(&c) else {
         set_error(app, app.tr("Choose a customer or a PC").to_string());
@@ -585,12 +708,16 @@ fn submit_log(app: &mut DeskApp, anyway: bool) {
         card.busy = true;
         card.error.clear();
     }
-    app.run_as("intervention.add", params, crate::Intent::Timer(Intent::Log));
+    let customer = c.target.customer;
+    app.run_as("intervention.add", params, crate::Intent::Timer(Intent::Log { customer }));
 }
 
 /// Records the verbal consent typed in the refusal panel (`privacy.consent`); the refused
 /// start or log is sent again when it succeeds.
 fn submit_consent(app: &mut DeskApp) {
+    if stale_refusal(app) {
+        return;
+    }
     let Some(c) = app.timer.card.clone() else { return };
     let (Some(r), Some(customer)) = (c.refusal, c.target.customer) else { return };
     if r.signer.trim().is_empty() {
@@ -606,7 +733,7 @@ fn submit_consent(app: &mut DeskApp) {
             r.error.clear();
         }
     }
-    app.run_as("privacy.consent", params, crate::Intent::Timer(Intent::Consent));
+    app.run_as("privacy.consent", params, crate::Intent::Timer(Intent::Consent { customer }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -622,20 +749,23 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
             Ok(v) => started(app, v, opened),
             Err(e) => refused(app, &e.to_string(), customer, device, Mode::Start),
         },
-        Intent::Log => match &c.result {
+        Intent::Log { customer } => match &c.result {
             Ok(v) => {
                 app.timer.card = None;
                 app.selected_intervention = v["intervention"]["id"].as_u64();
                 app.toast(app.tr("Intervention saved").to_string());
             }
-            Err(e) => refused(app, &e.to_string(), None, None, Mode::Log),
+            Err(e) => refused(app, &e.to_string(), customer, None, Mode::Log),
         },
         Intent::Stop { id } => match &c.result {
             Ok(v) => {
                 let i = &v["intervention"];
                 let duration = format::duration(i["minutes"].as_u64().unwrap_or(0));
                 let customer = i["customer_name"].as_str().unwrap_or_default().to_string();
-                app.timer.card = None;
+                if app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id)) {
+                    app.timer.card = None;
+                }
+                app.timer.drafts.remove(&id);
                 app.selected_intervention = Some(id);
                 app.toast(app.language.fill("Stopped · {duration} · {customer}", &[("duration", &duration), ("customer", &customer)]));
             }
@@ -643,22 +773,26 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
                 // Closed by someone else meanwhile: the status bar has the message.
                 let m = e.to_string();
                 if m.contains("already closed") || m.starts_with("no intervention") {
-                    app.timer.card = None;
+                    if app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id == id)) {
+                        app.timer.card = None;
+                    }
+                    app.timer.drafts.remove(&id);
                 } else {
                     set_error(app, app.language.tr_message(&m));
                 }
             }
         },
-        Intent::Consent => match &c.result {
+        Intent::Consent { customer } => match &c.result {
             Ok(_) => {
-                let mode = app.timer.card.as_mut().map(|card| {
+                // Sent again only while the card still targets the customer who agreed.
+                let mode = app.timer.card.as_mut().filter(|card| card.target.customer == Some(customer)).map(|card| {
                     card.refusal = None;
                     card.mode
                 });
                 match mode {
                     Some(Mode::Log) => submit_log(app, false),
-                    Some(_) => submit_start(app, false),
-                    None => {}
+                    Some(Mode::Start) => submit_start(app, false),
+                    _ => {}
                 }
             }
             Err(e) => {
@@ -689,6 +823,10 @@ fn started(app: &mut DeskApp, v: &Value, opened: bool) {
         app.requests.push(Request::OpenUrl(uri.to_string()));
     }
     let target = Target { customer: Some(running.customer_id), device: running.device_id, text: String::new() };
+    if app.timer.card.as_ref().is_some_and(|c| c.running.as_ref().is_some_and(|r| r.id != running.id)) {
+        // The card followed another intervention: keep what was typed in it.
+        release(app);
+    }
     let fresh = Card::new(app, Mode::Running, target.clone());
     let mut card = app.timer.card.take().unwrap_or(fresh);
     card.mode = Mode::Running;
@@ -696,6 +834,9 @@ fn started(app: &mut DeskApp, v: &Value, opened: bool) {
     card.summary = text("summary");
     card.notes.clear();
     card.billable = i["billable"].as_bool().unwrap_or(true);
+    card.saved = (card.summary.clone(), card.billable);
+    card.seen = app.data().intervention(running.id).is_some();
+    card.missing_since = None;
     card.running = Some(running);
     card.warnings = warnings;
     card.error.clear();
@@ -706,12 +847,17 @@ fn started(app: &mut DeskApp, v: &Value, opened: bool) {
     app.toast(app.tr("Timer started").to_string());
 }
 
-/// A start or a log failed: the consent refusal panel, or the message under the form. The
-/// card opens when it was not (the fast path from a row), so the technician sees why.
+/// A start or a log failed: the consent refusal panel, or the message under the form. A card
+/// opens on the refused target when none shows it (the fast path from a row, or a card busy
+/// with another intervention or customer), so the technician sees why.
 fn refused(app: &mut DeskApp, message: &str, customer: Option<u64>, device: Option<u64>, mode: Mode) {
-    if app.timer.card.is_none() {
-        let customer = device.and_then(|d| app.data().device(d)).map(|d| d.customer_id).or(customer);
-        let card = Card::new(app, mode, Target { customer, device, text: String::new() });
+    let customer = device.and_then(|d| app.data().device(d)).map(|d| d.customer_id).or(customer);
+    let shown = app.timer.card.as_ref().is_some_and(|c| matches!(c.mode, Mode::Start | Mode::Log) && c.target.customer == customer);
+    if !shown {
+        release(app);
+        let offset = app.timer.card.as_ref().map(|c| c.offset).unwrap_or_default();
+        let mut card = Card::new(app, mode, Target { customer, device, text: String::new() });
+        card.offset = offset;
         app.timer.card = Some(card);
     }
     let consent = message.contains("remote_assistance consent is");
@@ -720,7 +866,7 @@ fn refused(app: &mut DeskApp, message: &str, customer: Option<u64>, device: Opti
     card.minimized = false;
     if consent {
         card.error.clear();
-        card.refusal = Some(Refusal { state: refused_state(message), ..Refusal::default() });
+        card.refusal = Some(Refusal { customer, state: refused_state(message), ..Refusal::default() });
         card.refocus = Some(Field::Reason);
     } else {
         card.error = translated;
@@ -728,22 +874,43 @@ fn refused(app: &mut DeskApp, message: &str, customer: Option<u64>, device: Opti
 }
 
 /// Drops a card that follows an intervention the desk no longer runs (stopped from the CLI,
-/// another technician, deleted).
+/// another technician, deleted), and the notes kept for interventions no longer running. A
+/// remote mirror may lag behind the answer that started an intervention: there it is gone once
+/// the mirror held it and no longer does, or after [`MIRROR_LAG`] without it while the server
+/// answers.
 fn sync(app: &mut DeskApp) {
-    let Some(c) = app.timer.card.as_ref() else { return };
-    if !matches!(c.mode, Mode::Running | Mode::Stop) || c.busy {
-        return;
+    let local = app.session.server().is_empty();
+    let answering = app.session.problem().is_none();
+    if !app.timer.drafts.is_empty() {
+        let d = app.session.data();
+        app.timer.drafts.retain(|id, _| match d.intervention(*id) {
+            Some(i) => i.running(),
+            None => !local,
+        });
     }
-    let gone = match c.running.as_ref() {
+    let followed = match app.timer.card.as_ref() {
+        Some(c) if matches!(c.mode, Mode::Running | Mode::Stop) && !c.busy => c.running.as_ref().map(|r| r.id),
+        _ => return,
+    };
+    let held = followed.map(|id| app.data().intervention(id).map(|i| i.running()));
+    let Some(c) = app.timer.card.as_mut() else { return };
+    let gone = match held {
         None => true,
-        Some(r) => match app.data().intervention(r.id) {
-            Some(i) => !i.running(),
-            // A remote mirror may lag behind the answer; a local desk cannot.
-            None => app.session.server().is_empty(),
-        },
+        Some(Some(running)) => {
+            c.seen = true;
+            c.missing_since = None;
+            !running
+        }
+        Some(None) => {
+            let since = *c.missing_since.get_or_insert_with(Instant::now);
+            local || c.seen || (answering && since.elapsed() > MIRROR_LAG)
+        }
     };
     if gone {
         app.timer.card = None;
+        if let Some(id) = followed {
+            app.timer.drafts.remove(&id);
+        }
     }
 }
 
@@ -820,6 +987,7 @@ pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         acts.push(Action::Submit);
     }
     let now = app.now();
+    let was_minimized = c.minimized;
     let app_ref: &DeskApp = app;
     egui::Area::new(egui::Id::new("work-card")).anchor(egui::Align2::RIGHT_BOTTOM, home).order(egui::Order::Middle).fade_in(false).show(&ctx, |ui| {
         egui::Frame::NONE
@@ -839,7 +1007,12 @@ pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                 });
             });
     });
+    let minimized = c.minimized && !was_minimized;
     app.timer.card = Some(c);
+    if minimized {
+        // Minimised from the title bar: what was typed reaches the desk, like with Escape.
+        save_typed(app);
+    }
     for a in acts {
         apply(app, a);
     }
@@ -872,9 +1045,15 @@ fn apply(app: &mut DeskApp, action: Action) {
                     c.error.clear();
                 }
             }
-            _ => app.timer.card = None,
+            _ => {
+                release(app);
+                app.timer.card = None;
+            }
         },
-        Action::Close => app.timer.card = None,
+        Action::Close => {
+            release(app);
+            app.timer.card = None;
+        }
         Action::Stop(id) => open_running(app, id, true),
         Action::Follow(id) => open_running(app, id, false),
         Action::Connect(device) => app.connect(device),
@@ -1151,11 +1330,19 @@ fn target_section(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card) {
         let (rect, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
         ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, t.ui_text);
         if icon_button(ui, t, Icon::Close, app.tr("Change"), true, false).clicked() {
-            c.target = Target::default();
+            retarget(c, Target::default());
             c.refocus = Some(Field::Target);
         }
     });
     hairline(ui, t);
+}
+
+/// Points the card at another target: the refusal panel and the error belonged to the old one
+/// (a consent recorded from that panel would go to the new customer).
+fn retarget(c: &mut Card, target: Target) {
+    c.target = target;
+    c.refusal = None;
+    c.error.clear();
 }
 
 /// The target picker: a text box filtering the PCs and the customers of the mirror (a
@@ -1211,7 +1398,7 @@ fn picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &mut Card) {
         }
     });
     if let Some((customer, device)) = pick {
-        c.target = Target { customer: Some(customer), device, text: String::new() };
+        retarget(c, Target { customer: Some(customer), device, text: String::new() });
         if !c.kind_touched {
             c.kind = kind_default(d, &c.target).to_string();
         }
@@ -1660,6 +1847,272 @@ mod tests {
         assert!(app.timer.card.is_none());
         assert!(app.data().intervention(12).is_some_and(|i| !i.running()));
         assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("Stopped")));
+    }
+
+    /// A desk seen through a mirror, like a remote desk: commands run on the desk at once, the
+    /// mirror catches up on `pump` unless held back (the snapshot has not arrived yet).
+    struct Mirror {
+        desk: crate::Session,
+        data: Data,
+        revision: u64,
+        hold: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl crate::DeskSession for Mirror {
+        fn data(&self) -> &Data {
+            &self.data
+        }
+        fn actor(&self) -> &str {
+            self.desk.actor()
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.desk.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.desk.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            let done = self.desk.pump();
+            if !self.hold.get() && self.revision != self.desk.revision() {
+                self.data = self.desk.data().clone();
+                self.revision = self.desk.revision();
+            }
+            done
+        }
+        fn jobs_pending(&self) -> usize {
+            0
+        }
+        fn revision(&self) -> u64 {
+            self.revision
+        }
+        fn server(&self) -> String {
+            "http://mirror.test".into()
+        }
+    }
+
+    /// The demo desk behind a mirror, in English, and the switch that holds the mirror back.
+    fn mirrored() -> (DeskApp, std::rc::Rc<std::cell::Cell<bool>>) {
+        use crate::DeskSession;
+        let desk = crate::Session::demo();
+        let hold = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mirror = Mirror { data: desk.data().clone(), revision: desk.revision(), desk, hold: hold.clone() };
+        let mut app = DeskApp::new(Box::new(mirror));
+        app.language = Language::En;
+        (app, hold)
+    }
+
+    /// One frame on a context that lives across frames (the focus), with these input events.
+    fn frame_in(ctx: &egui::Context, app: &mut DeskApp, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+    }
+
+    pub(crate) fn ctrl_enter() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers { ctrl: true, command: true, ..Modifiers::NONE },
+        }
+    }
+
+    #[test]
+    fn on_a_lagging_mirror_stop_works_before_the_snapshot() {
+        let (mut app, hold) = mirrored();
+        hold.set(true);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        assert_eq!(card(&app).running.as_ref().map(|r| r.id), Some(11));
+        assert!(app.data().intervention(11).is_none(), "the snapshot has not arrived");
+        frame(&mut app);
+        assert!(app.timer.card.is_some(), "a lagging mirror does not close the card");
+        // Stop (the button, or Ctrl+Enter in Running mode) goes to Stop mode from the card's copy.
+        apply(&mut app, Action::Stop(11));
+        assert_eq!(card(&app).mode, Mode::Stop);
+        apply(&mut app, Action::Cancel);
+        apply(&mut app, Action::Submit);
+        assert_eq!(card(&app).mode, Mode::Stop);
+        edit(&mut app, |c| c.notes = "Fatto".into());
+        submit_stop(&mut app);
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "stopped");
+        hold.set(false);
+        frame(&mut app);
+        assert!(app.data().intervention(11).is_some_and(|i| !i.running() && i.notes.contains("Fatto")));
+        // Nothing to switch when no card follows it.
+        open_running(&mut app, 99, true);
+        assert!(app.timer.card.is_none());
+    }
+
+    #[test]
+    fn a_running_card_closes_when_its_intervention_is_deleted_elsewhere() {
+        // The mirror held it, then a snapshot without it arrives: deleted, the card closes.
+        let (mut app, _hold) = mirrored();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        frame(&mut app);
+        assert!(card(&app).seen);
+        app.session.execute("intervention.remove", &json!({"id": 11}));
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "deleted elsewhere");
+        // Never seen in the mirror (deleted before any snapshot held it): closed after the lag.
+        let (mut app, hold) = mirrored();
+        hold.set(true);
+        start_now(&mut app, 4);
+        frame(&mut app);
+        app.session.execute("intervention.remove", &json!({"id": 11}));
+        hold.set(false);
+        frame(&mut app);
+        assert!(app.timer.card.is_some(), "may still be lag");
+        assert!(card(&app).missing_since.is_some());
+        let past = Instant::now().checked_sub(MIRROR_LAG + std::time::Duration::from_secs(1)).expect("an instant in the past");
+        edit(&mut app, |c| c.missing_since = Some(past));
+        frame(&mut app);
+        assert!(app.timer.card.is_none(), "missing for longer than the lag");
+        // The local desk cannot lag: closed at once (and the record is present meanwhile).
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        app.run("intervention.remove", json!({"id": 11}));
+        frame(&mut app);
+        assert!(app.timer.card.is_none());
+    }
+
+    #[test]
+    fn closing_the_running_card_keeps_what_was_typed() {
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        edit(&mut app, |c| {
+            c.summary = "Stampante bloccata".into();
+            c.notes = "Driver reinstallato".into();
+            c.billable = false;
+        });
+        // Escape minimises: the summary and Billable reach the desk.
+        assert!(close(&mut app));
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("running");
+        assert_eq!((i.summary.as_str(), i.billable), ("Stampante bloccata", false));
+        assert!(i.notes.is_empty(), "the notes wait for the stop");
+        // Escape again closes: the notes are kept for the stop.
+        assert!(close(&mut app));
+        assert!(app.timer.card.is_none());
+        assert_eq!(app.timer.drafts.get(&11).map(String::as_str), Some("Driver reinstallato"));
+        // Reopened from the chip: the stored summary and the kept notes.
+        open_running(&mut app, 11, false);
+        assert_eq!(card(&app).summary, "Stampante bloccata");
+        assert_eq!(card(&app).notes, "Driver reinstallato");
+        assert!(app.timer.drafts.is_empty());
+        // The close button, after typing more; an emptied summary is never sent.
+        edit(&mut app, |c| {
+            c.summary.clear();
+            c.notes.push_str(" e testato");
+        });
+        apply(&mut app, Action::Close);
+        frame(&mut app);
+        assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some("Stampante bloccata"));
+        // Another form replacing the card keeps them too.
+        open_running(&mut app, 11, false);
+        edit(&mut app, |c| c.summary = "Stampante sbloccata".into());
+        open_log(&mut app, Some(1), None);
+        frame(&mut app);
+        assert_eq!(app.data().intervention(11).map(|i| i.summary.as_str()), Some("Stampante sbloccata"));
+        assert_eq!(app.timer.drafts.get(&11).map(String::as_str), Some("Driver reinstallato e testato"));
+        // Stopped with `x`: the kept notes go with it, and are forgotten.
+        app.timer.card = None;
+        stop_mine(&mut app);
+        frame(&mut app);
+        let i = app.data().intervention(11).expect("stopped");
+        assert!(!i.running());
+        assert!(i.notes.contains("Driver reinstallato e testato"), "{}", i.notes);
+        assert!(app.timer.drafts.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_acts_only_for_its_own_customer() {
+        // Elio Brina (3) has no remote-assistance consent; Lunaria (1, PC 1) has.
+        let mut app = demo_en();
+        let consents = |app: &DeskApp, customer: u64| {
+            app.data().privacy.iter().filter(|e| e.customer_id == customer && e.purpose == "remote_assistance").count()
+        };
+        start_now(&mut app, 5);
+        frame(&mut app);
+        assert_eq!(card(&app).refusal.as_ref().map(|r| r.customer), Some(Some(3)));
+        // Change the target (the Change button, the picker): the panel goes.
+        edit(&mut app, |c| retarget(c, Target { customer: Some(1), device: Some(1), text: String::new() }));
+        assert!(card(&app).refusal.is_none());
+        assert!(card(&app).error.is_empty());
+        // A panel left over from another customer never records a consent for this one.
+        let before = consents(&app, 1);
+        edit(&mut app, |c| {
+            c.refusal = Some(Refusal {
+                customer: Some(3),
+                state: "missing".into(),
+                reason: "agreed on the phone".into(),
+                record: true,
+                signer: "Elio Brina".into(),
+                ..Refusal::default()
+            });
+        });
+        submit_consent(&mut app);
+        frame(&mut app);
+        assert_eq!(consents(&app, 1), before, "no consent for the wrong customer");
+        assert!(card(&app).refusal.is_none(), "the stale panel is dropped");
+        assert!(app.data().intervention(11).is_none());
+        // Nor starts anyway with its reason.
+        edit(&mut app, |c| c.refusal = Some(Refusal { customer: Some(3), reason: "agreed".into(), ..Refusal::default() }));
+        submit_start(&mut app, true);
+        frame(&mut app);
+        assert!(app.data().intervention(11).is_none());
+        assert!(card(&app).refusal.is_none());
+        // A consent answered after the target changed is not followed by a start elsewhere.
+        let mut app = demo_en();
+        start_now(&mut app, 5);
+        frame(&mut app);
+        edit_refusal(&mut app, |r| {
+            r.record = true;
+            r.signer = "Elio Brina".into();
+        });
+        let before = consents(&app, 3);
+        submit_consent(&mut app);
+        edit(&mut app, |c| retarget(c, Target { customer: Some(1), device: Some(1), text: String::new() }));
+        frame(&mut app);
+        assert_eq!(consents(&app, 3), before + 1, "the consent the technician asked for is recorded");
+        assert!(app.data().intervention(11).is_none(), "no start re-sent for the new target");
+        // A row's start refused while the card follows a running intervention opens its own card.
+        let mut app = demo_en();
+        start_now(&mut app, 4);
+        frame(&mut app);
+        start_now(&mut app, 5);
+        frame(&mut app);
+        let c = card(&app);
+        assert_eq!((c.mode, c.target.customer), (Mode::Start, Some(3)));
+        assert_eq!(c.refusal.as_ref().map(|r| r.customer), Some(Some(3)));
+    }
+
+    #[test]
+    fn ctrl_enter_in_the_card_never_saves_a_privacy_form() {
+        let mut app = demo_en();
+        let ctx = egui::Context::default();
+        app.go(Screen::Customers);
+        app.selected_customer = Some(1);
+        crate::privacy::open_delivery(&mut app, 1, None);
+        start_now(&mut app, 4);
+        frame_in(&ctx, &mut app, Vec::new());
+        frame_in(&ctx, &mut app, Vec::new());
+        assert!(crate::privacy::form_customer(&app).is_some(), "the delivery form is open");
+        assert_eq!(ctx.memory(|m| m.focused()), Some(Field::Summary.id()), "the card's summary has the focus");
+        let events = app.data().privacy.len();
+        frame_in(&ctx, &mut app, vec![ctrl_enter()]);
+        assert_eq!(app.data().privacy.len(), events, "no notice delivery recorded");
+        assert!(crate::privacy::form_customer(&app).is_some(), "the form stays open");
+        assert_eq!(card(&app).mode, Mode::Stop, "the card got the shortcut");
     }
 
     #[test]

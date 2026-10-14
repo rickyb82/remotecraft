@@ -185,8 +185,8 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "update_intervention",
             command: "intervention.update",
-            description: "Correct an intervention: times, minutes, notes (replaced), kind, device, billable.",
-            properties: json!({"id": id, "kind": kind, "summary": text, "notes": text, "reference": text, "started_at": when("Start"), "ended_at": when("End"), "minutes": {"type": "integer", "minimum": 0}, "billable": flag, "technician": text, "device": device}),
+            description: "Correct an intervention: times, minutes, notes (replaced), kind, device, billable. Making it remote work, or moving remote work to another PC, needs the customer's remote_assistance consent like log_intervention: when it refuses, ask the person; only with a reason from them retry with consent_override.",
+            properties: json!({"id": id, "kind": kind, "summary": text, "notes": text, "reference": text, "started_at": when("Start"), "ended_at": when("End"), "minutes": {"type": "integer", "minimum": 0}, "billable": flag, "technician": text, "device": device, "consent_override": {"type": "string", "description": "Only when it becomes remote work (or moves to another PC) and the person says the customer agreed another way: the reason, kept and audited"}}),
             required: &["id"],
         },
         Tool {

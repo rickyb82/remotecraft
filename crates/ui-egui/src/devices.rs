@@ -27,6 +27,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Edit PC", "Modifica PC"),
     ("PC saved", "PC salvato"),
     ("Customer: {name}", "Cliente: {name}"),
+    ("1 device", "1 PC"),
     ("Show retired", "Mostra dismessi"),
     ("Unattended only", "Solo non presidiati"),
     ("No PCs yet", "Ancora nessun PC"),
@@ -189,8 +190,9 @@ pub struct State {
 
 /// The height of a row (two lines).
 const ROW_H: f32 = 48.0;
-/// Below this window width the pane replaces the list.
-const NARROW: f32 = 980.0;
+/// Below this window width the pane replaces the list: the navigation (235 px), the pane (520)
+/// and a list wide enough to read (about 480).
+const NARROW: f32 = 1240.0;
 /// The least width of the form's label column (the two grids line up).
 const LABEL_W: f32 = 124.0;
 /// The width the four hover actions cover at a row's right end.
@@ -573,7 +575,7 @@ fn header(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             if !query.is_empty() {
                 ui.label(RichText::new(format!("· \"{}\"", format::clipped(query, 40))).color(t.muted));
             }
-            ui.label(RichText::new(app.language.fill("{n} devices", &[("n", &count.to_string())])).small().color(t.muted));
+            ui.label(RichText::new(count_text(app, count)).small().color(t.muted));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if widgets::primary_button(ui, t, Some(Icon::Plus), app.tr("New PC")).on_hover_text(app.tip("device.add")).clicked() {
                     new(app);
@@ -597,6 +599,12 @@ fn header(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             }
         });
     });
+}
+
+/// The number of PCs listed, singular for one.
+fn count_text(app: &DeskApp, count: usize) -> String {
+    let pattern = if count == 1 { "1 device" } else { "{n} devices" };
+    app.language.fill(pattern, &[("n", &count.to_string())])
 }
 
 /// A filter chip that toggles: accent with a check when on, outlined when off.
@@ -925,14 +933,21 @@ fn move_device(app: &mut DeskApp, id: u64, customer: u64) {
     }
 }
 
-/// Sends the form: `device.add`, or `device.update` with every field (and the customer only
-/// when it changed).
+/// The RustDesk ID the form would save differs from the edited PC's (always for a new PC): only
+/// then is it sent and checked against the other PCs. An unchanged ID is the PC's own, even
+/// when another PC in service has it too (the old PC retired, the ID reused).
+fn rustdesk_changed(data: &Data, f: &Form) -> bool {
+    let stored = f.id.and_then(|id| data.device(id)).map(|d| d.rustdesk_id.as_str());
+    stored.is_none_or(|stored| !rustdesk::normalize(f.rustdesk_id.trim()).is_ok_and(|r| r == stored))
+}
+
+/// Sends the form: `device.add`, or `device.update` with every field (the RustDesk ID only when
+/// it changed, the customer only when it changed).
 fn submit(app: &mut DeskApp) {
     let Some(f) = app.devices.form.clone() else { return };
     let Some(customer) = f.customer.id else { return };
     let mut params = json!({
         "name": f.name.trim(),
-        "rustdesk_id": f.rustdesk_id.trim(),
         "hostname": f.hostname.trim(),
         "os": f.os.trim(),
         "serial": f.serial.trim(),
@@ -941,6 +956,9 @@ fn submit(app: &mut DeskApp) {
         "unattended": f.unattended,
         "notes": f.notes,
     });
+    if rustdesk_changed(app.data(), &f) {
+        params["rustdesk_id"] = json!(f.rustdesk_id.trim());
+    }
     let command = match f.id {
         Some(id) => {
             params["device"] = json!(id);
@@ -1022,7 +1040,8 @@ pub fn form_ui(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             widgets::field(ui, t, app.tr("Name"), &mut f.name, app.tr("PC reception, Notebook Anna…"));
             widgets::field(ui, t, app.tr("RustDesk ID"), &mut f.rustdesk_id, app.tr("As shown in the RustDesk window"));
             let rid = rustdesk::normalize(&f.rustdesk_id);
-            let dup = rid.as_ref().ok().and_then(|r| duplicate(app.data(), r, f.id));
+            // Only a new or changed ID is checked (and sent): the PC keeps its own.
+            let dup = rid.as_ref().ok().filter(|_| rustdesk_changed(app.data(), &f)).and_then(|r| duplicate(app.data(), r, f.id));
             match (&rid, &dup) {
                 (Err(_), _) => {
                     ui.label("");
@@ -1681,5 +1700,100 @@ mod tests {
         app.devices.customer = Some(999);
         frame(&mut app);
         assert!(app.devices.rows.is_empty());
+    }
+
+    #[test]
+    fn a_pc_keeps_its_own_rustdesk_id_when_another_pc_in_service_has_it() {
+        let mut app = app();
+        // The PC segreteria (1, 100 200 300) is retired and its ID goes to a new PC.
+        app.run("device.retire", json!({"device": 1, "retired": true}));
+        frame(&mut app);
+        app.run("device.add", json!({"customer": 1, "name": "PC segreteria nuovo", "rustdesk_id": "100200300"}));
+        frame(&mut app);
+        let new_pc = app.data().devices.iter().find(|d| d.name == "PC segreteria nuovo").map(|d| d.id).expect("added");
+        // The retired PC is edited with its ID unchanged: nothing to check, nothing refused.
+        open_edit(&mut app, 1);
+        let f = app.devices.form.as_mut().expect("the form");
+        f.notes = "In magazzino".into();
+        let f = f.clone();
+        assert!(!rustdesk_changed(app.data(), &f));
+        frame(&mut app);
+        submit(&mut app);
+        frame(&mut app);
+        assert!(app.devices.form.is_none(), "saved: {:?}", app.devices.form.as_ref().map(|f| f.error.clone()));
+        let d = app.data().device(1).expect("there");
+        assert_eq!((d.notes.as_str(), d.rustdesk_id.as_str(), d.retired), ("In magazzino", "100200300", true));
+        // A changed ID is still checked against the PCs in service.
+        open_edit(&mut app, 1);
+        if let Some(f) = app.devices.form.as_mut() {
+            f.rustdesk_id = "100 200 301".into();
+        }
+        let f = app.devices.form.clone().expect("the form");
+        assert!(rustdesk_changed(app.data(), &f));
+        assert_eq!(duplicate(app.data(), "100200301", f.id).map(|d| d.0), Some(2));
+        assert!(close(&mut app));
+        // Back in service it would share the ID with the new PC: refused, said in the status bar.
+        app.toast = None;
+        put_back(&mut app, 1);
+        frame(&mut app);
+        assert!(app.data().device(1).is_some_and(|d| d.retired), "still retired");
+        assert!(!app.status.is_empty());
+        assert_ne!(toast(&app), app.tr("Device back in service"));
+        // The new PC keeps its ID too.
+        open_edit(&mut app, new_pc);
+        if let Some(f) = app.devices.form.as_mut() {
+            f.location = "Reception".into();
+        }
+        submit(&mut app);
+        frame(&mut app);
+        assert!(app.devices.form.is_none());
+        assert!(app.data().device(new_pc).is_some_and(|d| d.location == "Reception" && d.rustdesk_id == "100200300"));
+        // A new PC is always checked.
+        open_new(&mut app, Some(1), "100 200 300");
+        let f = app.devices.form.clone().expect("the form");
+        assert!(rustdesk_changed(app.data(), &f));
+    }
+
+    /// The texts painted in one frame of the app at `w`×`h`.
+    fn texts_at(app: &mut DeskApp, w: f32, h: f32) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(w, h))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        let mut out = Vec::new();
+        for c in &output.shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_pane_replaces_the_list_until_both_fit() {
+        let mut app = app();
+        app.selected_device = Some(1);
+        let new_pc = app.tr("New PC").to_string();
+        assert!(texts_at(&mut app, 1440.0, 900.0).contains(&new_pc), "wide: the list next to the card");
+        assert!(!texts_at(&mut app, 1100.0, 900.0).contains(&new_pc), "the list would be squeezed under the card: the card alone");
+        app.selected_device = None;
+        assert!(texts_at(&mut app, 1100.0, 900.0).contains(&new_pc), "nothing open: the list");
+    }
+
+    #[test]
+    fn the_count_says_one_pc() {
+        let mut app = app();
+        app.language = Language::En;
+        assert_eq!(count_text(&app, 1), "1 device");
+        assert_eq!(count_text(&app, 5), "5 devices");
+        app.language = Language::It;
+        assert_eq!(count_text(&app, 1), "1 PC");
+        app.devices.customer = Some(2);
+        assert!(texts_at(&mut app, 1440.0, 900.0).contains(&"1 PC".to_string()));
     }
 }

@@ -43,3 +43,14 @@
   all-in-one container with RustDesk Server OSS 1.1.16.
 - 2026-10-14: the graphical interface (egui, web and desktop), `DeskSession`, `RemoteDesk`,
   `GET /api/snapshot`, the web app served by the container.
+- 2026-10-14: adversarial review of the interface, the remote session and the server; 37
+  confirmed defects fixed, each with a regression test. Among them: static files confined to
+  their directory (no encoded absolute paths, symlinks or special files; size cap), revisions
+  unique per process, the snapshot naming the desk's actor, `rustdesk.check` probing off the
+  UI thread and in parallel, the desktop picking up changes from MCP/CLI, `RemoteDesk` with a
+  monotonic clock, a poll timeout and problem classes, consent checks when an intervention
+  becomes remote (`intervention.update` with `consent_override`), put-backs that would
+  duplicate a RustDesk ID refused, Ctrl+Enter saving a form only from its own fields, the
+  running card saving its summary when closed, inclusive report periods, singular counts,
+  narrow layouts from 1240 px, dark-theme contrast, and `views::review` grouped by customer
+  (one pass instead of customers × records).

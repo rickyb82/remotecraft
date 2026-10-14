@@ -83,12 +83,11 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Missing: {items}", "Manca: {items}"),
     ("Appearance", "Aspetto"),
     ("Theme", "Tema"),
-    ("Focus the search", "Vai alla ricerca"),
-    ("Close the form, deselect, or leave Settings", "Chiude il modulo, deseleziona o esce dalle Impostazioni"),
-    ("Next / previous row", "Riga successiva / precedente"),
-    ("New customer, PC, intervention or notice", "Nuovo cliente, PC, intervento o informativa"),
     ("Outside text fields; Escape leaves a field", "Fuori dai campi di testo; Esc esce da un campo"),
     ("Version {version}", "Versione {version}"),
+    ("1 customer", "1 cliente"),
+    ("1 device", "1 PC"),
+    ("1 intervention", "1 intervento"),
     ("Server: {url}", "Server: {url}"),
     ("This computer", "Questo computer"),
     ("Problems loading the desk", "Problemi nel caricamento del gestionale"),
@@ -381,15 +380,20 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
     };
     match intent {
         Intent::Prefs(section) => {
-            let saved = app.session.data().preferences.clone();
             let s = &mut app.settings;
             s.feedback_mut(section).job = None;
             match error {
                 Some(e) => s.feedback_mut(section).error = e,
                 None => {
                     s.feedback_mut(section).error.clear();
-                    s.draft.adopt(&saved, section);
-                    s.base.adopt(&saved, section);
+                    // What the engine saved, from its answer: a remote desk's mirror still holds
+                    // the old values until the next snapshot, and taking those would undo the
+                    // edit on screen. Without them the draft stays as typed, and the snapshot's
+                    // merge settles it.
+                    if let Some(saved) = saved_preferences(&c.result) {
+                        s.draft.adopt(&saved, section);
+                        s.base.adopt(&saved, section);
+                    }
                     app.toast(app.tr("Preferences saved").to_string());
                 }
             }
@@ -436,6 +440,12 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
             }
         }
     }
+}
+
+/// The preferences in a `prefs.set` answer (`{"changed": […], "preferences": {…}}`).
+fn saved_preferences(result: &crate::engine::Result<Value>) -> Option<Preferences> {
+    let answer = result.as_ref().ok()?;
+    serde_json::from_value(answer.get("preferences")?.clone()).ok()
 }
 
 /// Closes an open form; the settings have none (Escape leaves the screen), so never.
@@ -626,14 +636,15 @@ fn guide_card(
     let mut g = app.settings.guide.clone();
     let fb = g.feedback(card).clone();
     let ok = widgets::tone_colors(t, Tone::Ok).1;
+    let (badge, digit) = badge_colors(t, done);
     let mut save = false;
     ui.add_space(6.0);
     widgets::card(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-            ui.painter().circle_filled(r.center(), 12.0, if done { ok } else { t.accent });
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, n.to_string(), FontId::proportional(13.0), t.on_accent);
+            ui.painter().circle_filled(r.center(), 12.0, badge);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, n.to_string(), FontId::proportional(13.0), digit);
             ui.label(RichText::new(lang.tr(title)).strong().color(t.ui_text));
             if done {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -655,6 +666,18 @@ fn guide_card(
     app.settings.guide = g;
     if save {
         save_card(app, card);
+    }
+}
+
+/// `(fill, digit)` of a guide card's number: the accent while to do; the Ok tone's colours
+/// swapped once done, since the Ok text colour is light in the dark theme and a white digit on
+/// it would be unreadable.
+fn badge_colors(t: &Tokens, done: bool) -> (egui::Color32, egui::Color32) {
+    if done {
+        let (fill, text) = widgets::tone_colors(t, Tone::Ok);
+        (text, fill)
+    } else {
+        (t.accent, t.on_accent)
     }
 }
 
@@ -771,16 +794,20 @@ fn setup_card(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             ui.add_space(6.0);
         }
         let text = |key: &str| v[key].as_str().map(str::to_string);
-        value_row(app, ui, t, lang.tr("ID server"), text("id_server").as_deref());
-        value_row(app, ui, t, lang.tr("Relay server"), text("relay_server").as_deref());
-        value_row(app, ui, t, lang.tr("API server (leave empty)"), text("api_server").as_deref());
-        value_row(app, ui, t, lang.tr("Public key"), text("key").as_deref());
+        let labels =
+            ["ID server", "Relay server", "API server (leave empty)", "Public key", "Import string", "Windows installer name"].map(|l| lang.tr(l));
+        let [id, relay, api, key, import, installer] = labels;
+        let w = label_width(ui.painter(), &labels);
+        value_row(app, ui, t, id, w, text("id_server").as_deref());
+        value_row(app, ui, t, relay, w, text("relay_server").as_deref());
+        value_row(app, ui, t, api, w, text("api_server").as_deref());
+        value_row(app, ui, t, key, w, text("key").as_deref());
         hint_line(ui, t, lang.tr("Enter in RustDesk › Settings › Network › ID/Relay server"));
         ui.add_space(8.0);
-        value_row(app, ui, t, lang.tr("Import string"), text("config_string").as_deref());
+        value_row(app, ui, t, import, w, text("config_string").as_deref());
         hint_line(ui, t, lang.tr("Paste in RustDesk › Settings › Network › Import server config"));
         ui.add_space(8.0);
-        value_row(app, ui, t, lang.tr("Windows installer name"), text("windows_installer_name").as_deref());
+        value_row(app, ui, t, installer, w, text("windows_installer_name").as_deref());
         hint_line(ui, t, lang.tr("Rename the official Windows installer to this name: it installs already pointed at this server"));
         ui.add_space(10.0);
         ui.label(RichText::new(lang.tr("Ports to forward")).small().strong().color(t.muted));
@@ -823,25 +850,14 @@ fn appearance_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     }
 }
 
-/// The keyboard shortcuts the shell answers to.
+/// The keyboard shortcuts the shell answers to: the same list as the `?` window.
 fn shortcuts_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     widgets::section(ui, t, app.tr("Keyboard shortcuts"));
     let lang = app.language;
-    let settings_key = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma));
-    let screens = ["Customers", "Devices", "Interventions", "Privacy", "Reports"].map(|s| lang.tr(s)).join(", ");
-    let rows: [(String, String); 7] = [
-        ("/".into(), lang.tr("Focus the search").into()),
-        ("Esc".into(), lang.tr("Close the form, deselect, or leave Settings").into()),
-        ("j / k, ↓ / ↑".into(), lang.tr("Next / previous row").into()),
-        ("s".into(), lang.tr("Start intervention").into()),
-        ("n".into(), lang.tr("New customer, PC, intervention or notice").into()),
-        ("1 – 5".into(), screens),
-        (settings_key, lang.tr("Settings").into()),
-    ];
     widgets::card(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
         egui::Grid::new("settings-shortcuts").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            for (key, action) in &rows {
+            for (key, action) in shortcut_rows(lang) {
                 key_chip(ui, t, key);
                 ui.label(RichText::new(action).color(t.ui_text));
                 ui.end_row();
@@ -850,6 +866,22 @@ fn shortcuts_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         ui.add_space(6.0);
         ui.label(RichText::new(lang.tr("Outside text fields; Escape leaves a field")).small().color(t.muted));
     });
+}
+
+/// The rows of the shortcuts table: [`crate::SHORTCUTS`], the descriptions translated.
+fn shortcut_rows(lang: Language) -> impl Iterator<Item = (&'static str, &'static str)> {
+    crate::SHORTCUTS.iter().map(move |(key, what)| (*key, lang.tr(what)))
+}
+
+/// The status card's counts, `1 customer` in the singular.
+fn counts_line(lang: Language, customers: usize, devices: usize, interventions: usize) -> String {
+    let count = |n: usize, one: &str, many: &str| if n == 1 { lang.tr(one).to_string() } else { lang.fill(many, &[("n", &n.to_string())]) };
+    format!(
+        "{} · {} · {}",
+        count(customers, "1 customer", "{n} customers"),
+        count(devices, "1 device", "{n} devices"),
+        count(interventions, "1 intervention", "{n} interventions"),
+    )
 }
 
 /// Version, actor, where the desk is, counts and the problems found loading it.
@@ -866,12 +898,7 @@ fn status_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         lang.fill("Version {version}", &[("version", env!("CARGO_PKG_VERSION"))]),
         lang.fill("Working as {actor}", &[("actor", if actor.is_empty() { "?" } else { &actor })]),
         if server.is_empty() { lang.tr("This computer").to_string() } else { lang.fill("Server: {url}", &[("url", &server)]) },
-        format!(
-            "{} · {} · {}",
-            lang.fill("{n} customers", &[("n", &customers.to_string())]),
-            lang.fill("{n} devices", &[("n", &devices.to_string())]),
-            lang.fill("{n} interventions", &[("n", &d.interventions.len().to_string())]),
-        ),
+        counts_line(lang, customers, devices, d.interventions.len()),
         format!("{}: {} · {}: {}", lang.tr("Running"), running, lang.tr("Privacy Notices"), d.notices.len()),
     ];
     let problems = app.session.problems();
@@ -964,12 +991,27 @@ fn hint_line(ui: &mut egui::Ui, t: &Tokens, hint: &str) {
     ui.add(egui::Label::new(RichText::new(hint).small().color(t.muted)).wrap());
 }
 
-/// A label, a read-only monospace box with the value and a Copy button; a missing value shows
-/// why and cannot be copied.
-fn value_row(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str, value: Option<&str>) {
+/// The font of the client setup's labels.
+const LABEL_FONT: f32 = 14.0;
+
+/// The width of the client setup's label column: the widest label in this language with a gap,
+/// within bounds so a long translation neither gets cut nor squeezes the values.
+fn label_width(painter: &egui::Painter, labels: &[&str]) -> f32 {
+    let width = |l: &&str| painter.layout_no_wrap(l.to_string(), FontId::proportional(LABEL_FONT), egui::Color32::WHITE).size().x;
+    let widest = labels.iter().map(width).fold(0.0, f32::max);
+    (widest + 12.0).clamp(140.0, 240.0)
+}
+
+/// A label in a column `label_w` wide, a read-only monospace box with the value and a Copy
+/// button; a missing value shows why and cannot be copied. A label cut short shows whole on hover.
+fn value_row(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str, label_w: f32, value: Option<&str>) {
     ui.horizontal(|ui| {
-        let (lr, _) = ui.allocate_exact_size(vec2(170.0, 30.0), Sense::hover());
-        let galley = widgets::truncate(ui.painter(), label, FontId::proportional(14.0), t.muted, lr.width() - 4.0);
+        let (lr, resp) = ui.allocate_exact_size(vec2(label_w, 30.0), Sense::hover());
+        let room = lr.width() - 4.0;
+        let galley = widgets::truncate(ui.painter(), label, FontId::proportional(LABEL_FONT), t.muted, room);
+        if ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(LABEL_FONT), t.muted).size().x > room {
+            resp.on_hover_text(label);
+        }
         ui.painter().galley(lr.left_center() - vec2(0.0, galley.size().y / 2.0), galley, t.muted);
         let w = (ui.available_width() - 40.0).max(80.0);
         let (rect, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
@@ -1042,7 +1084,7 @@ fn missing_label(lang: Language, item: &str) -> String {
 mod tests {
     use super::*;
     use crate::core::Data;
-    use crate::{Screen, Session, engine};
+    use crate::{DeskSession, Screen, Session, engine};
 
     /// Renders one frame of the app at 1440×900 in `ctx` (no window, no GPU).
     fn frame_in(ctx: &egui::Context, app: &mut DeskApp) {
@@ -1223,5 +1265,161 @@ mod tests {
         assert!(app.settings.company.error.is_empty());
         // Escape has nothing to close here.
         assert!(!close(&mut app));
+    }
+
+    /// A desk seen through a mirror, as from a server: a command's answer arrives before the
+    /// snapshot with its effect, which comes only when `snapshot` is set.
+    struct Mirrored {
+        desk: Session,
+        mirror: Data,
+        revision: u64,
+        snapshot: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl DeskSession for Mirrored {
+        fn data(&self) -> &Data {
+            &self.mirror
+        }
+        fn actor(&self) -> &str {
+            self.desk.actor()
+        }
+        fn now(&self) -> crate::core::chrono::DateTime<crate::core::chrono::Utc> {
+            self.desk.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.desk.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            let done = self.desk.pump();
+            if self.snapshot.get() {
+                self.mirror = self.desk.data().clone();
+                self.revision = self.desk.revision();
+            }
+            done
+        }
+        fn jobs_pending(&self) -> usize {
+            self.desk.jobs_pending()
+        }
+        fn revision(&self) -> u64 {
+            self.revision
+        }
+    }
+
+    #[test]
+    fn a_save_on_a_remote_desk_keeps_what_was_saved_until_the_snapshot_confirms_it() {
+        let desk = Session::demo();
+        let (mirror, revision) = (desk.data().clone(), desk.revision());
+        let snapshot = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut app = DeskApp::new(Box::new(Mirrored { desk, mirror, revision, snapshot: snapshot.clone() }));
+        app.go(Screen::Settings);
+        let ctx = egui::Context::default();
+        frame_in(&ctx, &mut app);
+        assert!(app.settings.draft.require_consent);
+        app.settings.draft.require_consent = false;
+        app.settings.draft.retention_years = 7;
+        app.settings.draft.company_name = "  Sirius  ".into();
+        save_section(&mut app, Section::Rules);
+        save_section(&mut app, Section::Company);
+        frame_in(&ctx, &mut app);
+        // Both answers are in, the mirror still has the old preferences.
+        assert!(app.settings.rules.job.is_none() && app.settings.company.job.is_none());
+        assert!(app.session.data().preferences.require_consent);
+        assert!(app.toast.as_ref().is_some_and(|(text, _)| text == app.tr("Preferences saved")));
+        let d = &app.settings.draft;
+        assert_eq!((d.require_consent, d.retention_years, d.company_name.as_str()), (false, 7, "Sirius"), "the draft shows what was saved, as saved");
+        assert!(!d.dirty(&app.settings.base, Section::Rules) && !d.dirty(&app.settings.base, Section::Company));
+        frame_in(&ctx, &mut app);
+        assert!(!app.settings.draft.require_consent, "nothing reverts while the snapshot is on its way");
+        // The snapshot lands: it confirms the values, nothing flips.
+        snapshot.set(true);
+        frame_in(&ctx, &mut app);
+        assert!(!app.session.data().preferences.require_consent);
+        let d = &app.settings.draft;
+        assert_eq!((d.require_consent, d.retention_years, d.company_name.as_str()), (false, 7, "Sirius"));
+        assert_eq!(app.settings.draft, app.settings.base);
+        // An answer without the preferences leaves the draft as typed.
+        assert!(saved_preferences(&Ok(json!({"changed": []}))).is_none());
+        assert!(saved_preferences(&Ok(json!({"preferences": 3}))).is_none());
+        assert_eq!(saved_preferences(&Ok(json!({"preferences": {"retention_years": 4}}))).map(|p| p.retention_years), Some(4));
+    }
+
+    /// The texts painted in one frame at `w`×`h`, each with whether it was cut short.
+    fn texts_at(app: &mut DeskApp, w: f32, h: f32) -> Vec<(String, bool)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, bool)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.elided)),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))), ..Default::default() };
+        let mut out = Vec::new();
+        // Two frames: the client setup answers after the first.
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input.clone(), |ui| app.ui(ui));
+            output.textures_delta.clear();
+            out.clear();
+            for c in &output.shapes {
+                walk(&c.shape, &mut out);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_client_setup_labels_fit_in_italian_and_show_whole_on_hover() {
+        let mut app = DeskApp::demo();
+        app.language = Language::It;
+        app.go(Screen::Settings);
+        let texts = texts_at(&mut app, 1100.0, 2600.0);
+        for label in ["Server ID", "Server relay", "Server API (lascia vuoto)", "Stringa di importazione", "Nome dell'installer Windows"] {
+            let row = texts.iter().find(|(t, _)| t == label);
+            assert_eq!(row.map(|(_, elided)| *elided), Some(false), "{label}: {texts:?}");
+        }
+        // The column follows the widest label, within bounds.
+        let ctx = egui::Context::default();
+        let mut widths = (0.0, 0.0, 0.0, 0.0);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let p = ui.painter();
+            let installer = p.layout_no_wrap("Nome dell'installer Windows".into(), FontId::proportional(LABEL_FONT), egui::Color32::WHITE).size().x;
+            widths =
+                (label_width(p, &["ID", "Nome dell'installer Windows"]), installer, label_width(p, &["ID"]), label_width(p, &[&"x".repeat(200)]));
+        });
+        output.textures_delta.clear();
+        let (it, installer, short, long) = widths;
+        assert!(it >= installer + 4.0 && it > 170.0, "{it} for {installer}");
+        assert_eq!((short, long), (140.0, 240.0));
+    }
+
+    #[test]
+    fn the_shortcuts_are_the_help_windows_and_the_counts_say_one() {
+        let rows: Vec<_> = shortcut_rows(Language::It).collect();
+        assert_eq!(rows.len(), crate::SHORTCUTS.len());
+        for ((key, it), (en_key, en)) in rows.iter().zip(crate::SHORTCUTS) {
+            assert_eq!(key, en_key);
+            assert_ne!(it, en, "untranslated shortcut: {en}");
+        }
+        assert!(rows.contains(&("Ctrl+,", "Impostazioni")), "{rows:?}");
+        let mut app = DeskApp::demo();
+        app.language = Language::It;
+        app.go(Screen::Settings);
+        let texts: Vec<String> = texts_at(&mut app, 1100.0, 3200.0).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "Ctrl+,") && texts.iter().any(|t| t == "?"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Comma")), "{texts:?}");
+        // The counts of the status card.
+        assert_eq!(counts_line(Language::It, 1, 1, 1), "1 cliente · 1 PC · 1 intervento");
+        assert_eq!(counts_line(Language::It, 3, 0, 12), "3 clienti · 0 PC · 12 interventi");
+        assert_eq!(counts_line(Language::En, 1, 2, 1), "1 customer · 2 devices · 1 intervention");
+        assert_eq!(counts_line(Language::En, 0, 1, 5), "0 customers · 1 device · 5 interventions");
+    }
+
+    #[test]
+    fn a_done_step_number_reads_in_both_themes() {
+        for t in [Tokens::LIGHT, Tokens::DARK] {
+            let (fill, digit) = badge_colors(&t, true);
+            assert!(widgets::contrast(fill, digit) >= 4.5, "dark {}: {:.2}", t.dark, widgets::contrast(fill, digit));
+            assert_eq!(badge_colors(&t, false), (t.accent, t.on_accent));
+        }
     }
 }

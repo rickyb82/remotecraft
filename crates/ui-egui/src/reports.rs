@@ -42,6 +42,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
         "I minuti fatturabili sono arrotondati per eccesso a {unit} min per intervento, minimo {min} min",
     ),
     ("{n} running interventions excluded", "{n} interventi in corso esclusi"),
+    ("1 running intervention excluded", "1 intervento in corso escluso"),
     ("No closed interventions between {from} and {to}", "Nessun intervento chiuso tra {from} e {to}"),
     ("Export CSV", "Esporta CSV"),
     ("CSV saved", "CSV salvato"),
@@ -196,6 +197,9 @@ impl Columns {
 }
 
 const ROW_H: f32 = 40.0;
+/// The least widths of the customer and the technician pickers.
+const CUSTOMER_W: f32 = 220.0;
+const TECHNICIAN_W: f32 = 180.0;
 
 /// Draws the screen: the header, the controls, the table.
 pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -204,11 +208,15 @@ pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     // again after the controls, for a change made this frame (the same key runs nothing).
     refresh(app);
     crate::central_panel(ui, t, |ui| {
+        // The panel's width before anything is laid out: a control that did not fit widens
+        // the panel's rect, and the table's right-aligned numbers would follow it off-screen.
+        let width = ui.available_width();
         header(app, ui, t);
         controls(app, ui, t);
         publish_shared(app);
         refresh(app);
-        table(app, ui, t);
+        let rect = Rect::from_min_size(ui.cursor().min, vec2(width.min(ui.available_width()).max(0.0), ui.available_height().max(0.0)));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| table(app, ui, t));
     });
 }
 
@@ -242,14 +250,14 @@ pub fn close(_app: &mut DeskApp) -> bool {
 // ---------------------------------------------------------------------------------------------
 // The period
 
-/// The bounds of a preset period as form text (empty for Custom).
+/// The bounds of a preset period as form text, the last day included (empty for Custom).
 fn preset_bounds(period: Period, now: DateTime<Utc>) -> (String, String) {
     match period {
         Period::ThisMonth => format::month_bounds(now, 0),
         Period::LastMonth => format::month_bounds(now, 1),
         Period::ThisYear => {
             let y = now.with_timezone(&Local).year();
-            (format!("{y:04}-01-01"), format!("{:04}-01-01", y.saturating_add(1)))
+            (format!("{y:04}-01-01"), format!("{y:04}-12-31"))
         }
         Period::Custom => (String::new(), String::new()),
     }
@@ -266,15 +274,15 @@ fn period_of(from: &str, to: &str, now: DateTime<Utc>) -> Period {
         .unwrap_or(Period::Custom)
 }
 
-/// The first day of a `YYYY-MM` month and of the next one, as form text.
+/// The first and the last day of a `YYYY-MM` month, as form text.
 fn month_span(key: &str) -> Option<(String, String)> {
     let (y, m) = key.trim().split_once('-')?;
     let (y, m): (i32, u32) = (y.parse().ok()?, m.parse().ok()?);
     if !(1..=12).contains(&m) {
         return None;
     }
-    let (ny, nm) = if m == 12 { (y.checked_add(1)?, 1) } else { (y, m + 1) };
-    Some((format!("{y:04}-{m:02}-01"), format!("{ny:04}-{nm:02}-01")))
+    let last = format::days_in_month(i64::from(y), m);
+    Some((format!("{y:04}-{m:02}-01"), format!("{y:04}-{m:02}-{last:02}")))
 }
 
 /// Takes the period and the pickers from `app.work_filter` when another screen changed them
@@ -319,11 +327,14 @@ fn publish_shared(app: &mut DeskApp) {
 // Loading
 
 /// A bound typed in a field as the stamp to send: `Ok(None)` when empty, `Err` when unreadable.
-fn bound(text: &str, now: DateTime<Utc>) -> Result<Option<String>, ()> {
+/// The end (`end`) is included: a date alone sends the start of the next day, as the engine
+/// excludes its `to`.
+fn bound(text: &str, now: DateTime<Utc>, end: bool) -> Result<Option<String>, ()> {
     if text.trim().is_empty() {
         return Ok(None);
     }
-    format::stamp_from_input(text, now).map(Some).ok_or(())
+    let stamp = if end { format::end_stamp_from_input(text, now) } else { format::stamp_from_input(text, now) };
+    stamp.map(Some).ok_or(())
 }
 
 /// The parameters of `report.time` for the controls and the key they make with the revision;
@@ -331,8 +342,8 @@ fn bound(text: &str, now: DateTime<Utc>) -> Result<Option<String>, ()> {
 fn params(app: &DeskApp) -> Option<(Value, String)> {
     let s = &app.reports;
     let now = app.now();
-    let from = bound(&s.from, now).ok()?;
-    let to = bound(&s.to, now).ok()?;
+    let from = bound(&s.from, now, false).ok()?;
+    let to = bound(&s.to, now, true).ok()?;
     let technician = Some(s.technician.trim().to_string()).filter(|t| !t.is_empty());
     let key = format!(
         "{}|{}|{}|{}|{}|{}",
@@ -422,13 +433,18 @@ fn drill(app: &mut DeskApp, key: &str) {
     wf.customer = s.customer;
     wf.technician.clone_from(&s.technician);
     wf.device = None;
+    wf.no_device = false;
     wf.kind.clear();
     wf.running_only = false;
     wf.billable_only = false;
     match s.group_by {
         GroupBy::Customer => wf.customer = key.parse().ok(),
         GroupBy::Technician => wf.technician = key.to_string(),
-        GroupBy::Device => wf.device = key.parse().ok(),
+        GroupBy::Device => {
+            // The "—" row (key "") holds the interventions without a PC.
+            wf.device = key.parse().ok();
+            wf.no_device = key.trim().is_empty();
+        }
         GroupBy::Kind => wf.kind = key.to_string(),
         GroupBy::Month => {
             if let Some((from, to)) = month_span(key) {
@@ -628,7 +644,7 @@ fn controls(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                 for (label, is_from) in [("From", true), ("To", false)] {
                     ui.label(RichText::new(app.tr(label)).small().color(t.muted));
                     let value = if is_from { &mut app.reports.from } else { &mut app.reports.to };
-                    let ok = bound(value, now).is_ok();
+                    let ok = bound(value, now, !is_from).is_ok();
                     ui.add(egui::TextEdit::singleline(value).hint_text("2026-10-01").desired_width(110.0));
                     if !ok {
                         ui.label(RichText::new(&unreadable).small().color(widgets::danger(t)));
@@ -643,13 +659,21 @@ fn controls(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             if let Some(g) = segmented(ui, t, &options, app.reports.group_by) {
                 app.reports.group_by = g;
             }
-            widgets::divider(ui, t);
+            // A ComboBox takes its width where it stands and never wraps by itself: each picker
+            // goes to a new line when the rest of this one cannot hold it (`available_width` is
+            // a whole line's in a wrapping layout; the rest of this one is before the wrap).
+            let gap = ui.spacing().item_spacing.x;
+            if ui.available_size_before_wrap().x < CUSTOMER_W + 9.0 + 2.0 * gap {
+                ui.end_row();
+            } else {
+                widgets::divider(ui, t);
+            }
             // The customer picker.
             let customers = customers(app);
             let every = app.tr("Every customer").to_string();
             let shown = app.reports.customer.and_then(|id| customers.iter().find(|(i, _)| *i == id)).map_or(every.clone(), |(_, n)| n.clone());
             let mut pick: Option<Option<u64>> = None;
-            egui::ComboBox::from_id_salt("report-customer").selected_text(shown).width(220.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("report-customer").selected_text(shown).width(CUSTOMER_W).show_ui(ui, |ui| {
                 if ui.selectable_label(app.reports.customer.is_none(), &every).clicked() {
                     pick = Some(None);
                 }
@@ -668,7 +692,10 @@ fn controls(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             let current = app.reports.technician.trim().to_string();
             let shown = if current.is_empty() { everyone.clone() } else { current.clone() };
             let mut pick: Option<String> = None;
-            egui::ComboBox::from_id_salt("report-technician").selected_text(shown).width(180.0).show_ui(ui, |ui| {
+            if ui.available_size_before_wrap().x < TECHNICIAN_W + gap {
+                ui.end_row();
+            }
+            egui::ComboBox::from_id_salt("report-technician").selected_text(shown).width(TECHNICIAN_W).show_ui(ui, |ui| {
                 if ui.selectable_label(current.is_empty(), &everyone).clicked() {
                     pick = Some(String::new());
                 }
@@ -706,6 +733,12 @@ fn column_titles(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, group: GroupBy) {
     }
 }
 
+/// The note on the running interventions the report leaves out, singular for one.
+fn excluded_text(app: &DeskApp, running: u64) -> String {
+    let pattern = if running == 1 { "1 running intervention excluded" } else { "{n} running interventions excluded" };
+    app.language.fill(pattern, &[("n", &running.to_string())])
+}
+
 /// The table: the rows, the totals, the notes; or the empty state.
 fn table(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     if !app.reports.error.is_empty() {
@@ -719,7 +752,7 @@ fn table(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     };
     let rows = rows_of(app, &report);
     let running = report["running_excluded"].as_u64().unwrap_or(0);
-    let excluded = app.language.fill("{n} running interventions excluded", &[("n", &running.to_string())]);
+    let excluded = excluded_text(app, running);
     if rows.is_empty() {
         let italian = app.italian();
         let shown = |stamp: Option<&str>, text: &str| -> String {
@@ -727,7 +760,9 @@ fn table(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             d.unwrap_or_else(|| if text.trim().is_empty() { "…".into() } else { text.trim().to_string() })
         };
         let from = shown(report["from"].as_str(), &app.reports.from);
-        let to = shown(report["to"].as_str(), &app.reports.to);
+        // The engine's `to` is excluded: shown as the last day it covers.
+        let to = report["to"].as_str().map(|s| format::end_text(s, italian)).filter(|d| !d.is_empty());
+        let to = to.unwrap_or_else(|| shown(None, &app.reports.to));
         let title = app.language.fill("No closed interventions between {from} and {to}", &[("from", &from), ("to", &to)]);
         widgets::empty_state(ui, t, Icon::Reports, &title, if running > 0 { &excluded } else { "" });
         return;
@@ -891,7 +926,7 @@ mod tests {
         frame(&mut app);
         assert!(!stale(&app));
         let (from, to) = preset_bounds(Period::ThisYear, now);
-        assert!(from.ends_with("-01-01") && to.ends_with("-01-01") && from < to);
+        assert!(from.ends_with("-01-01") && to.ends_with("-12-31") && from.get(..4) == to.get(..4), "{from} {to}");
         assert_eq!(period_of(&from, &to, now), Period::ThisYear);
         assert_eq!(period_of("2026-02-01", "", now), Period::Custom);
 
@@ -918,7 +953,9 @@ mod tests {
         assert_eq!(app.work_filter.to, "");
         app.reports.group_by = GroupBy::Month;
         drill(&mut app, "2026-12");
-        assert_eq!((app.work_filter.from.as_str(), app.work_filter.to.as_str()), ("2026-12-01", "2027-01-01"));
+        assert_eq!((app.work_filter.from.as_str(), app.work_filter.to.as_str()), ("2026-12-01", "2026-12-31"));
+        drill(&mut app, "2028-02");
+        assert_eq!((app.work_filter.from.as_str(), app.work_filter.to.as_str()), ("2028-02-01", "2028-02-29"));
         app.reports.group_by = GroupBy::Kind;
         drill(&mut app, "phone");
         assert_eq!(app.work_filter.kind, "phone");
@@ -928,9 +965,12 @@ mod tests {
         assert_eq!(app.work_filter.kind, "", "a drill-down keeps only its own group");
         app.reports.group_by = GroupBy::Device;
         drill(&mut app, "4");
-        assert_eq!(app.work_filter.device, Some(4));
+        assert_eq!((app.work_filter.device, app.work_filter.no_device), (Some(4), false));
         drill(&mut app, "");
-        assert_eq!(app.work_filter.device, None);
+        assert_eq!((app.work_filter.device, app.work_filter.no_device), (None, true), "the \"—\" row: the work without a PC");
+        app.reports.group_by = GroupBy::Customer;
+        drill(&mut app, "1");
+        assert!(!app.work_filter.no_device, "a drill-down keeps only its own group");
 
         // Filters set on the Interventions screen are adopted when the Reports show again.
         app.work_filter.customer = Some(1);
@@ -942,6 +982,110 @@ mod tests {
         assert_eq!(app.reports.from, "2026-01-01");
         assert_eq!(month_span("2026-13"), None);
         assert_eq!(month_span("x"), None);
+    }
+
+    /// The texts painted in one frame of the app at `w`×`h`, with their rects.
+    fn texts_at(app: &mut DeskApp, w: f32, h: f32) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(w, h))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        let mut out = Vec::new();
+        for c in &output.shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_hours_stay_on_screen_in_a_narrow_window() {
+        for lang in Language::ALL {
+            for w in [900.0, 1000.0, 1150.0, 1440.0] {
+                let mut app = open(lang);
+                frame(&mut app);
+                frame(&mut app);
+                assert!(has_rows(&app));
+                let texts = texts_at(&mut app, w, 700.0);
+                for label in ["Billable hours", "Hours", "Every technician", "Every customer"] {
+                    let wanted = app.tr(label).to_string();
+                    let found: Vec<&Rect> = texts.iter().filter(|(text, _)| *text == wanted).map(|(_, r)| r).collect();
+                    assert!(!found.is_empty(), "{wanted} at {w}: {texts:?}");
+                    assert!(found.iter().all(|r| r.right() <= w + 0.5), "{wanted} at {w}: {found:?}");
+                }
+                // The totals line's numbers too.
+                let total = app.reports.report.as_ref().and_then(|r| r["totals"]["billable_hours"].as_str()).unwrap_or_default().to_string();
+                assert!(texts.iter().filter(|(text, _)| *text == total).all(|(_, r)| r.right() <= w + 0.5), "{total} at {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_end_of_the_period_is_included_as_a_whole_day() {
+        let mut app = open(Language::It);
+        let now = app.now();
+        // From and To on the day intervention 10 started: it is counted.
+        let started = app.data().intervention(10).map(|i| format::input(&i.started_at)).expect("intervention 10");
+        let day = started.get(..10).expect("a date").to_string();
+        app.work_filter.from.clone_from(&day);
+        app.work_filter.to.clone_from(&day);
+        frame(&mut app);
+        frame(&mut app);
+        let report = app.reports.report.clone().expect("loaded");
+        let counted: u64 = report["rows"].as_array().into_iter().flatten().filter_map(|r| r["interventions"].as_u64()).sum();
+        let expected = app.data().interventions.iter().filter(|i| !i.running() && format::input(&i.started_at).starts_with(&day)).count();
+        assert!(counted >= 1 && counted == expected as u64, "{day}: {counted} of {expected}");
+        assert_eq!(report["to"].as_str().map(str::to_string), format::end_stamp_from_input(&day, now), "the start of the next day");
+        // The empty state names the last day included, not the day after.
+        app.work_filter.from = "1990-10-01".into();
+        app.work_filter.to = "1990-10-31".into();
+        frame(&mut app);
+        frame(&mut app);
+        assert!(labels(&app).is_empty());
+        let texts: Vec<String> = texts_at(&mut app, 1440.0, 900.0).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t.contains("31 ott 1990") && !t.contains("1 nov 1990")), "{texts:?}");
+        // An unreadable end runs nothing.
+        assert_eq!(bound("ieri", now, true), Err(()));
+        assert_eq!(bound(" ", now, true), Ok(None));
+    }
+
+    #[test]
+    fn the_no_pc_row_drills_into_the_work_without_a_pc() {
+        let mut app = open(Language::It);
+        app.reports.group_by = GroupBy::Device;
+        frame(&mut app);
+        frame(&mut app);
+        let report = app.reports.report.clone().expect("loaded");
+        let rows = rows_of(&app, &report);
+        let none = rows.iter().find(|r| r.key.is_empty()).expect("the \"—\" row");
+        assert_eq!(none.label, "—");
+        let count = none.interventions;
+        drill(&mut app, "");
+        frame(&mut app);
+        assert_eq!(app.screen, Screen::Interventions);
+        assert_eq!(app.work_filter.device, None);
+        assert!(app.work_filter.no_device);
+        // The Interventions header counts what the row counted.
+        let header = if count == 1 { "1 intervento ·".to_string() } else { format!("{count} interventi ·") };
+        let texts = texts_at(&mut app, 1440.0, 900.0);
+        assert!(texts.iter().any(|(t, _)| t.starts_with(&header)), "{header}: {texts:?}");
+    }
+
+    #[test]
+    fn the_running_note_says_one_intervention() {
+        let mut app = DeskApp::demo();
+        app.language = Language::En;
+        assert_eq!(excluded_text(&app, 1), "1 running intervention excluded");
+        assert_eq!(excluded_text(&app, 2), "2 running interventions excluded");
+        app.language = Language::It;
+        assert_eq!(excluded_text(&app, 1), "1 intervento in corso escluso");
+        assert_eq!(excluded_text(&app, 3), "3 interventi in corso esclusi");
     }
 
     #[test]

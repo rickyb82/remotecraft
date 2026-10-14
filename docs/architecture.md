@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last updated:** 2026-10-13
+> **Last updated:** 2026-10-14
 
 | Crate | Layer | What it holds |
 |---|---|---|
@@ -26,6 +26,28 @@ desk when its revision moved. The `Desk` bumps its revision on every save and on
 of a file another process wrote. Results are routed back to the screen that asked by an
 `Intent` the interface stores per job, so desktop and web behave the same.
 
+- **Revisions** start at a value unique to the process and the desk (the time mixed with the
+  process's random hash seed, below 2^53 so JSON clients read it exactly), so a client that
+  kept revision N across a server restart is never told `unchanged` by a new server that
+  happens to be at N. A snapshot names the actor commands run as: with no user named, the
+  desk's own.
+- **Local session.** `rustdesk.check` waits on the network (3 s per address when a firewall
+  drops the packets), so `Session` prepares it on the caller's thread
+  (`Desk::prepare_rustdesk_check`: parameters and host) and probes on another thread, the three
+  ports in parallel (`RustDeskCheck::run`); the report arrives through `pump` and counts in
+  `jobs_pending`. Wasm has no threads and no probe. `serve` likewise probes after releasing the
+  desk's lock; the CLI and the MCP server simply wait. Every `pump` also calls `Desk::refresh`
+  (a stat of the desk file), and the desktop app repaints at least every 2 s, so what the MCP
+  server or the CLI writes shows in an idle window.
+- **Remote session.** Polls are timed on a monotonic clock (`web_time::Instant`); a poll still
+  unanswered after 30 s (the browser's fetch has no timeout) is given up and another goes out,
+  and the late answer of a given-up poll is ignored (each carries its poll number).
+  `problem()` is `connecting` until the first answer, then `None` or a stable prefix and the
+  detail: `unauthorized: ` (401/403, a revoked token), `incompatible: ` (an answer the client
+  cannot read: not a RemoteCraft server, another version, too large) or `unreachable: ` (no
+  connection, no answer, 5xx from a proxy). Only a poll that succeeds clears it; command
+  answers do not.
+
 ## Commands
 
 Every user-visible action is a `Command` in `crates/engine/src/cmd.rs` (id, label, menu,
@@ -50,8 +72,13 @@ the navigation with counts, each screen's list in the centre and a resizable det
 the right, the intervention card docked bottom right (start, running timer, stop with notes),
 a confirmation for actions that cannot be undone, toasts, and host `Request`s (open a link,
 save a file) served by the apps. Lists and privacy states are computed from the mirror with
-the engine's own helpers (`engine::views`), never by the interface alone. Every label is
-English in code and translated in `i18n/it.rs`; a test checks the table is complete.
+the engine's own helpers (`engine::views`), never by the interface alone. The per-customer
+states are rebuilt when the revision moves (and once a minute, for expiries) in one pass:
+`views::ByCustomer` groups devices, interventions and privacy events by customer, and
+`views::review_grouped` reads the groups, so the cost grows with the records, not with
+customers × records (`views::review` is the same review for the CLI and MCP). Every label is
+English in code and translated in `i18n/it.rs` or the screen's `LABELS_IT`; a test checks the
+tables are complete and that a label repeated across screens has one Italian.
 
 ## Storage
 

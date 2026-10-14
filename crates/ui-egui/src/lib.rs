@@ -109,6 +109,17 @@ pub struct PendingOpen {
     pub screen: Screen,
     pub id: u64,
     pub since: Instant,
+    /// Where the technician was when it was asked: moving elsewhere meanwhile cancels it.
+    pub from: Place,
+}
+
+/// The screen and the selections: where the technician is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub screen: Screen,
+    pub customer: Option<u64>,
+    pub device: Option<u64>,
+    pub intervention: Option<u64>,
 }
 
 /// The keyboard shortcuts (key, what), for the help window.
@@ -148,9 +159,13 @@ pub struct Confirm {
 pub struct WorkFilter {
     /// Form text the engine accepts (`2026-10-01`), empty = no bound.
     pub from: String,
+    /// The end, included: a date alone counts the whole day (`2026-10-31` sends the start of
+    /// 1 November, `format::end_stamp_from_input`); empty = no bound.
     pub to: String,
     pub customer: Option<u64>,
     pub device: Option<u64>,
+    /// Only interventions without a PC (a report's "—" row); `device` is `None` then.
+    pub no_device: bool,
     /// Empty = every technician.
     pub technician: String,
     /// Empty = every kind; else `remote`, `onsite`, `phone`, `lab`, `other`.
@@ -365,8 +380,13 @@ impl DeskApp {
         if present {
             self.open_on(screen, id);
         } else {
-            self.pending_open = Some(PendingOpen { screen, id, since: Instant::now() });
+            self.pending_open = Some(PendingOpen { screen, id, since: Instant::now(), from: self.place() });
         }
+    }
+
+    /// The screen and the selections now.
+    pub fn place(&self) -> Place {
+        Place { screen: self.screen, customer: self.selected_customer, device: self.selected_device, intervention: self.selected_intervention }
     }
 
     fn open_on(&mut self, screen: Screen, id: u64) {
@@ -421,6 +441,11 @@ impl DeskApp {
             if let Err(e) = &c.result {
                 self.status = self.language.tr_message(&e.to_string());
             }
+            // An audited read (device.connect, gdpr.export) adds to the audit log without
+            // changing the revision: the Audit log tab asks again.
+            if c.result.is_ok() && engine::COMMANDS.iter().any(|s| s.id == c.command && s.audited && !s.writes) {
+                self.privacy.audit.key = None;
+            }
             match intent {
                 Intent::None => {}
                 Intent::Toast(text) => {
@@ -460,7 +485,10 @@ impl DeskApp {
                 Screen::Interventions => d.intervention(p.id).is_some(),
                 _ => true,
             };
-            if present {
+            if p.from != self.place() {
+                // The technician moved on meanwhile: the open would pull them back.
+                self.pending_open = None;
+            } else if present {
                 self.pending_open = None;
                 self.open_on(p.screen, p.id);
             } else if p.since.elapsed().as_secs() > 10 {
@@ -479,6 +507,11 @@ impl DeskApp {
             }
             if self.selected_intervention.is_some_and(|id| d.intervention(id).is_none()) {
                 self.selected_intervention = None;
+            }
+            // Not the technician moving: a pending open still applies.
+            let here = self.place();
+            if let Some(p) = self.pending_open.as_mut() {
+                p.from = here;
             }
         }
     }
@@ -909,6 +942,91 @@ mod tests {
         frame(&mut app);
         assert!(app.derived.customer(4).is_some());
         assert!(app.window_title().contains("Quarto"));
+    }
+
+    /// One frame on a context that lives across frames (the focus), with these input events.
+    fn frame_in(ctx: &egui::Context, app: &mut DeskApp, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn ctrl_enter_in_the_search_starts_on_the_pc_found() {
+        let mut app = DeskApp::demo();
+        let ctx = egui::Context::default();
+        app.selected_customer = Some(1);
+        privacy::open_delivery(&mut app, 1, None);
+        app.search = "100200300".into();
+        app.search_focus = true;
+        frame_in(&ctx, &mut app, Vec::new());
+        frame_in(&ctx, &mut app, Vec::new());
+        let events = app.data().privacy.len();
+        let ctrl_enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE },
+        };
+        frame_in(&ctx, &mut app, vec![ctrl_enter]);
+        frame_in(&ctx, &mut app, Vec::new());
+        assert!(app.data().intervention(11).is_some_and(|i| i.running() && i.device_id == Some(1)), "started on the PC found");
+        assert_eq!(app.timer.card.as_ref().map(|c| c.mode), Some(timer::Mode::Running));
+        assert_eq!(app.data().privacy.len(), events, "the open privacy form is not saved");
+        assert!(privacy::form_customer(&app).is_some());
+    }
+
+    #[test]
+    fn a_pending_open_gives_way_to_where_the_technician_went() {
+        // Gone to another screen before the record arrived: it does not pull back.
+        let mut app = DeskApp::demo();
+        app.open_when_ready(Screen::Customers, 4);
+        app.go(Screen::Interventions);
+        frame(&mut app);
+        assert!(app.pending_open.is_none());
+        app.run("customer.add", json!({"name": "Quarto"}));
+        frame(&mut app);
+        assert_eq!((app.screen, app.selected_customer), (Screen::Interventions, None));
+        // Another customer picked meanwhile: the same.
+        let mut app = DeskApp::demo();
+        app.open_when_ready(Screen::Customers, 4);
+        app.selected_customer = Some(2);
+        frame(&mut app);
+        app.run("customer.add", json!({"name": "Quarto"}));
+        frame(&mut app);
+        assert_eq!(app.selected_customer, Some(2));
+        // Nothing done meanwhile: it opens when it arrives.
+        let mut app = DeskApp::demo();
+        app.open_when_ready(Screen::Customers, 4);
+        frame(&mut app);
+        assert!(app.pending_open.is_some());
+        app.run("customer.add", json!({"name": "Quarto"}));
+        frame(&mut app);
+        assert!(app.pending_open.is_none());
+        assert_eq!((app.screen, app.selected_customer), (Screen::Customers, Some(4)));
+    }
+
+    #[test]
+    fn an_audited_read_refreshes_the_audit_log() {
+        let mut app = DeskApp::demo();
+        app.privacy.tab = privacy::Tab::Audit;
+        app.go(Screen::Privacy);
+        let connects = |app: &DeskApp| app.privacy.audit.value.as_ref().map(|v| v.to_string().matches("device.connect").count()).unwrap_or(0);
+        frame(&mut app);
+        frame(&mut app);
+        assert!(app.privacy.audit.value.is_some(), "the audit log is loaded");
+        let before = connects(&app);
+        let rev = app.session.revision();
+        app.connect(1);
+        frame(&mut app);
+        frame(&mut app);
+        assert_eq!(app.session.revision(), rev, "a read does not move the revision");
+        assert_eq!(connects(&app), before + 1, "the new access is listed");
     }
 
     #[test]

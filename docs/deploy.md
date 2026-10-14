@@ -1,6 +1,6 @@
 # Installazione e integrazione con il framework
 
-> **Ultimo aggiornamento:** 2026-10-13
+> **Ultimo aggiornamento:** 2026-10-14
 
 ## Il container
 
@@ -40,7 +40,7 @@ Volumi: `/data/rustdesk` (coppia di chiavi e database di hbbs) e `/data/desk` (g
 
 | Token | Chi lo usa | Il tecnico è |
 |---|---|---|
-| **di servizio** (`REMOTECRAFT_TOKEN`) | il backend del framework | l'header `X-Remotecraft-User: <id utente>` (opzionale: senza, l'azione è registrata come «tecnico») |
+| **di servizio** (`REMOTECRAFT_TOKEN`) | il backend del framework | l'header `X-Remotecraft-User: <id utente>` (opzionale: senza, vale il tecnico del server, `REMOTECRAFT_USER` o altrimenti «tecnico», e lo stesso nome torna nello snapshot dell'app web) |
 | **utente** | il processo MCP di un tecnico | il token stesso |
 
 Gli id vengono normalizzati (`Anna Rossi` → `anna-rossi`). Il nome finisce negli interventi
@@ -68,6 +68,11 @@ che l'ha servita). Può anche essere ospitata altrove (GitHub Pages) e puntata a
 `?server=https://assistenza.example.it`: il server risponde al CORS per qualunque origine, è il
 token a proteggere i dati. Il link `rustdesk://` apre il client RustDesk installato sul PC del
 tecnico; gli export GDPR arrivano come download.
+
+Senza token si scaricano solo i file della cartella dell'app (`--static`, `REMOTECRAFT_STATIC`):
+file normali fino a 64 MiB che stanno davvero dentro la cartella. Percorsi assoluti anche
+codificati (`/%2Fetc%2F…`), `..` e collegamenti simbolici che escono dalla cartella ricevono
+400 o 404. Nella cartella va messo solo l'output di `trunk build`.
 
 L'app desktop (`cargo install --path apps/remotecraft`, oppure `remotecraft --demo`) lavora
 sul gestionale locale nella cartella dei dati, senza server.

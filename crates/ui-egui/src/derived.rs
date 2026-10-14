@@ -6,7 +6,7 @@
 //! Also [`Cached`]: the slot a screen keeps for a command whose answer is not in the data
 //! (report, audit log, RustDesk setup and check, status).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use remotecraft_engine::core::chrono::{DateTime, Utc};
 use remotecraft_engine::core::privacy::{self, PurposeState};
@@ -134,19 +134,24 @@ impl Derived {
 
 /// Builds the derived state from the data; `defaults` is what the host knows about the
 /// RustDesk server (`DeskSession::rustdesk_defaults`), `actor` the technician at work.
+///
+/// Runs on the interface's thread after every change and every minute, so it groups the
+/// records by customer once ([`views::ByCustomer`], shared with the review) and reads each
+/// customer's own: linear in the desk's size, not customers × records.
 pub fn build(data: &Data, now: DateTime<Utc>, revision: u64, defaults: &(String, String), actor: &str) -> Derived {
     let prefs = &data.preferences;
     let now_stamp = time::stamp(now);
     let current = privacy::current_notice(&data.notices, now);
     let known = privacy::known_purposes(&data.privacy);
+    let groups = views::ByCustomer::new(data);
     let mut customers = HashMap::with_capacity(data.customers.len());
     for c in &data.customers {
-        let devices: Vec<_> = data.devices.iter().filter(|d| d.customer_id == c.id && !d.retired).collect();
+        let devices: Vec<_> = groups.devices(c.id).iter().filter(|d| !d.retired).collect();
         let remote_devices = devices.iter().any(|d| !d.rustdesk_id.is_empty());
         let unattended_devices: Vec<u64> = devices.iter().filter(|d| d.unattended).map(|d| d.id).collect();
-        let work: Vec<_> = data.interventions.iter().filter(|i| i.customer_id == c.id).collect();
+        let work = groups.interventions(c.id);
         let remote_work = work.iter().any(|i| i.kind.is_remote());
-        let delivery = privacy::last_delivery(&data.privacy, c.id);
+        let delivery = groups.last_delivery(c.id);
         let notice = match (current, delivery) {
             (None, _) => NoticeState::NoNotice,
             (Some(cur), None) => NoticeState::NotDelivered { current: cur.version.clone() },
@@ -158,7 +163,7 @@ pub fn build(data: &Data, now: DateTime<Utc>, revision: u64, defaults: &(String,
         let purposes: Vec<PurposeRow> = known
             .iter()
             .map(|p| {
-                let (state, event) = privacy::purpose_state(&data.privacy, c.id, p, now, prefs.consent_validity_months);
+                let (state, event) = groups.purpose_state(c.id, p, now, prefs.consent_validity_months);
                 PurposeRow { id: p.clone(), state, event: event.map(|e| e.id) }
             })
             .collect();
@@ -208,7 +213,7 @@ pub fn build(data: &Data, now: DateTime<Utc>, revision: u64, defaults: &(String,
                 minutes: work.iter().map(|i| u64::from(i.minutes)).sum(),
                 running: work.iter().filter(|i| i.running()).count(),
                 last_intervention: last,
-                privacy_events: data.privacy.iter().filter(|e| e.customer_id == c.id).count(),
+                privacy_events: groups.privacy(c.id).len(),
                 notice,
                 purposes,
                 dot,
@@ -219,16 +224,10 @@ pub fn build(data: &Data, now: DateTime<Utc>, revision: u64, defaults: &(String,
     }
     let mut running: Vec<&remotecraft_engine::core::Intervention> = data.interventions.iter().filter(|i| i.running()).collect();
     running.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-    let mut technicians: Vec<String> = data.interventions.iter().map(|i| i.technician.clone()).filter(|t| !t.is_empty()).collect();
-    if !actor.is_empty() {
-        technicians.push(actor.to_string());
-    }
-    technicians.sort();
-    technicians.dedup();
-    let mut tags: Vec<String> = data.customers.iter().filter(|c| c.erased_at.is_none()).flat_map(|c| c.tags.iter().cloned()).collect();
-    tags.sort();
-    tags.dedup();
-    let findings = views::review(data, now)["findings"]
+    let technicians: BTreeSet<&str> =
+        data.interventions.iter().map(|i| i.technician.as_str()).chain(std::iter::once(actor)).filter(|t| !t.is_empty()).collect();
+    let tags: BTreeSet<&str> = data.customers.iter().filter(|c| c.erased_at.is_none()).flat_map(|c| c.tags.iter().map(String::as_str)).collect();
+    let findings = views::review_grouped(&groups, now)["findings"]
         .as_array()
         .map(|list| {
             list.iter()
@@ -249,8 +248,8 @@ pub fn build(data: &Data, now: DateTime<Utc>, revision: u64, defaults: &(String,
         built: Instant::now(),
         customers,
         running: running.iter().map(|i| i.id).collect(),
-        technicians,
-        tags,
+        technicians: technicians.into_iter().map(str::to_string).collect(),
+        tags: tags.into_iter().map(str::to_string).collect(),
         findings,
         rustdesk_missing: host.is_empty() || key.is_empty(),
     }
@@ -374,6 +373,223 @@ mod tests {
         assert!(!customer_filter(&data, data.customer(2).unwrap(), "lun-seg", None));
         assert_eq!(rustdesk_query(" 100 200 300 ").as_deref(), Some("100200300"));
         assert!(rustdesk_query("corvo").is_none());
+    }
+
+    /// The per-customer state as it was built before the records were grouped (every customer
+    /// rescans every record), with the findings of `views::review` on the whole data.
+    fn customers_by_scanning(data: &Data, now: DateTime<Utc>) -> (HashMap<u64, CustomerDerived>, Vec<Finding>) {
+        let prefs = &data.preferences;
+        let now_stamp = time::stamp(now);
+        let current = privacy::current_notice(&data.notices, now);
+        let known = privacy::known_purposes(&data.privacy);
+        let mut customers = HashMap::new();
+        for c in &data.customers {
+            let devices: Vec<_> = data.devices.iter().filter(|d| d.customer_id == c.id && !d.retired).collect();
+            let remote_devices = devices.iter().any(|d| !d.rustdesk_id.is_empty());
+            let unattended_devices: Vec<u64> = devices.iter().filter(|d| d.unattended).map(|d| d.id).collect();
+            let work: Vec<_> = data.interventions.iter().filter(|i| i.customer_id == c.id).collect();
+            let remote_work = work.iter().any(|i| i.kind.is_remote());
+            let notice = match (current, privacy::last_delivery(&data.privacy, c.id)) {
+                (None, _) => NoticeState::NoNotice,
+                (Some(cur), None) => NoticeState::NotDelivered { current: cur.version.clone() },
+                (Some(cur), Some(d)) if d.notice_version == cur.version => {
+                    NoticeState::UpToDate { version: cur.version.clone(), at: d.at.clone(), method: method_name(d.method) }
+                }
+                (Some(cur), Some(d)) => NoticeState::Outdated { old: d.notice_version.clone(), new: cur.version.clone() },
+            };
+            let purposes: Vec<PurposeRow> = known
+                .iter()
+                .map(|p| {
+                    let (state, event) = privacy::purpose_state(&data.privacy, c.id, p, now, prefs.consent_validity_months);
+                    PurposeRow { id: p.clone(), state, event: event.map(|e| e.id) }
+                })
+                .collect();
+            let remote = purposes.iter().find(|p| p.id == "remote_assistance").map(|p| p.state).unwrap_or(PurposeState::Missing);
+            let unattended = purposes.iter().find(|p| p.id == "unattended_access").map(|p| p.state).unwrap_or(PurposeState::Missing);
+            let mut reasons = Vec::new();
+            let needs_remote = remote_devices || remote_work;
+            match &notice {
+                NoticeState::NotDelivered { .. } => reasons.push("Privacy notice not delivered"),
+                NoticeState::Outdated { .. } => reasons.push("Privacy notice outdated"),
+                _ => {}
+            }
+            match remote {
+                PurposeState::Missing if needs_remote => reasons.push("Remote assistance consent missing"),
+                PurposeState::Withdrawn if needs_remote => reasons.push("Remote assistance consent withdrawn"),
+                PurposeState::Expired => reasons.push("Remote assistance consent expired"),
+                _ => {}
+            }
+            if !unattended_devices.is_empty() && unattended != PurposeState::Given {
+                reasons.push("A PC has unattended access without consent");
+            }
+            let dot = if c.erased_at.is_some() {
+                None
+            } else if needs_remote && matches!(remote, PurposeState::Missing | PurposeState::Withdrawn) {
+                Some((Icon::ShieldOff, Tone::Bad))
+            } else if !reasons.is_empty() {
+                Some((Icon::Warning, Tone::Warn))
+            } else if matches!(notice, NoticeState::UpToDate { .. }) && remote == PurposeState::Given {
+                Some((Icon::ShieldCheck, Tone::Ok))
+            } else {
+                None
+            };
+            let last = work.iter().map(|i| i.started_at.as_str()).max().unwrap_or_default().to_string();
+            let retention_due = if prefs.retention_years > 0 && c.erased_at.is_none() {
+                let since = if last.is_empty() { c.created_at.as_str() } else { last.as_str() };
+                time::add_months(since, prefs.retention_years.saturating_mul(12)).filter(|due| *due <= now_stamp).map(|_| since.to_string())
+            } else {
+                None
+            };
+            let derived = CustomerDerived {
+                devices: devices.len(),
+                remote_devices,
+                unattended_devices,
+                interventions: work.len(),
+                minutes: work.iter().map(|i| u64::from(i.minutes)).sum(),
+                running: work.iter().filter(|i| i.running()).count(),
+                last_intervention: last,
+                privacy_events: data.privacy.iter().filter(|e| e.customer_id == c.id).count(),
+                notice,
+                purposes,
+                dot,
+                reasons,
+                retention_due,
+            };
+            customers.insert(c.id, derived);
+        }
+        let findings = views::review(data, now)["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| Finding {
+                issue: f["issue"].as_str().unwrap_or_default().to_string(),
+                customer: f["customer"].as_u64(),
+                intervention: f["intervention"].as_u64(),
+                technician: f["technician"].as_str().unwrap_or_default().to_string(),
+                detail: f["text"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect();
+        (customers, findings)
+    }
+
+    /// A deterministic desk of `n` customers mixing what the derived state looks at: archived,
+    /// erased and repeated customers, PCs with and without RustDesk, unattended, retired or of
+    /// no known customer, remote and other work, running timers, deliveries of old and current
+    /// notices, consents given, withdrawn or expired and of custom purposes, events recorded out
+    /// of order and tied on time, tags.
+    fn synthetic(n: u64, now: DateTime<Utc>) -> Data {
+        use remotecraft_engine::core::chrono::TimeDelta;
+        use remotecraft_engine::core::{Device, Intervention, InterventionKind, Notice, PrivacyEvent, PrivacyKind};
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move |m: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % m.max(1)
+        };
+        let ago = |minutes: u64| time::stamp(now - TimeDelta::minutes(i64::try_from(minutes).unwrap()));
+        let pick = |list: &[&'static str], k: u64| list[usize::try_from(k).unwrap() % list.len()];
+        let mut data = Data::new();
+        data.preferences.consent_validity_months = 24;
+        data.preferences.retention_years = 10;
+        data.notices.push(Notice { id: 1, version: "v1".into(), effective_from: ago(4000 * 1440), ..Notice::default() });
+        data.notices.push(Notice { id: 2, version: "v2".into(), effective_from: ago(30 * 1440), ..Notice::default() });
+        data.notices.push(Notice { id: 3, version: "v3".into(), effective_from: time::stamp(now + TimeDelta::days(10)), ..Notice::default() });
+        let kinds = [InterventionKind::Remote, InterventionKind::Onsite, InterventionKind::Phone, InterventionKind::Lab, InterventionKind::Other];
+        let (mut device_id, mut work_id) = (0, 0);
+        for i in 0..n {
+            let id = if i > 0 && i % 97 == 0 { i } else { i + 1 };
+            data.customers.push(Customer {
+                id,
+                name: format!("Cliente {i}"),
+                tags: vec![pick(&["contratto", "vip", "scuola", "negozio"], rnd(4)).to_string()],
+                archived: rnd(7) == 0,
+                erased_at: (rnd(11) == 0).then(|| ago(10)),
+                created_at: ago(rnd(6000) * 1440),
+                ..Customer::default()
+            });
+            for _ in 0..rnd(4) {
+                device_id += 1;
+                data.devices.push(Device {
+                    id: device_id,
+                    customer_id: if rnd(50) == 0 { n + 10 } else { id },
+                    rustdesk_id: if rnd(3) == 0 { String::new() } else { format!("{}", 100_000_000 + device_id) },
+                    unattended: rnd(4) == 0,
+                    retired: rnd(6) == 0,
+                    ..Device::default()
+                });
+            }
+            for _ in 0..rnd(40) {
+                work_id += 1;
+                let started = rnd(5000 * 1440);
+                let running = rnd(30) == 0;
+                data.interventions.push(Intervention {
+                    id: work_id,
+                    customer_id: id,
+                    kind: kinds[usize::try_from(rnd(5)).unwrap()],
+                    technician: pick(&["anna", "bruno", "", "carla"], rnd(4)).to_string(),
+                    started_at: ago(if running && rnd(2) == 0 { rnd(600) } else { started }),
+                    ended_at: (!running).then(|| ago(started.saturating_sub(60))),
+                    minutes: u32::try_from(rnd(240)).unwrap(),
+                    ..Intervention::default()
+                });
+            }
+        }
+        let privacy_kinds = [PrivacyKind::NoticeDelivered, PrivacyKind::ConsentGiven, PrivacyKind::ConsentWithdrawn, PrivacyKind::ConsentGiven];
+        for k in 0..n * 4 {
+            let kind = privacy_kinds[usize::try_from(rnd(4)).unwrap()];
+            let purpose = if kind == PrivacyKind::NoticeDelivered {
+                ""
+            } else {
+                pick(&["remote_assistance", "unattended_access", "marketing", "custom_one", "custom_two"], rnd(5))
+            };
+            data.privacy.push(PrivacyEvent {
+                id: if rnd(20) == 0 { k } else { k + 1 },
+                customer_id: rnd(n + 2),
+                kind,
+                purpose: purpose.into(),
+                notice_version: pick(&["v1", "v2", "v3"], rnd(3)).into(),
+                at: ago([20, 400, 900, 1200][usize::try_from(rnd(4)).unwrap()] * 1440),
+                expires_at: match rnd(5) {
+                    0 => Some(ago(1440)),
+                    1 => Some(time::stamp(now + TimeDelta::days(30))),
+                    _ => None,
+                },
+                ..PrivacyEvent::default()
+            });
+        }
+        for k in (1..data.privacy.len()).rev() {
+            data.privacy.swap(k, usize::try_from(rnd(u64::try_from(k).unwrap() + 1)).unwrap());
+        }
+        data
+    }
+
+    #[test]
+    fn grouping_by_customer_builds_what_scanning_every_record_built() {
+        let now = time::parse_stamp("2026-10-13T08:00:00Z").unwrap();
+        let mut desks = vec![mock::demo(now), Data::new()];
+        desks.extend([1, 30, 400].map(|n| synthetic(n, now)));
+        for data in &desks {
+            let d = build(data, now, 7, &(String::new(), String::new()), "zeno");
+            let (customers, findings) = customers_by_scanning(data, now);
+            assert_eq!(d.customers, customers, "{} customers", data.customers.len());
+            assert_eq!(d.findings, findings, "{} customers", data.customers.len());
+            let mut technicians: Vec<String> = data.interventions.iter().map(|i| i.technician.clone()).filter(|t| !t.is_empty()).collect();
+            technicians.push("zeno".into());
+            technicians.sort();
+            technicians.dedup();
+            assert_eq!(d.technicians, technicians);
+            let mut tags: Vec<String> = data.customers.iter().filter(|c| c.erased_at.is_none()).flat_map(|c| c.tags.iter().cloned()).collect();
+            tags.sort();
+            tags.dedup();
+            assert_eq!(d.tags, tags);
+        }
+        // The synthetic desk reaches every dot and reason.
+        let big = desks.last().unwrap();
+        let d = build(big, now, 7, &(String::new(), String::new()), "");
+        for dot in [Some((Icon::ShieldOff, Tone::Bad)), Some((Icon::Warning, Tone::Warn)), Some((Icon::ShieldCheck, Tone::Ok)), None] {
+            assert!(d.customers.values().any(|c| c.dot == dot), "{dot:?}");
+        }
+        assert!(d.customers.values().any(|c| c.retention_due.is_some()));
+        assert!(!d.running.is_empty() && !d.technicians.contains(&String::new()));
     }
 
     #[test]

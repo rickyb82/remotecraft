@@ -34,7 +34,7 @@ impl App {
 }
 
 /// Opens a TCP connection (3 s at most per address) and answers how long it took, for
-/// `rustdesk.check`.
+/// `rustdesk.check` (the session runs it off the interface's thread, one port per thread).
 fn probe(host: &str, port: u16) -> Result<u64, String> {
     use std::net::ToSocketAddrs;
     let start = std::time::Instant::now();
@@ -68,6 +68,9 @@ impl eframe::App for App {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
         self.0.ui(ui);
         self.serve_requests();
+        // An idle window still pumps every 2 s, so what the MCP server or the CLI writes to the
+        // desk file shows without a click.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));
     }
 }
 

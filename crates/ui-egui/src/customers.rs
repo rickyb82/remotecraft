@@ -59,10 +59,12 @@ pub const LABELS_IT: &[(&str, &str)] = &[
         "Personal data erased on {date}. Times and the privacy record are kept without names.",
         "Dati personali cancellati il {date}. Tempi e registro privacy restano, senza nomi.",
     ),
-    (
-        "{n} PCs anonymised · {m} interventions kept without text · {k} privacy events kept",
-        "{n} PC anonimizzati · {m} interventi conservati senza testo · {k} eventi privacy conservati",
-    ),
+    ("1 PC anonymised", "1 PC anonimizzato"),
+    ("{n} PCs anonymised", "{n} PC anonimizzati"),
+    ("1 intervention kept without text", "1 intervento conservato senza testo"),
+    ("{n} interventions kept without text", "{n} interventi conservati senza testo"),
+    ("1 privacy event kept", "1 evento privacy conservato"),
+    ("{n} privacy events kept", "{n} eventi privacy conservati"),
     ("Details", "Dettagli"),
     ("Contacts", "Contatti"),
     ("Add contact", "Aggiungi contatto"),
@@ -85,6 +87,7 @@ pub const LABELS_IT: &[(&str, &str)] = &[
     ("Not an e-mail address", "Non è un indirizzo e-mail"),
     ("Allow a duplicate (same tax ID or name)", "Consenti un doppione (stessa P. IVA o stesso nome)"),
     ("{name} already has this name or tax ID", "{name} ha già questo nome o questa P. IVA"),
+    ("1 intervention · {hours} h · {running} running", "1 intervento · {hours} h · {running} in corso"),
     ("{n} interventions · {hours} h · {running} running", "{n} interventi · {hours} h · {running} in corso"),
     ("Show all", "Mostra tutti"),
     ("No interventions yet", "Ancora nessun intervento"),
@@ -123,8 +126,9 @@ const WHO_MAX: usize = 6;
 const RECENT: usize = 20;
 /// How many tag chips a row shows before `+n`.
 const ROW_TAGS: usize = 3;
-/// Below this window width the card replaces the list.
-const NARROW: f32 = 980.0;
+/// Below this window width the card replaces the list: the nav (235 px), the pane (520 px) and
+/// a list of about 480 px, the least that shows a row's name, its PCs and its date.
+const NARROW: f32 = 1240.0;
 /// The width of the form's label column.
 const LABEL_W: f32 = 104.0;
 
@@ -361,7 +365,7 @@ fn clear_banner(app: &mut DeskApp) {
 // The shell's entry points
 
 /// Draws the screen: the card (or the form) in the right pane when something is open, then the
-/// list. Below 980 px of window width the pane replaces the list.
+/// list. Below [`NARROW`] px of window width the pane replaces the list.
 pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     refresh_rows(app);
     if app.erase.customer.is_some() && app.erase.customer != app.selected_customer {
@@ -395,24 +399,35 @@ pub fn show(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
 }
 
 fn narrow(ui: &egui::Ui) -> bool {
-    ui.ctx().content_rect().width() < NARROW
+    narrow_width(ui.ctx().content_rect().width())
+}
+
+/// Whether a window this wide shows the pane alone.
+fn narrow_width(width: f32) -> bool {
+    width < NARROW
 }
 
 /// Applies a finished command of this screen.
 pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
     match intent {
         Intent::Saved => {
-            if app.customers.busy == Some(c.job) {
+            // Only the form that sent it: on a remote desk the answer may come after the form
+            // was closed and another one opened, which a late answer must leave alone.
+            let mine = app.customers.busy == Some(c.job);
+            if mine {
                 app.customers.busy = None;
             }
             match &c.result {
                 Ok(v) => {
-                    app.customers.form = None;
                     app.toast(app.tr("Customer saved").to_string());
-                    if let Some(id) = forms::new_id(v, "customer") {
-                        app.open_when_ready(Screen::Customers, id);
+                    if mine {
+                        app.customers.form = None;
+                        if let Some(id) = forms::new_id(v, "customer") {
+                            app.open_when_ready(Screen::Customers, id);
+                        }
                     }
                 }
+                Err(_) if !mine => {}
                 Err(e) => {
                     let text = e.to_string();
                     let duplicate = text.contains("already has this name or tax id");
@@ -657,6 +672,27 @@ fn pill(ui: &mut egui::Ui, t: &Tokens, icon: Option<Icon>, text: &str, on: bool,
     (resp, cleared)
 }
 
+/// The main action at the right end of a wrapped header row (New customer, New notice
+/// version): the accent button when the rest of the row fits it, else its icon, on a row of its
+/// own when even that does not fit. Answers whether it was clicked.
+pub(crate) fn header_action(ui: &mut egui::Ui, t: &Tokens, icon: Icon, label: &str, tip: &str) -> bool {
+    let gap = ui.spacing().item_spacing.x;
+    // `widgets::primary_button`'s width: the text, the padding and the icon.
+    let wide = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(14.0), t.on_accent).size().x + 54.0 + gap;
+    // What is left of the row (`available_width` is the whole row's in a wrapping layout).
+    if ui.available_size_before_wrap().x < 32.0 + gap {
+        ui.end_row();
+    }
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui.available_width() >= wide {
+            widgets::primary_button(ui, t, Some(icon), label).on_hover_text(tip).clicked()
+        } else {
+            widgets::icon_button(ui, t, icon, label, true, false).clicked()
+        }
+    })
+    .inner
+}
+
 /// The header strip: title and count, the tag filter, the archived toggle, New customer.
 fn header(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     let mut tag_pick: Option<Option<String>> = None;
@@ -664,14 +700,17 @@ fn header(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     let mut create = false;
     egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
+        // Wrapped: when the pane narrows the list, what does not fit goes to a second line
+        // instead of under the pane.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
             let q = app.search.trim();
             let title =
                 if q.is_empty() { app.tr("Customers").to_string() } else { format!("{} · \"{}\"", app.tr("Customers"), format::clipped(q, 32)) };
-            ui.label(RichText::new(title).strong().color(t.ui_text));
+            ui.add(egui::Label::new(RichText::new(title).strong().color(t.ui_text)).truncate());
             let n = app.customers.rows.len();
             let count = if n == 1 { app.tr("1 customer").to_string() } else { app.language.fill("{n} customers", &[("n", &n.to_string())]) };
-            ui.label(RichText::new(count).small().color(t.muted));
+            ui.add(egui::Label::new(RichText::new(count).small().color(t.muted)).extend());
             widgets::divider(ui, t);
             let current = app.customers.tag.clone();
             let (resp, cleared) = match &current {
@@ -698,9 +737,7 @@ fn header(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             });
             let (resp, _) = pill(ui, t, Some(Icon::Archive), app.tr("Show archived"), app.customers.show_archived, false);
             toggle = resp.clicked();
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                create = widgets::primary_button(ui, t, Some(Icon::Plus), app.tr("New customer")).on_hover_text(app.tip("customer.add")).clicked();
-            });
+            create = header_action(ui, t, Icon::Plus, app.tr("New customer"), &app.tip("customer.add"));
         });
     });
     if let Some(tag) = tag_pick {
@@ -1200,14 +1237,16 @@ fn erased_banner(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, c: &Customer, at:
         &[],
     );
     let devices = app.data().devices.iter().filter(|d| d.customer_id == c.id).count();
-    let kept = app.language.fill(
-        "{n} PCs anonymised · {m} interventions kept without text · {k} privacy events kept",
-        &[
-            ("n", &devices.to_string()),
-            ("m", &info.map_or(0, |i| i.interventions).to_string()),
-            ("k", &info.map_or(0, |i| i.privacy_events).to_string()),
-        ],
-    );
+    let (work, events) = info.map_or((0, 0), |i| (i.interventions, i.privacy_events));
+    let kept = [
+        (devices, "1 PC anonymised", "{n} PCs anonymised"),
+        (work, "1 intervention kept without text", "{n} interventions kept without text"),
+        (events, "1 privacy event kept", "{n} privacy events kept"),
+    ]
+    .iter()
+    .map(|(n, one, many)| if *n == 1 { app.tr(one).to_string() } else { app.language.fill(many, &[("n", &n.to_string())]) })
+    .collect::<Vec<_>>()
+    .join(" · ");
     ui.label(RichText::new(kept).small().color(t.muted));
     ui.add_space(6.0);
 }
@@ -1336,10 +1375,10 @@ fn interventions_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, id: u
             ui.label(RichText::new(app.tr("No interventions yet")).color(t.muted));
             return;
         }
-        let totals = app.language.fill(
-            "{n} interventions · {hours} h · {running} running",
-            &[("n", &total.to_string()), ("hours", &hours(minutes, app.italian())), ("running", &running.to_string())],
-        );
+        let text =
+            if total == 1 { "1 intervention · {hours} h · {running} running" } else { "{n} interventions · {hours} h · {running} running" };
+        let totals =
+            app.language.fill(text, &[("n", &total.to_string()), ("hours", &hours(minutes, app.italian())), ("running", &running.to_string())]);
         ui.label(RichText::new(totals).small().color(t.muted));
         ui.add_space(4.0);
         for i in &recent {
@@ -1752,6 +1791,121 @@ mod tests {
         export(&mut app, 2);
         frame(&mut app);
         assert!(app.requests.iter().any(|r| matches!(r, crate::Request::SaveFile { name, .. } if name.starts_with("export-ferramenta-corvo-"))));
+    }
+
+    #[test]
+    fn a_late_answer_leaves_the_next_form_alone() {
+        // On a remote desk the answer may come after the form was closed and another opened.
+        let mut app = demo();
+        frame(&mut app);
+        open_new(&mut app, "Officina A");
+        let f = app.customers.form.clone().unwrap();
+        submit(&mut app, f);
+        assert!(close(&mut app), "Esc before the answer");
+        open_new(&mut app, "Officina B");
+        app.selected_customer = Some(2);
+        frame(&mut app);
+        assert!(app.data().customers.iter().any(|c| c.name == "Officina A"), "A was saved");
+        assert!(app.toast.as_ref().is_some_and(|(text, _)| text == "Customer saved"));
+        let f = app.customers.form.clone().expect("B's form stays open");
+        assert_eq!(f.name, "Officina B");
+        assert!(f.error.is_empty());
+        assert_eq!(app.selected_customer, Some(2), "no jump to A");
+        assert!(app.pending_open.is_none());
+        // A late refusal does not land in B's form either.
+        open_edit(&mut app, 2);
+        let mut f = app.customers.form.clone().unwrap();
+        f.email = "not an address".into();
+        submit(&mut app, f);
+        open_new(&mut app, "Officina C");
+        frame(&mut app);
+        let f = app.customers.form.clone().expect("C's form stays open");
+        assert_eq!(f.name, "Officina C");
+        assert!(f.error.is_empty() && !f.duplicate, "{}", f.error);
+        // The form that sent it still gets its answer.
+        let f = Form { email: "not an address".into(), ..f };
+        submit(&mut app, f);
+        frame(&mut app);
+        assert!(app.customers.form.as_ref().is_some_and(|f| f.error.contains("e-mail")));
+    }
+
+    /// The header's texts at `w` (the title, the count, the pills, New customer), each drawn
+    /// whole and none over another.
+    fn header_is_whole(app: &mut DeskApp, w: f32) {
+        use crate::privacy::tests::{texts_at, whole};
+        let texts = texts_at(app, w);
+        let title = app.tr("Customers").to_string();
+        let mut labels: Vec<String> = [app.tr("Tag"), app.tr("Show archived"), app.tr("New customer")].iter().map(|s| s.to_string()).collect();
+        labels.extend(
+            (0..=3).map(|n| if n == 1 { app.tr("1 customer").to_string() } else { app.language.fill("{n} customers", &[("n", &n.to_string())]) }),
+        );
+        let header: Vec<&(String, Rect, Rect)> = texts.iter().filter(|(s, _, _)| s.starts_with(&title) || labels.contains(s)).collect();
+        for label in [app.tr("Tag"), app.tr("Show archived")] {
+            assert!(header.iter().any(|(s, _, _)| s == label), "{w}: {label} is drawn: {texts:?}");
+        }
+        for (i, a) in header.iter().enumerate() {
+            assert!(whole(a), "{w}: {a:?} is cut off");
+            for b in header.iter().skip(i + 1) {
+                assert!(!a.1.shrink(1.0).intersects(b.1.shrink(1.0)), "{w}: {a:?} over {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_header_fits_next_to_the_card() {
+        for lang in Language::ALL {
+            let mut app = demo();
+            app.language = lang;
+            app.selected_customer = Some(1);
+            for search in ["", "studio", "studio tecnico lunaria e altro testo"] {
+                app.search = search.into();
+                for w in [1240.0, 1300.0, 1440.0, 1800.0] {
+                    header_is_whole(&mut app, w);
+                }
+            }
+            // Narrower, the card replaces the list (whose names, PCs and dates would not fit).
+            app.search.clear();
+            for w in [1000.0, 1200.0] {
+                let texts = crate::privacy::tests::texts_at(&mut app, w);
+                assert!(crate::privacy::tests::find(&texts, app.tr("Show archived")).is_none(), "{lang:?} at {w}: no list");
+                assert!(crate::privacy::tests::find(&texts, "Studio Tecnico Lunaria").is_some_and(crate::privacy::tests::whole), "{lang:?} at {w}");
+            }
+            assert!(narrow_width(1239.0) && !narrow_width(1240.0));
+        }
+    }
+
+    #[test]
+    fn counts_of_one_are_singular() {
+        use crate::privacy::tests::{find, texts_in};
+        let texts_at = |app: &mut DeskApp, w: f32| texts_in(app, w, 1800.0);
+        let mut app = demo();
+        app.selected_customer = Some(3);
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(find(&texts, "1 intervention · 1.5 h · 0 running").is_some(), "{texts:?}");
+        app.language = Language::It;
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(find(&texts, "1 intervento · 1,5 h · 0 in corso").is_some(), "{texts:?}");
+        // The erased card: what was kept, each count with its own noun.
+        app.run("gdpr.erase", json!({"customer": 3, "confirm": true, "reason": "richiesta"}));
+        frame(&mut app);
+        app.language = Language::En;
+        assert_eq!(app.derived.customer(3).map(|i| i.privacy_events), Some(1), "Elio has one privacy event");
+        let texts = texts_at(&mut app, 1440.0);
+        let kept = "1 PC anonymised · 1 intervention kept without text · 1 privacy event kept";
+        assert!(find(&texts, kept).is_some(), "{texts:?}");
+        app.language = Language::It;
+        let texts = texts_at(&mut app, 1440.0);
+        let kept = "1 PC anonimizzato · 1 intervento conservato senza testo · 1 evento privacy conservato";
+        assert!(find(&texts, kept).is_some(), "{texts:?}");
+        // And the plural, for a customer with more of each.
+        app.run("gdpr.erase", json!({"customer": 1, "confirm": true, "reason": "richiesta"}));
+        frame(&mut app);
+        app.selected_customer = Some(1);
+        let texts = texts_at(&mut app, 1440.0);
+        assert!(
+            texts.iter().any(|(s, _, _)| s.starts_with("3 PC anonimizzati · ") && s.contains(" interventi conservati senza testo · ")),
+            "{texts:?}"
+        );
     }
 
     #[test]

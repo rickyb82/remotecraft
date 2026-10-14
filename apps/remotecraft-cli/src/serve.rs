@@ -233,19 +233,44 @@ fn mime_of(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// A file of the web app (`index.html` for `/`); paths never leave the directory.
+/// Largest file of the web app served (the wasm module is a few MB).
+const MAX_STATIC: u64 = 64 * 1024 * 1024;
+
+/// A file of the web app (`index.html` for `/`). The decoded path must be plain names (no
+/// root, `..`, `.`, drive or backslash: `/%2Fetc%2Fpasswd` must not become `/etc/passwd`),
+/// the file it resolves to (symbolic links followed) must lie inside the directory, and only
+/// regular files up to [`MAX_STATIC`] are read.
 fn serve_static(stream: &mut TcpStream, dir: &std::path::Path, path: &str, origin: Option<&str>) {
+    use std::path::{Component, Path};
     let rel = url_decode(path.trim_start_matches('/'));
     let rel = if rel.is_empty() { "index.html".to_string() } else { rel };
-    if rel.contains("..") || rel.contains('\\') || rel.contains('\0') {
+    let plain = Path::new(&rel).components().all(|c| matches!(c, Component::Normal(_)));
+    if !plain || rel.contains(['\\', '\0', ':']) {
         respond_bytes(stream, "400 Bad Request", "text/plain", b"bad path", origin);
         return;
     }
-    let file = dir.join(&rel);
-    match std::fs::read(&file) {
-        Ok(bytes) => respond_bytes(stream, "200 OK", mime_of(&file), &bytes, origin),
-        Err(_) => respond_bytes(stream, "404 Not Found", "text/plain; charset=utf-8", b"not found", origin),
+    match read_static(dir, &rel) {
+        Some(bytes) => respond_bytes(stream, "200 OK", mime_of(Path::new(&rel)), &bytes, origin),
+        None => respond_bytes(stream, "404 Not Found", "text/plain; charset=utf-8", b"not found", origin),
     }
+}
+
+/// The bytes of `dir/rel` when it is a regular file inside `dir`, at most [`MAX_STATIC`].
+fn read_static(dir: &std::path::Path, rel: &str) -> Option<Vec<u8>> {
+    let root = dir.canonicalize().ok()?;
+    let file = root.join(rel).canonicalize().ok()?;
+    if !file.starts_with(&root) {
+        return None;
+    }
+    // Checked before opening: opening a FIFO would wait for a writer.
+    let meta = std::fs::metadata(&file).ok()?;
+    if !meta.is_file() || meta.len() > MAX_STATIC {
+        return None;
+    }
+    let f = std::fs::File::open(&file).ok()?;
+    let mut bytes = Vec::new();
+    f.take(MAX_STATIC + 1).read_to_end(&mut bytes).ok()?;
+    (u64::try_from(bytes.len()).ok()? <= MAX_STATIC).then_some(bytes)
 }
 
 const WELCOME: &str = "RemoteCraft server is running.\n\nAPI: POST /api/cmd {\"command\", \"params\"}  ·  GET /api/snapshot?since=N  ·  GET /api/health\nStart the server with --static DIR to serve the web app's files (apps/remotecraft-web, built with trunk).\n";
@@ -334,6 +359,13 @@ fn route(path: &str, query: &str) -> Option<(&'static str, Value)> {
 
 fn run(hub: &Hub, actor: &str, command: &str, params: &Value) -> (&'static str, Value) {
     let result = match hub.desk.lock() {
+        // The RustDesk check waits on the network (seconds when a firewall drops the
+        // packets): it probes after the desk is released, so other requests go on.
+        Ok(mut d) if command == "rustdesk.check" => {
+            let check = d.prepare_rustdesk_check(params);
+            drop(d);
+            check.map(|c| c.run())
+        }
         Ok(mut d) => d.execute_as(actor, command, params),
         Err(_) => return ("500 Internal Server Error", json!({"error": "the desk is unavailable"})),
     };
@@ -571,6 +603,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.html"), "<html>app</html>").unwrap();
         std::fs::write(dir.join("app.wasm"), [0u8, 1, 2]).unwrap();
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets/app.js"), "export {}").unwrap();
         let opts = Options { bind: "127.0.0.1:0".into(), token: "svc".into(), tokens_dir: None, static_dir: Some(dir.clone()) };
         let listener = bind(&opts).unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -597,14 +631,102 @@ mod tests {
         let mut out = Vec::new();
         s.read_to_end(&mut out).unwrap();
         assert!(String::from_utf8_lossy(&out).contains("application/wasm"));
-        for bad in ["/../Cargo.toml", "/%2e%2e/Cargo.toml", "/missing.js"] {
+        let get = |path: &str| {
             let mut s = TcpStream::connect(&addr).unwrap();
-            s.write_all(format!("GET {bad} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
-            let mut out = String::new();
-            let _ = s.read_to_string(&mut out);
-            assert!(out.starts_with("HTTP/1.1 4"), "{bad}: {out}");
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        assert!(get("/assets/app.js").starts_with("HTTP/1.1 200"));
+        // Nothing outside the directory, however the path is spelled: an encoded leading slash
+        // used to reach any absolute path (the token in /proc/self/environ), and /dev/zero
+        // used to grow until the server aborted.
+        let mut bad = vec![
+            "/../Cargo.toml",
+            "/%2e%2e/Cargo.toml",
+            "/missing.js",
+            "/%2Fetc%2Fhostname",
+            "/%2Fproc%2Fself%2Fenviron",
+            "/%2Fdev%2Fzero",
+            "//etc/hostname",
+            "/assets/%2E%2E/%2E%2E/Cargo.toml",
+            "/./index.html",
+            "/C:%5CWindows%5Cwin.ini",
+            "/assets",
+            "/assets/",
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hostname", dir.join("leak.txt")).unwrap();
+            std::os::unix::fs::symlink("/dev/zero", dir.join("zero.js")).unwrap();
+            bad.extend(["/leak.txt", "/zero.js"]);
+            // A FIFO would block the answer forever if it were opened.
+            if std::process::Command::new("mkfifo").arg(dir.join("pipe.js")).status().is_ok_and(|s| s.success()) {
+                bad.push("/pipe.js");
+            }
+        }
+        for path in bad {
+            let out = get(path);
+            assert!(out.starts_with("HTTP/1.1 4"), "{path}: {out}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_and_commands_without_a_named_user_use_the_desk_actor() {
+        for token in ["", "svc"] {
+            let addr = start(token);
+            let bearer = format!("Bearer {token}");
+            let auth: Vec<(&str, &str)> = if token.is_empty() { vec![] } else { vec![("Authorization", bearer.as_str())] };
+            let (st, snap) = http(&addr, "GET", "/api/snapshot?since=0", &auth, "");
+            assert_eq!(st, 200);
+            assert_eq!(snap["actor"], "server", "the web app finds its own timers by this name");
+            let body = r#"{"command": "intervention.start", "params": {"customer": 2, "kind": "phone"}}"#;
+            let (_, v) = http(&addr, "POST", "/api/cmd", &auth, body);
+            assert_eq!(v["result"]["intervention"]["technician"], snap["actor"]);
+        }
+    }
+
+    #[test]
+    fn rustdesk_check_does_not_hold_the_desk() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        let (go, wait) = mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let mut desk = Desk::demo();
+        desk.set_rustdesk_probe(
+            "127.0.0.1",
+            Box::new(move |_: &str, _: u16| {
+                let released = wait.lock().map(|rx| rx.recv_timeout(Duration::from_secs(10)).is_ok()).unwrap_or(false);
+                if released { Ok(1) } else { Err("not released".into()) }
+            }),
+        );
+        let opts = Options { bind: "127.0.0.1:0".into(), token: String::new(), tokens_dir: None, static_dir: None };
+        let listener = bind(&opts).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || serve(listener, desk, opts));
+        let done = Arc::new(AtomicBool::new(false));
+        let check = {
+            let (addr, done) = (addr.clone(), done.clone());
+            std::thread::spawn(move || {
+                let r = http(&addr, "GET", "/api/rustdesk/check", &[], "");
+                done.store(true, Ordering::SeqCst);
+                r
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        // While the probes wait, the desk still answers.
+        assert_eq!(http(&addr, "GET", "/api/status", &[], "").0, 200);
+        assert!(!done.load(Ordering::SeqCst), "the status waited for the check");
+        for _ in 0..3 {
+            go.send(()).unwrap();
+        }
+        let (st, v) = check.join().unwrap();
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["result"]["ports"][0]["ok"], true);
+        assert_eq!(http(&addr, "GET", "/api/rustdesk/check?host=a%20b", &[], "").0, 400);
     }
 
     #[test]

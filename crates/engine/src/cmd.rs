@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::params::{boolean, bounded, first, list, notes, number, page, required, text};
 use crate::views::{self, customer_ref, device_ref, intervention_json, privacy_status, state_name, to_value};
-use crate::{Ctx, Desk, Result};
+use crate::{Ctx, Desk, Result, SharedProbe};
 
 /// A command's description (the catalogue the CLI, the MCP server and an interface show).
 #[derive(Clone, Copy, Debug)]
@@ -117,7 +117,7 @@ pub const COMMANDS: &[Command] = &[
         "intervention.update",
         "Edit Intervention",
         "Interventions › Edit",
-        "{id, kind?, summary?, notes?, reference?, started_at?, ended_at?, minutes?, billable?, technician?, device? (null = none)}",
+        "{id, kind?, summary?, notes?, reference?, started_at?, ended_at?, minutes?, billable?, technician?, device? (null = none), consent_override? (when it becomes remote, or remote on another PC, without the consent)} → intervention, warnings",
         W,
         W,
     ),
@@ -538,7 +538,10 @@ fn apply_device(data: &Data, d: &mut Device, p: &Value) -> CoreResult<()> {
     }
     if let Some(v) = text(p, "rustdesk_id")? {
         let rid = rustdesk::normalize(&v)?;
+        // An unchanged ID is never a new clash: clients that send every field (the form, the
+        // CLI, an agent) can still save a PC whose ID an older record shares.
         if !rid.is_empty()
+            && rid != d.rustdesk_id
             && let Some(o) = data.devices.iter().find(|o| o.id != d.id && !o.retired && o.rustdesk_id == rid)
         {
             return Err(Error::Refused(format!(
@@ -692,6 +695,22 @@ fn device_find(data: &Data, p: &Value) -> CoreResult<Value> {
 fn device_retire(data: &mut Data, ctx: &mut Ctx, p: &Value) -> CoreResult<Value> {
     let id = device_of(data, p, None)?;
     let retired = boolean(p, "retired")?.unwrap_or(true);
+    // Back in service only while no other PC in service has its RustDesk ID (the ID may have
+    // gone to a new PC since): two would make every lookup by ID ambiguous.
+    if !retired
+        && let Some(d) = data.device(id)
+        && d.retired
+        && !d.rustdesk_id.is_empty()
+        && let Some(o) = data.devices.iter().find(|o| o.id != id && !o.retired && o.rustdesk_id == d.rustdesk_id)
+    {
+        return Err(Error::Refused(format!(
+            "RustDesk ID {} is already on device {} `{}` of {}: retire that one first",
+            rustdesk::display(&d.rustdesk_id),
+            o.id,
+            o.name,
+            views::customer_name(data, o.customer_id)
+        )));
+    }
     let now = time::stamp(ctx.now);
     let d = data.device_mut(id).ok_or_else(|| Error::NotFound(format!("no device {id}")))?;
     d.retired = retired;
@@ -988,6 +1007,7 @@ fn intervention_update(data: &mut Data, ctx: &mut Ctx, p: &Value) -> CoreResult<
     if data.customer(i.customer_id).is_some_and(|c| c.erased_at.is_some()) {
         return Err(Error::Refused("this customer's data was erased".into()));
     }
+    let (was_remote, old_device) = (i.kind.is_remote(), i.device_id);
     if let Some(k) = text(p, "kind")?.filter(|k| !k.is_empty()) {
         i.kind = InterventionKind::parse(&k).ok_or_else(|| invalid(format!("`{k}` is not a kind: remote, onsite, phone, lab or other")))?;
     }
@@ -1014,6 +1034,20 @@ fn intervention_update(data: &mut Data, ctx: &mut Ctx, p: &Value) -> CoreResult<
         }
         None => {}
     }
+    // Becoming remote work, or remote work moved to another PC: the same consent checks as
+    // logging it (taking the PC off is no new remote access).
+    let override_reason = text(p, "consent_override")?.unwrap_or_default();
+    let moved = i.device_id.is_some() && i.device_id != old_device;
+    let warnings = if i.kind.is_remote() && (!was_remote || moved) {
+        let dev = i.device_id.and_then(|d| data.device(d)).cloned();
+        let w = remote_checks(data, ctx, i.customer_id, dev.as_ref(), &override_reason)?;
+        if !ctx.detail.is_empty() {
+            i.consent_override = override_reason;
+        }
+        w
+    } else {
+        Vec::new()
+    };
     let mut times_changed = false;
     if let Some(s) = optional_when(p, "started_at", ctx)? {
         i.started_at = s;
@@ -1036,7 +1070,7 @@ fn intervention_update(data: &mut Data, ctx: &mut Ctx, p: &Value) -> CoreResult<
     i.updated_at = time::stamp(ctx.now);
     ctx.touch("intervention", i.id);
     ctx.touch("customer", i.customer_id);
-    let out = json!({"intervention": intervention_json(data, &i, ctx.now)});
+    let out = json!({"intervention": intervention_json(data, &i, ctx.now), "warnings": warnings});
     if let Some(slot) = data.intervention_mut(i.id) {
         *slot = i;
     }
@@ -1597,7 +1631,78 @@ fn rustdesk_setup(desk: &Desk) -> Value {
     })
 }
 
-fn rustdesk_check(desk: &Desk, p: &Value) -> CoreResult<Value> {
+/// A `rustdesk.check` ready to probe ([`Desk::prepare_rustdesk_check`]): the host and what the
+/// report needs, without the desk, so the probing can run on another thread.
+#[derive(Clone)]
+pub struct RustDeskCheck {
+    host: String,
+    public_host: String,
+    key_known: bool,
+    probe: SharedProbe,
+}
+
+impl std::fmt::Debug for RustDeskCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustDeskCheck").field("host", &self.host).field("public_host", &self.public_host).field("key_known", &self.key_known).finish()
+    }
+}
+
+impl RustDeskCheck {
+    /// The host the check connects to.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Probes every port (in parallel where threads exist, so a host that drops the packets
+    /// costs one probe's timeout, not three) and answers `rustdesk.check`'s report.
+    pub fn run(&self) -> Value {
+        let ports: Vec<Value> = rustdesk::PORTS
+            .iter()
+            .zip(probe_ports(&self.probe, &self.host))
+            .map(|((port, what), r)| match r {
+                Ok(ms) => json!({"port": port, "service": what, "ok": true, "ms": ms}),
+                Err(e) => json!({"port": port, "service": what, "ok": false, "error": e}),
+            })
+            .collect();
+        let all = ports.len() == rustdesk::PORTS.len() && ports.iter().all(|p| p["ok"] == true);
+        json!({
+            "host": self.host,
+            "public_host": self.public_host,
+            "ports": ports,
+            "key_known": self.key_known,
+            "ok": all && self.key_known,
+            "note": "UDP 21116 cannot be tested with a connection: if clients stay offline while TCP works, check UDP forwarding on the router",
+        })
+    }
+}
+
+/// The probe of every RustDesk port, in [`rustdesk::PORTS`] order: one thread per port, or one
+/// after the other where a thread cannot be started.
+#[cfg(not(target_arch = "wasm32"))]
+fn probe_ports(probe: &SharedProbe, host: &str) -> Vec<std::result::Result<u64, String>> {
+    std::thread::scope(|s| {
+        let started: Vec<_> = rustdesk::PORTS
+            .iter()
+            .map(|(port, _)| (*port, std::thread::Builder::new().name("remotecraft-probe".into()).spawn_scoped(s, move || probe(host, *port))))
+            .collect();
+        started
+            .into_iter()
+            .map(|(port, h)| match h {
+                Ok(h) => h.join().unwrap_or_else(|_| Err(format!("the check of port {port} failed"))),
+                Err(_) => probe(host, port),
+            })
+            .collect()
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn probe_ports(probe: &SharedProbe, host: &str) -> Vec<std::result::Result<u64, String>> {
+    rustdesk::PORTS.iter().map(|(port, _)| probe(host, *port)).collect()
+}
+
+/// `rustdesk.check` up to the probing: the probe, the host (the parameter, else where the host
+/// says to check, else the public name) and the key.
+pub(crate) fn rustdesk_check_plan(desk: &Desk, p: &Value) -> CoreResult<RustDeskCheck> {
     let env = desk.rustdesk();
     let Some(probe) = &env.probe else {
         return Err(Error::Refused("this RemoteCraft cannot reach the network (no probe): run the check from the CLI or the server".into()));
@@ -1611,22 +1716,11 @@ fn rustdesk_check(desk: &Desk, p: &Value) -> CoreResult<Value> {
     if host.chars().any(|c| c.is_whitespace() || c == '/' || c == '@') || host.len() > 255 {
         return Err(invalid(format!("`{host}` is not a host name")));
     }
-    let ports: Vec<Value> = rustdesk::PORTS
-        .iter()
-        .map(|(port, what)| match probe(&host, *port) {
-            Ok(ms) => json!({"port": port, "service": what, "ok": true, "ms": ms}),
-            Err(e) => json!({"port": port, "service": what, "ok": false, "error": e}),
-        })
-        .collect();
-    let all = ports.iter().all(|p| p["ok"] == true);
-    Ok(json!({
-        "host": host,
-        "public_host": public_host,
-        "ports": ports,
-        "key_known": !key.is_empty(),
-        "ok": all && !key.is_empty(),
-        "note": "UDP 21116 cannot be tested with a connection: if clients stay offline while TCP works, check UDP forwarding on the router",
-    }))
+    Ok(RustDeskCheck { host, public_host, key_known: !key.is_empty(), probe: probe.clone() })
+}
+
+fn rustdesk_check(desk: &Desk, p: &Value) -> CoreResult<Value> {
+    Ok(rustdesk_check_plan(desk, p)?.run())
 }
 
 fn app_status(desk: &Desk, ctx: &Ctx) -> Value {

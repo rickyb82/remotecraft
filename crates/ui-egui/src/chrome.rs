@@ -70,6 +70,11 @@ pub fn top_bar(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
             if te.changed() {
                 app.search_changed();
             }
+            // Cmd+Enter keeps the focus in a one-line box: consumed here (the top bar draws
+            // before the screens), it starts on the PC found and never saves an open form.
+            if te.has_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
+                app.search_start();
+            }
             if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 app.search_submit();
             }
@@ -101,7 +106,7 @@ pub fn top_bar(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                 egui::Popup::menu(&lang).show(|ui| {
                     for l in Language::ALL {
                         if ui.selectable_label(app.language == l, l.name()).clicked() {
-                            app.language = l;
+                            pick_language(app, l);
                             ui.close();
                         }
                     }
@@ -121,7 +126,7 @@ pub fn top_bar(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                     let disc = pos2(rect.right() - 8.0, rect.top() + 8.0);
                     p.circle_filled(disc, 8.0, color);
                     p.text(disc, egui::Align2::CENTER_CENTER, findings.min(99).to_string(), FontId::proportional(10.0), fill);
-                    if resp.on_hover_text(app.language.fill("Privacy review: {n} findings", &[("n", &findings.to_string())])).clicked() {
+                    if resp.on_hover_text(findings_tip(app.language, findings)).clicked() {
                         app.privacy_review();
                     }
                 }
@@ -138,12 +143,8 @@ pub fn status_bar(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         ui.horizontal(|ui| {
             let problem = app.session.problem();
             let error = match problem.as_deref() {
-                Some("connecting") => None,
-                Some(p) => Some(app.language.fill(
-                    "Server unreachable ({url}): {error}. Start it with: remotecraft-cli serve",
-                    &[("url", &app.session.server()), ("error", &app.language.tr_message(p))],
-                )),
-                None => None,
+                Some("connecting") | None => None,
+                Some(p) => Some(problem_text(app.language, &app.session.server(), p)),
             };
             match error {
                 Some(e) => {
@@ -163,16 +164,53 @@ pub fn status_bar(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                 let d = app.session.data();
                 let customers = d.customers.iter().filter(|c| !c.archived && c.erased_at.is_none()).count();
                 let devices = d.devices.iter().filter(|x| !x.retired).count();
-                let text = format!(
-                    "{} · {} · {}",
-                    app.language.fill("{n} customers", &[("n", &customers.to_string())]),
-                    app.language.fill("{n} devices", &[("n", &devices.to_string())]),
-                    app.language.fill("{n} interventions", &[("n", &d.interventions.len().to_string())]),
-                );
+                let text = counts_text(app.language, customers, devices, d.interventions.len());
                 ui.label(RichText::new(text).small().color(t.muted));
             });
         });
     });
+}
+
+/// The top bar's language menu picked `l`: kept for the next start on a local desk. On a server
+/// the preference is desk-wide (the language of the purpose texts people read), and the web app
+/// keeps the choice in the browser instead.
+fn pick_language(app: &mut DeskApp, l: Language) {
+    app.language = l;
+    if app.session.server().is_empty() {
+        app.run("prefs.set", json!({"language": l.code()}));
+    }
+}
+
+/// The privacy shield's tooltip.
+fn findings_tip(lang: Language, n: usize) -> String {
+    if n == 1 { lang.tr("Privacy review: 1 finding").to_string() } else { lang.fill("Privacy review: {n} findings", &[("n", &n.to_string())]) }
+}
+
+/// The status bar's counts.
+fn counts_text(lang: Language, customers: usize, devices: usize, interventions: usize) -> String {
+    let count = |n: usize, one: &str, many: &str| if n == 1 { lang.tr(one).to_string() } else { lang.fill(many, &[("n", &n.to_string())]) };
+    format!(
+        "{} · {} · {}",
+        count(customers, "1 customer", "{n} customers"),
+        count(devices, "1 device", "{n} devices"),
+        count(interventions, "1 intervention", "{n} interventions"),
+    )
+}
+
+/// The status bar's text for a problem of a remote desk. The session classifies it:
+/// `unauthorized: …` (the token was refused), `incompatible: …` (the server answered what this
+/// app cannot read) or `unreachable: …` (no answer); the detail is translated.
+fn problem_text(lang: Language, url: &str, problem: &str) -> String {
+    let (template, detail) = if let Some(d) = problem.strip_prefix("unauthorized: ") {
+        ("The server refused the token ({url}): {error}. Open RemoteCraft again from the framework's link, or check the token", d)
+    } else if let Some(d) = problem.strip_prefix("incompatible: ") {
+        ("The server and this app are different versions ({url}): {error}. Reload the page or update the app", d)
+    } else if let Some(d) = problem.strip_prefix("unreachable: ") {
+        ("Server unreachable ({url}): {error}. Start it with: remotecraft-cli serve", d)
+    } else {
+        ("Server problem ({url}): {error}", problem)
+    };
+    lang.fill(template, &[("url", url), ("error", &lang.tr_message(detail))])
 }
 
 /// A transient message at the bottom centre.
@@ -267,5 +305,104 @@ pub fn shortcuts_help(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         });
     if !open || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.shortcuts_open = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Completed, DeskSession, Session};
+    use remotecraft_engine::core::Data;
+    use remotecraft_engine::core::chrono::{DateTime, Utc};
+    use serde_json::Value;
+
+    /// The demo desk as a server would show it: a URL and, maybe, a problem.
+    struct Served(Session, Option<&'static str>);
+
+    impl DeskSession for Served {
+        fn data(&self) -> &Data {
+            self.0.data()
+        }
+        fn actor(&self) -> &str {
+            self.0.actor()
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.0.now()
+        }
+        fn execute(&mut self, command: &str, params: &Value) -> u64 {
+            self.0.execute(command, params)
+        }
+        fn pump(&mut self) -> Vec<Completed> {
+            self.0.pump()
+        }
+        fn jobs_pending(&self) -> usize {
+            0
+        }
+        fn revision(&self) -> u64 {
+            self.0.revision()
+        }
+        fn problem(&self) -> Option<String> {
+            self.1.map(str::to_string)
+        }
+        fn server(&self) -> String {
+            "https://desk.test".into()
+        }
+    }
+
+    fn frame(app: &mut DeskApp) {
+        let ctx = egui::Context::default();
+        let input =
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_remote_problem_gives_the_advice_of_its_class() {
+        let it = Language::It;
+        let url = "https://desk.test";
+        let auth = problem_text(it, url, "unauthorized: unknown token");
+        assert!(auth.contains("token sconosciuto") && auth.contains("framework"), "{auth}");
+        assert!(!auth.contains("remotecraft-cli serve"), "{auth}");
+        let old = problem_text(it, url, "incompatible: bad snapshot: missing field `data`");
+        assert!(old.contains("versioni diverse") && old.contains("snapshot non valido"), "{old}");
+        assert!(!old.contains("remotecraft-cli serve"), "{old}");
+        let down = problem_text(it, url, "unreachable: connection refused");
+        assert!(
+            down.contains("Server non raggiungibile (https://desk.test): connection refused") && down.contains("remotecraft-cli serve"),
+            "{down}"
+        );
+        let other = problem_text(Language::En, url, "no intervention 7");
+        assert_eq!(other, "Server problem (https://desk.test): no intervention 7");
+        // The status bar draws each, and "connecting" as the spinner.
+        for p in ["connecting", "unauthorized: unknown token", "incompatible: the snapshot is too large", "unreachable: timeout", "odd"] {
+            let mut app = DeskApp::new(Box::new(Served(Session::demo(), Some(p))));
+            frame(&mut app);
+        }
+    }
+
+    #[test]
+    fn counts_say_one_in_the_singular() {
+        assert_eq!(counts_text(Language::It, 1, 1, 1), "1 cliente · 1 PC · 1 intervento");
+        assert_eq!(counts_text(Language::It, 3, 0, 2), "3 clienti · 0 PC · 2 interventi");
+        assert_eq!(counts_text(Language::En, 1, 2, 1), "1 customer · 2 devices · 1 intervention");
+        assert_eq!(findings_tip(Language::It, 1), "Revisione privacy: 1 segnalazione");
+        assert_eq!(findings_tip(Language::En, 4), "Privacy review: 4 findings");
+    }
+
+    #[test]
+    fn the_language_menu_is_kept_on_a_local_desk_only() {
+        let mut app = DeskApp::demo();
+        pick_language(&mut app, Language::En);
+        frame(&mut app);
+        assert_eq!(app.language, Language::En);
+        assert_eq!(app.data().preferences.language, "en", "kept for the next start");
+        // On a server the preference is the whole desk's: only this session changes.
+        let mut app = DeskApp::new(Box::new(Served(Session::demo(), None)));
+        let before = app.data().preferences.language.clone();
+        pick_language(&mut app, Language::En);
+        frame(&mut app);
+        assert_eq!(app.language, Language::En);
+        assert_eq!(app.data().preferences.language, before);
     }
 }

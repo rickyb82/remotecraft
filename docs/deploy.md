@@ -34,8 +34,49 @@ Variabili d'ambiente:
 | `RUSTDESK_HOST` | consigliata | nome pubblico del server (es. `rustdesk.siriustec.it`): hbbs lo annuncia come relay, il gestionale lo mostra ai client |
 | `TZ` | no (`Europe/Rome`) | fuso orario per gli orari scritti a mano (`9:30`) e per i report mensili |
 | `RUSTDESK_TAG` (build) | no (`1.1.16`) | versione dell'immagine ufficiale da cui copiare hbbs/hbbr |
+| `REMOTECRAFT_INTRANET_URL`, `REMOTECRAFT_INTRANET_TOKEN`, `REMOTECRAFT_INTRANET_ROLE` | no | la intranet da cui importare i clienti (vedi [La intranet](#la-intranet)); senza, il gestionale non la propone |
 
 Volumi: `/data/rustdesk` (coppia di chiavi e database di hbbs) e `/data/desk` (gestionale).
+
+## La intranet
+
+Se sulla stessa macchina gira la intranet (`intranet-cli serve` nel suo container, sulla porta
+7978), il gestionale può importare i clienti da lì: `intranet.search` e `customer.import`, cioè
+*Cerca nella intranet* nel modulo *Nuovo cliente* e nel campo *Cliente* di *Nuovo PC*, e gli
+strumenti MCP `search_intranet` / `import_customer`. Serve solo un cliente alla volta: non c'è
+una sincronizzazione.
+
+```sh
+echo "REMOTECRAFT_INTRANET_TOKEN=$(grep ^INTRANET_TOKEN= ../intranet/.env | cut -d= -f2-)" >> .env
+echo "COMPOSE_FILE=docker-compose.yml:docker-compose.intranet.yml" >> .env
+docker compose up -d --build
+docker compose exec -u remotecraft remotecraft remotecraft-cli run intranet.search '{"query": "rossi"}'
+```
+
+`COMPOSE_FILE` in `.env` fa valere `docker-compose.intranet.yml` per ogni `docker compose`
+(anche l'aggiornamento di sempre, `git pull && docker compose up -d --build`): senza, un
+`docker compose up` ricreerebbe il container senza la intranet. Quel file fa entrare il
+container nella rete Docker della intranet
+(`intranet_default`; `REMOTECRAFT_INTRANET_NETWORK` se si chiama diversamente) e imposta
+`REMOTECRAFT_INTRANET_URL=http://intranet:7978`. Il gestionale chiama `POST /api/cmd` della
+intranet con il suo token di servizio (`Authorization: Bearer`), il nome del tecnico in
+`X-Intranet-User` e `REMOTECRAFT_INTRANET_ROLE` (`super_admin` se non indicato) in
+`X-Intranet-Role`, come fa il framework: nella intranet le ricerche risultano fatte da quel
+tecnico. Il token della intranet resta nell'ambiente del container e non viene mai salvato
+nel gestionale né mostrato.
+
+Ogni cliente importato porta il suo id della intranet (`intranet_id`): una seconda
+importazione aggiorna anagrafica, partita IVA, recapiti e indirizzo e lascia tag, note, PC,
+interventi e registro privacy. Un cliente già nel gestionale con la stessa partita IVA viene
+collegato, non duplicato. Dalla intranet arrivano solo i campi dell'anagrafica: niente
+credenziali, contratti o fatture.
+
+La intranet esegue i comandi su un suo worker e risponde subito con un numero di job: il
+gestionale aspetta il risultato nello snapshot della sessione del tecnico (al massimo 15
+secondi, poi rinuncia con un errore). L'attesa non blocca niente: il server rilascia il
+gestionale mentre aspetta, l'app desktop chiede su un altro thread. Le chiamate partono dal
+server (`serve`): l'app web le fa fare a lui, l'app desktop e la CLI le fanno da sole se hanno
+le stesse variabili nell'ambiente.
 
 ## Migrazione dai due container di prima
 
@@ -52,11 +93,13 @@ Volumi: `/data/rustdesk` (coppia di chiavi e database di hbbs) e `/data/desk` (g
 
 | Token | Chi lo usa | Il tecnico è |
 |---|---|---|
-| **di servizio** (`REMOTECRAFT_TOKEN`) | il backend del framework | l'header `X-Remotecraft-User: <id utente>` (opzionale: senza, vale il tecnico del server, `REMOTECRAFT_USER` o altrimenti «tecnico», e lo stesso nome torna nello snapshot dell'app web) |
+| **di servizio** (`REMOTECRAFT_TOKEN`) | il backend del framework | l'header `X-Remotecraft-User: <nome del tecnico>` (opzionale: senza, vale il tecnico del server, `REMOTECRAFT_USER` o altrimenti «tecnico», e lo stesso nome torna nello snapshot dell'app web) |
 | **utente** | il processo MCP di un tecnico | il token stesso |
 
-Gli id vengono normalizzati (`Anna Rossi` → `anna-rossi`). Il nome finisce negli interventi
-(`technician`) e nel registro di audit.
+I nomi vengono normalizzati (`Anna Rossi` → `anna-rossi`) e finiscono negli interventi
+(`technician`), nel registro di audit e, importando un cliente, nella intranet
+(`X-Intranet-User`): il framework deve mandare un nome leggibile (Emily manda lo username),
+non un id interno, perché è quello che l'interfaccia mostra e i report raggruppano.
 
 ```http
 POST /api/users/<utente>/token        → {"user": "marco", "token": "64 caratteri hex"}

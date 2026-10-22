@@ -14,7 +14,7 @@ pub mod views;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use cmd::{COMMANDS, Command, RustDeskCheck};
+pub use cmd::{COMMANDS, Command, IntranetFetch, RustDeskCheck};
 pub use remotecraft_core as core;
 use remotecraft_core::chrono::{DateTime, Utc};
 use remotecraft_core::{Data, storage, time};
@@ -93,6 +93,8 @@ pub struct Snapshot {
     /// The RustDesk server next to the desk: name and key, when the container knows them.
     pub rustdesk_host: String,
     pub rustdesk_key: String,
+    /// The operator's intranet is reachable: customers can be imported from it.
+    pub intranet: bool,
 }
 
 /// Audit entries kept in memory when the desk has no files (tests, demo).
@@ -104,6 +106,9 @@ pub(crate) struct Ctx {
     pub now: DateTime<Utc>,
     pub targets: Vec<String>,
     pub detail: String,
+    /// The intranet's answer fetched before the command ran ([`Desk::execute_fetched`]), so
+    /// the command never waits on the network while it holds the desk.
+    pub fetched: Option<std::result::Result<Value, String>>,
 }
 
 impl Ctx {
@@ -131,6 +136,8 @@ pub struct Desk {
     problems: Vec<String>,
     /// What the host knows about the RustDesk server next to it.
     rustdesk: RustDeskEnv,
+    /// The operator's intranet, when the host can reach it.
+    intranet: Option<SharedIntranet>,
     /// Bumped on every change (and every reload), for remote interfaces.
     revision: u64,
 }
@@ -142,6 +149,15 @@ pub type Probe = Box<dyn Fn(&str, u16) -> std::result::Result<u64, String> + Sen
 
 /// A [`Probe`] shared with the threads that run it.
 pub(crate) type SharedProbe = Arc<dyn Fn(&str, u16) -> std::result::Result<u64, String> + Send + Sync>;
+
+/// Runs a command of the operator's intranet (`customers.search`, `customer.get`) as a
+/// technician: `(actor, command, params)` → the command's answer, or why it failed. Injected
+/// by the app (the engine never touches the network); absent, `intranet.search` and
+/// `customer.import` refuse.
+pub type IntranetCall = Box<dyn Fn(&str, &str, &Value) -> std::result::Result<Value, String> + Send + Sync>;
+
+/// An [`IntranetCall`] shared with the commands that run it.
+pub(crate) type SharedIntranet = Arc<dyn Fn(&str, &str, &Value) -> std::result::Result<Value, String> + Send + Sync>;
 
 /// The RustDesk server running next to the desk (same container or machine).
 #[derive(Default)]
@@ -171,6 +187,7 @@ impl Desk {
             memory_audit: Vec::new(),
             problems,
             rustdesk: RustDeskEnv::default(),
+            intranet: None,
             revision: first_revision(),
         })
     }
@@ -189,6 +206,7 @@ impl Desk {
             memory_audit: Vec::new(),
             problems,
             rustdesk: RustDeskEnv::default(),
+            intranet: None,
             revision: first_revision(),
         }
     }
@@ -237,6 +255,20 @@ impl Desk {
         self.rustdesk.probe = Some(Arc::from(probe));
     }
 
+    /// How `intranet.search` and `customer.import` reach the operator's intranet.
+    pub fn set_intranet(&mut self, call: IntranetCall) {
+        self.intranet = Some(Arc::from(call));
+    }
+
+    /// Whether the intranet is reachable from here (customers can be imported).
+    pub fn has_intranet(&self) -> bool {
+        self.intranet.is_some()
+    }
+
+    pub(crate) fn intranet(&self) -> Option<SharedIntranet> {
+        self.intranet.clone()
+    }
+
     pub fn data(&self) -> &Data {
         &self.data
     }
@@ -253,6 +285,29 @@ impl Desk {
 
     /// Runs a command for `actor` (the technician the framework or the token names).
     pub fn execute_as(&mut self, actor: &str, command: &str, params: &Value) -> Result<Value> {
+        self.execute_with(actor, command, params, None)
+    }
+
+    /// An `intranet.search` or `customer.import` prepared with [`Desk::prepare_intranet`]:
+    /// the parameters checked and the intranet's request made, so the slow part
+    /// ([`IntranetFetch::run`]) can run without the desk — on another thread, or outside the
+    /// server's lock. The same answer as `execute_as(actor, command, params)`, which fetches
+    /// while it holds the desk.
+    pub fn prepare_intranet(&mut self, actor: &str, command: &str, params: &Value) -> Result<IntranetFetch> {
+        let empty = json!({});
+        let params = object_params(params, &empty)?;
+        self.reload_if_changed()?;
+        let actor = remotecraft_core::line(actor);
+        let actor = if actor.is_empty() { self.actor.clone() } else { actor };
+        Ok(cmd::intranet_fetch(self, &actor, command, params)?)
+    }
+
+    /// Runs the command the fetch was prepared for, with the intranet's answer.
+    pub fn execute_fetched(&mut self, fetch: &IntranetFetch, answer: std::result::Result<Value, String>) -> Result<Value> {
+        self.execute_with(fetch.actor(), fetch.command_id(), fetch.command_params(), Some(answer))
+    }
+
+    fn execute_with(&mut self, actor: &str, command: &str, params: &Value, fetched: Option<std::result::Result<Value, String>>) -> Result<Value> {
         let Some(spec) = COMMANDS.iter().find(|c| c.id == command) else {
             return Err(Error::UnknownCommand(remotecraft_core::clip(command, 80).to_string()));
         };
@@ -260,8 +315,13 @@ impl Desk {
         let params = object_params(params, &empty)?;
         self.reload_if_changed()?;
         let actor = remotecraft_core::line(actor);
-        let mut ctx =
-            Ctx { actor: if actor.is_empty() { self.actor.clone() } else { actor }, now: self.now(), targets: Vec::new(), detail: String::new() };
+        let mut ctx = Ctx {
+            actor: if actor.is_empty() { self.actor.clone() } else { actor },
+            now: self.now(),
+            targets: Vec::new(),
+            detail: String::new(),
+            fetched,
+        };
         if !spec.writes {
             let out = cmd::dispatch(self, &mut ctx, command, params)?;
             if spec.audited {
@@ -338,6 +398,7 @@ impl Desk {
             problems: self.problems.clone(),
             rustdesk_host: self.rustdesk.host.clone(),
             rustdesk_key: self.rustdesk.key.clone(),
+            intranet: self.intranet.is_some(),
         }))
     }
 

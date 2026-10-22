@@ -50,6 +50,10 @@ pub trait DeskSession {
     fn problems(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Whether the operator's intranet is reachable (customers can be imported from it).
+    fn intranet(&self) -> bool {
+        false
+    }
     fn italian(&self) -> bool {
         self.data().preferences.language != "en"
     }
@@ -71,9 +75,17 @@ pub struct Session {
 /// Commands finishing on other threads.
 #[cfg(not(target_arch = "wasm32"))]
 struct Background {
-    tx: std::sync::mpsc::Sender<Completed>,
-    rx: std::sync::mpsc::Receiver<Completed>,
+    tx: std::sync::mpsc::Sender<Done>,
+    rx: std::sync::mpsc::Receiver<Done>,
     pending: usize,
+}
+
+/// What a background thread hands back: a finished command, or the intranet's answer for a
+/// command that `pump` then runs on the desk.
+#[cfg(not(target_arch = "wasm32"))]
+enum Done {
+    Completed(Completed),
+    Fetched { job: u64, fetch: Box<crate::IntranetFetch>, answer: std::result::Result<Value, String> },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -143,11 +155,32 @@ impl Session {
             // A probe that panics still answers, so the job never stays pending.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| theirs.run()))
                 .map_err(|_| Error::Core(remotecraft_core::Error::Io("the RustDesk check failed".into())));
-            let _ = tx.send(Completed { job, command, result });
+            let _ = tx.send(Done::Completed(Completed { job, command, result }));
         });
         match started {
             Ok(_) => self.background.pending = self.background.pending.saturating_add(1),
             Err(_) => self.finish(Completed { job, command: "rustdesk.check".into(), result: Ok(check.run()) }),
+        }
+    }
+
+    /// Asks the intranet on another thread; `pump` runs the command with the answer. Where no
+    /// thread can be started, asks here.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fetch_in_background(&mut self, job: u64, fetch: crate::IntranetFetch) {
+        let tx = self.background.tx.clone();
+        let theirs = fetch.clone();
+        let started = std::thread::Builder::new().name("remotecraft-intranet".into()).spawn(move || {
+            let answer =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| theirs.run())).unwrap_or_else(|_| Err("the intranet call failed".into()));
+            let _ = tx.send(Done::Fetched { job, fetch: Box::new(theirs), answer });
+        });
+        match started {
+            Ok(_) => self.background.pending = self.background.pending.saturating_add(1),
+            Err(_) => {
+                let answer = fetch.run();
+                let result = self.desk.execute_fetched(&fetch, answer);
+                self.finish(Completed { job, command: fetch.command_id().to_string(), result });
+            }
         }
     }
 }
@@ -176,6 +209,17 @@ impl DeskSession for Session {
             }
             return job;
         }
+        // The intranet answers in seconds (and not at all when it is down): asked off this
+        // thread, the command runs with the answer on a later pump.
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(command, "intranet.search" | "customer.import") {
+            let actor = self.desk.actor().to_string();
+            match self.desk.prepare_intranet(&actor, command, params) {
+                Ok(fetch) => self.fetch_in_background(job, fetch),
+                Err(e) => self.finish(Completed { job, command: command.to_string(), result: Err(e) }),
+            }
+            return job;
+        }
         let result = self.desk.execute(command, params);
         self.finish(Completed { job, command: command.to_string(), result });
         job
@@ -186,9 +230,15 @@ impl DeskSession for Session {
         // that cannot be read now is read on a later pump (and reported by the next command).
         let _ = self.desk.refresh();
         #[cfg(not(target_arch = "wasm32"))]
-        while let Ok(c) = self.background.rx.try_recv() {
+        while let Ok(done) = self.background.rx.try_recv() {
             self.background.pending = self.background.pending.saturating_sub(1);
-            self.finish(c);
+            match done {
+                Done::Completed(c) => self.finish(c),
+                Done::Fetched { job, fetch, answer } => {
+                    let result = self.desk.execute_fetched(&fetch, answer);
+                    self.finish(Completed { job, command: fetch.command_id().to_string(), result });
+                }
+            }
         }
         std::mem::take(&mut self.done)
     }
@@ -204,6 +254,10 @@ impl DeskSession for Session {
     fn rustdesk_defaults(&self) -> (String, String) {
         let env = self.desk.rustdesk();
         (env.host.clone(), env.key.clone())
+    }
+
+    fn intranet(&self) -> bool {
+        self.desk.has_intranet()
     }
 
     fn problems(&self) -> Vec<String> {
@@ -243,6 +297,60 @@ mod tests {
         assert_eq!(s.revision(), same, "reads do not bump the revision");
         assert!(s.italian());
         assert_eq!(s.actor(), "riccardo");
+    }
+
+    #[test]
+    fn the_intranet_is_asked_off_the_calling_thread_and_the_command_runs_on_pump() {
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+        let (go, wait) = mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let mut desk = Desk::demo();
+        desk.set_intranet(Box::new(move |actor, command, params| {
+            assert_eq!(actor, "riccardo");
+            let released = wait.lock().map(|rx| rx.recv_timeout(Duration::from_secs(10)).is_ok()).unwrap_or(false);
+            if !released {
+                return Err("not released".into());
+            }
+            match command {
+                "customer.get" if params["id"] == 9 => {
+                    Ok(json!({"customer": {"id": 9, "name": "Dalla Intranet S.r.l.", "vat": "IT09999999999", "private": false}}))
+                }
+                _ => Err("no".into()),
+            }
+        }));
+        let mut s = Session::new(desk);
+        let count = s.data().customers.len();
+        let job = s.execute("customer.import", &json!({"intranet_id": 9}));
+        assert_eq!(s.jobs_pending(), 1, "asked on another thread");
+        assert!(s.pump().is_empty());
+        // Meanwhile other commands go on, and the desk is unchanged.
+        s.execute("customer.get", &json!({"customer": 1}));
+        assert_eq!(s.pump().len(), 1);
+        assert_eq!(s.data().customers.len(), count);
+        go.send(()).unwrap();
+        let mut done = Vec::new();
+        for _ in 0..1000 {
+            done.extend(s.pump());
+            if !done.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!((done.len(), done[0].job, done[0].command.as_str()), (1, job, "customer.import"));
+        let v = done[0].result.as_ref().unwrap();
+        assert_eq!(v["created"], true);
+        assert_eq!(s.data().customers.len(), count + 1, "applied on pump");
+        assert!(s.data().customers.iter().any(|c| c.intranet_id == Some(9)));
+        assert_eq!(s.jobs_pending(), 0);
+        // What is refused without the intranet is refused at once.
+        let bad = s.execute("customer.import", &json!({}));
+        let done = s.pump();
+        assert_eq!((done[0].job, done[0].result.is_err()), (bad, true));
+        let mut s = Session::demo();
+        let none = s.execute("intranet.search", &json!({"query": "x"}));
+        let done = s.pump();
+        assert!(done[0].job == none && done[0].result.as_ref().unwrap_err().to_string().contains("not reachable"));
     }
 
     #[test]

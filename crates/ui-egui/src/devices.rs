@@ -108,8 +108,10 @@ pub enum Intent {
     Removed,
     /// `device.update {device, customer}` answered: the PC moved to another customer.
     Moved,
-    /// `customer.add` from the form's customer field ("Create the customer"): the form picks it.
+    /// `customer.add` or `customer.import` from the form's customer field: the form picks it.
     CustomerAdded,
+    /// `intranet.search` from the form's customer field answered.
+    IntranetSearched,
 }
 
 /// The new/edit PC form, as typed.
@@ -183,6 +185,8 @@ pub struct State {
     pub move_to: Option<Move>,
     /// The warnings of the last save of a PC, shown on its card until another PC is opened.
     pub warnings: Option<(u64, Vec<String>)>,
+    /// The intranet behind the form's customer field.
+    pub intranet: forms::IntranetLookup,
     rows: Vec<u64>,
     rows_key: Option<RowsKey>,
     cache: Cache,
@@ -284,12 +288,15 @@ pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
         }
         Intent::Moved => moved(app, c),
         Intent::CustomerAdded => customer_added(app, c),
+        Intent::IntranetSearched => {
+            app.devices.intranet.cached.finish(c);
+        }
     }
 }
 
-/// The customer created from the form's customer field: the form picks it while the field still
-/// names it (on a remote desk the answer can come after more typing); a refusal shows in the
-/// form.
+/// The customer created (or imported from the intranet) from the form's customer field: the
+/// form picks it while the field still names it (on a remote desk the answer can come after
+/// more typing); a refusal shows in the form.
 fn customer_added(app: &mut DeskApp, c: &Completed) {
     if app.devices.busy != Some(c.job) {
         return;
@@ -458,6 +465,7 @@ pub fn open_new(app: &mut DeskApp, customer: Option<u64>, rustdesk_id: &str) {
         Some(Form { customer: Picker::customer(app, customer), customer_locked: customer.is_some(), rustdesk_id: shown, ..Form::default() });
     app.devices.busy = None;
     app.devices.move_to = None;
+    app.devices.intranet = forms::IntranetLookup::default();
     app.go(Screen::Devices);
 }
 
@@ -1068,12 +1076,13 @@ pub fn form_ui(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.add_space(8.0);
     let mut request = None;
     let mut enabled = false;
-    let mut create = None;
+    let mut picker = forms::PickerAnswer::default();
     widgets::card(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
         egui::Grid::new("device-form-grid").num_columns(2).spacing([12.0, 8.0]).min_col_width(LABEL_W).show(ui, |ui| {
             let customer_label = format!("{} *", app.tr("Customer"));
-            create = forms::customer_picker(app, ui, t, &customer_label, &mut f.customer, f.customer_locked, !busy);
+            let options = forms::PickOptions { locked: f.customer_locked, create: !busy, intranet: Some(&app.devices.intranet) };
+            picker = forms::customer_picker(app, ui, t, &customer_label, &mut f.customer, options);
             widgets::field(ui, t, app.tr("Name"), &mut f.name, app.tr("PC reception, Notebook Anna…"));
             widgets::field(ui, t, app.tr("RustDesk ID"), &mut f.rustdesk_id, app.tr("As shown in the RustDesk window"));
             let rid = rustdesk::normalize(&f.rustdesk_id);
@@ -1146,8 +1155,28 @@ pub fn form_ui(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
         }
     });
     let action = forms::submit_row(app, ui, t, app.tr("Save"), busy, enabled);
-    if let Some(name) = create {
+    if let Some(name) = picker.create {
         let job = app.run_as("customer.add", json!({"name": name}), crate::Intent::Devices(Intent::CustomerAdded));
+        app.devices.busy = Some(job);
+        app.devices.form = Some(f);
+        return;
+    }
+    if let Some(query) = picker.search {
+        // A click is a request: searched again even after an error, and a search still out is
+        // forgotten (its answer would be another text's).
+        app.devices.intranet = forms::IntranetLookup { query: query.clone(), cached: derived::Cached::default() };
+        derived::refresh(
+            app,
+            |a| &mut a.devices.intranet.cached,
+            "intranet.search",
+            json!({"query": query}),
+            crate::Intent::Devices(Intent::IntranetSearched),
+        );
+        app.devices.form = Some(f);
+        return;
+    }
+    if let Some((intranet_id, _)) = picker.import {
+        let job = app.run_as("customer.import", json!({"intranet_id": intranet_id}), crate::Intent::Devices(Intent::CustomerAdded));
         app.devices.busy = Some(job);
         app.devices.form = Some(f);
         return;
@@ -1309,7 +1338,7 @@ fn move_panel(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, d: &Device) {
         ui.label(RichText::new(app.tr("Move to another customer")).strong().color(t.ui_text));
         ui.add_space(4.0);
         egui::Grid::new("device-move-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            forms::customer_picker(app, ui, t, app.tr("Customer"), &mut m.customer, false, false);
+            forms::customer_picker(app, ui, t, app.tr("Customer"), &mut m.customer, forms::PickOptions::default());
         });
         widgets::error_line(ui, t, &m.error);
         ui.horizontal(|ui| {
@@ -1841,6 +1870,19 @@ mod tests {
         out
     }
 
+    /// Frames until no command waits on another thread (the intranet), then one more: the
+    /// texts painted.
+    fn settle(ctx: &egui::Context, app: &mut DeskApp) -> Vec<(String, Rect)> {
+        for _ in 0..500 {
+            if app.session.jobs_pending() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            frame_with(ctx, app, Vec::new());
+        }
+        frame_with(ctx, app, Vec::new())
+    }
+
     /// Clicks, as a mouse does (press, then release a frame later), the rightmost text painted
     /// as `text` (the pane's, not the list's); answers the texts after it.
     fn click_text(ctx: &egui::Context, app: &mut DeskApp, text: &str) -> Vec<(String, Rect)> {
@@ -1878,6 +1920,128 @@ mod tests {
             let texts = texts_at(&mut app, 1440.0, 900.0);
             assert!(!texts.contains(&connect), "{search}: {texts:?}");
         }
+    }
+
+    #[test]
+    fn the_intranet_search_is_asked_again_on_a_click_and_says_archived() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        // An intranet that fails until told otherwise, counting the calls.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let down = Arc::new(Mutex::new(true));
+        let mut desk = crate::engine::Desk::demo();
+        let (c, d) = (calls.clone(), down.clone());
+        let long = "Lunghissima Società Cooperativa Agricola di Trasformazione Prodotti Ortofrutticoli del Nuorese S.c.a.r.l.";
+        desk.set_intranet(Box::new(move |_, command, params| {
+            c.fetch_add(1, Ordering::SeqCst);
+            if *d.lock().unwrap() {
+                return Err("the intranet is unreachable (refused)".into());
+            }
+            let row = json!({"id": 9, "name": long, "vat": "IT09999999999", "private": false});
+            match command {
+                "customers.search" => Ok(json!({"customers": [row], "count": 1})),
+                _ if params["id"] == 9 => Ok(json!({"customer": row})),
+                _ => Err("no".into()),
+            }
+        }));
+        let mut app = DeskApp::new(Box::new(crate::engine::Session::new(desk)));
+        app.go(Screen::Devices);
+        let ctx = egui::Context::default();
+        open_new(&mut app, None, "");
+        frame_with(&ctx, &mut app, Vec::new());
+        let field = app.tr("Type a name…").to_string();
+        click_text(&ctx, &mut app, &field);
+        frame_with(&ctx, &mut app, vec![egui::Event::Paste("Lunghiss\tima".into())]);
+        let search = format!("» {}", app.language.fill("Search the intranet for \"{name}\"", &[("name", "Lunghiss\tima")]));
+        click_text(&ctx, &mut app, &search);
+        let texts = settle(&ctx, &mut app);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("non risponde") || t.contains("unreachable")),
+            "{:?}",
+            texts.iter().map(|t| &t.0).collect::<Vec<_>>()
+        );
+        assert_eq!(app.devices.form.as_ref().map(|f| f.customer.text.as_str()), Some("Lunghiss ima"), "the field reads as the engine does");
+        // The intranet is back: the search row is offered again, and a click asks again.
+        *down.lock().unwrap() = false;
+        let search = format!("» {}", app.language.fill("Search the intranet for \"{name}\"", &[("name", "Lunghiss ima")]));
+        assert!(texts.iter().any(|(t, _)| *t == search), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        click_text(&ctx, &mut app, &search);
+        let texts = settle(&ctx, &mut app);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let painted: Vec<&String> = texts.iter().map(|t| &t.0).collect();
+        assert!(painted.iter().any(|t| t.starts_with("Lunghissima Società")), "{painted:?}");
+        // The long name is imported and picked (the field holds the whole name).
+        let row = painted.iter().find(|t| t.starts_with("Lunghissima Società")).unwrap().to_string();
+        click_text(&ctx, &mut app, &row);
+        settle(&ctx, &mut app);
+        let imported = app.data().customers.iter().find(|c| c.intranet_id == Some(9)).map(|c| c.id).expect("imported");
+        let f = app.devices.form.clone().unwrap();
+        assert_eq!((f.customer.id, f.customer.text.as_str()), (Some(imported), long));
+        // Archived in the desk: the intranet row says so instead of picking it.
+        app.run("customer.archive", json!({"customer": imported}));
+        open_new(&mut app, None, "");
+        frame_with(&ctx, &mut app, Vec::new());
+        click_text(&ctx, &mut app, &field);
+        frame_with(&ctx, &mut app, vec![egui::Event::Text("Lunghissima".into())]);
+        let search = format!("» {}", app.language.fill("Search the intranet for \"{name}\"", &[("name", "Lunghissima")]));
+        click_text(&ctx, &mut app, &search);
+        let texts = settle(&ctx, &mut app);
+        let archived = app.language.fill("The customer \"{name}\" is archived: restore it to pick it", &[("name", &format::clipped(long, 60))]);
+        assert!(texts.iter().any(|(t, _)| *t == archived), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        assert!(!texts.iter().any(|(t, _)| t.starts_with("Lunghissima Società")), "no row to pick");
+        assert_eq!(app.devices.form.as_ref().and_then(|f| f.customer.id), None);
+    }
+
+    #[test]
+    fn a_customer_is_imported_from_the_intranet_in_the_pc_form() {
+        let mut app = DeskApp::demo_with_intranet();
+        app.go(Screen::Devices);
+        let ctx = egui::Context::default();
+        open_new(&mut app, None, "987654321");
+        frame_with(&ctx, &mut app, Vec::new());
+        let field = app.tr("Type a name…").to_string();
+        click_text(&ctx, &mut app, &field);
+        let texts = frame_with(&ctx, &mut app, vec![egui::Event::Text("Rossi Imp".into())]);
+        let search = format!("» {}", app.language.fill("Search the intranet for \"{name}\"", &[("name", "Rossi Imp")]));
+        assert!(texts.iter().any(|(t, _)| *t == search), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        let customers = app.data().customers.len();
+        click_text(&ctx, &mut app, &search);
+        let texts = settle(&ctx, &mut app);
+        assert!(texts.iter().any(|(t, _)| t == "Rossi Impianti S.r.l."), "the intranet's rows: {:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        assert!(texts.iter().any(|(t, _)| t == "IT05555555555 · Nuoro"));
+        click_text(&ctx, &mut app, "Rossi Impianti S.r.l.");
+        settle(&ctx, &mut app);
+        assert_eq!(app.data().customers.len(), customers + 1, "imported");
+        let imported = app.data().customers.iter().find(|c| c.intranet_id == Some(501)).map(|c| c.id).expect("the import");
+        let f = app.devices.form.clone().expect("the form stays open");
+        assert_eq!((f.customer.id, f.customer.text.as_str()), (Some(imported), "Rossi Impianti S.r.l."));
+        assert_eq!(app.devices.busy, None);
+        let save = app.tr("Save").to_string();
+        click_text(&ctx, &mut app, &save);
+        assert!(app.data().devices.iter().any(|d| d.rustdesk_id == "987654321" && d.customer_id == imported));
+        // Searched again: the imported one is marked as the desk's and a click picks it.
+        open_new(&mut app, None, "");
+        frame_with(&ctx, &mut app, Vec::new());
+        click_text(&ctx, &mut app, &field);
+        frame_with(&ctx, &mut app, vec![egui::Event::Text("Rossi".into())]);
+        let search = format!("» {}", app.language.fill("Search the intranet for \"{name}\"", &[("name", "Rossi")]));
+        click_text(&ctx, &mut app, &search);
+        let texts = settle(&ctx, &mut app);
+        let already = app.tr("Already in the desk").to_string();
+        assert!(texts.iter().any(|(t, _)| *t == already), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        assert!(texts.iter().any(|(t, _)| t == "Rossi Anna"));
+        click_text(&ctx, &mut app, "Rossi Impianti S.r.l.");
+        settle(&ctx, &mut app);
+        assert_eq!(app.devices.form.as_ref().and_then(|f| f.customer.id), Some(imported));
+        assert_eq!(app.data().customers.len(), customers + 1, "not imported twice");
+        // Without an intranet the field offers no search.
+        let mut app = self::app();
+        open_new(&mut app, None, "");
+        frame_with(&ctx, &mut app, Vec::new());
+        click_text(&ctx, &mut app, &field);
+        let texts = frame_with(&ctx, &mut app, vec![egui::Event::Text("Rossi".into())]);
+        assert!(!texts.iter().any(|(t, _)| t.starts_with('»')), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
     }
 
     #[test]

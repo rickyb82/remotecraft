@@ -721,6 +721,7 @@ fn rules_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
 /// The server's name and key, the check and the client setup.
 fn server_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
     let (default_host, default_key) = app.session.rustdesk_defaults();
+    let intranet = app.session.intranet();
     section_card(app, ui, t, Section::Server, "RustDesk server", |ui, t, d, lang| {
         egui::Grid::new("settings-server").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             widgets::field(ui, t, lang.tr("Server name"), &mut d.rustdesk_host, &default_host);
@@ -729,6 +730,9 @@ fn server_section(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) {
                 hint_row(ui, t, lang.tr("From the container"));
             }
         });
+        if intranet {
+            hint_line(ui, t, lang.tr("Customers can be imported from the intranet"));
+        }
     });
     check_block(app, ui, t);
     setup_card(app, ui, t);

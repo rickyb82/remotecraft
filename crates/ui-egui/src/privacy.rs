@@ -2157,7 +2157,7 @@ fn notice_pane(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, id: u64) {
         widgets::card(t).show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::Grid::new("privacy-deliver-to").num_columns(2).spacing([12.0, 8.0]).min_col_width(LABEL_W).show(ui, |ui| {
-                forms::customer_picker(app, ui, t, app.tr("Customer"), &mut picker, false, false);
+                forms::customer_picker(app, ui, t, app.tr("Customer"), &mut picker, forms::PickOptions::default());
             });
             if ui.button(app.tr("Cancel")).clicked() {
                 keep = false;

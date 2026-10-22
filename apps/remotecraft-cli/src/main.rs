@@ -51,7 +51,7 @@ const USAGE: &str = "Usage:
   remotecraft-cli run COMMAND [JSON]
   remotecraft-cli commands
 Options: --home DIR (data directory), --as NAME (technician), --demo (the built-in demo desk)
-Environment: REMOTECRAFT_HOME, REMOTECRAFT_USER, REMOTECRAFT_TOKEN (better than --token: at least 32 characters,\n  openssl rand -hex 32), REMOTECRAFT_BIND, REMOTECRAFT_STATIC, REMOTECRAFT_ALLOW_ORIGIN, REMOTECRAFT_RUSTDESK_HOST,\n  REMOTECRAFT_RUSTDESK_KEY_FILE, REMOTECRAFT_RUSTDESK_CHECK_HOST";
+Environment: REMOTECRAFT_HOME, REMOTECRAFT_USER, REMOTECRAFT_TOKEN (better than --token: at least 32 characters,\n  openssl rand -hex 32), REMOTECRAFT_BIND, REMOTECRAFT_STATIC, REMOTECRAFT_ALLOW_ORIGIN, REMOTECRAFT_RUSTDESK_HOST,\n  REMOTECRAFT_RUSTDESK_KEY_FILE, REMOTECRAFT_RUSTDESK_CHECK_HOST, REMOTECRAFT_INTRANET_URL, REMOTECRAFT_INTRANET_TOKEN,\n  REMOTECRAFT_INTRANET_ROLE (customers imported from the operator's intranet)";
 
 struct Opts {
     args: Vec<String>,
@@ -127,6 +127,14 @@ fn desk(o: &Opts) -> Result<Desk, String> {
         d.set_default_rustdesk_host(&h);
     }
     d.set_rustdesk_probe(&env("REMOTECRAFT_RUSTDESK_CHECK_HOST").unwrap_or_default(), Box::new(probe));
+    // The operator's intranet, when this machine can reach it: customers are imported from it.
+    if let Some(call) = remotecraft_remote::intranet::caller(
+        &env("REMOTECRAFT_INTRANET_URL").unwrap_or_default(),
+        &env("REMOTECRAFT_INTRANET_TOKEN").unwrap_or_default(),
+        &env("REMOTECRAFT_INTRANET_ROLE").unwrap_or_default(),
+    ) {
+        d.set_intranet(call);
+    }
     Ok(d)
 }
 

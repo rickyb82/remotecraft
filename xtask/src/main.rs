@@ -11,10 +11,10 @@ const LAYERS: &[(&str, &[&str])] = &[
     ("crates/core", &[]),
     ("crates/engine", &["remotecraft-core"]),
     ("crates/mcp", &["remotecraft-engine"]),
-    ("crates/remote", &["remotecraft-engine", "ehttp"]),
+    ("crates/remote", &["remotecraft-engine", "ehttp", "ureq"]),
     ("crates/ui-egui", &["remotecraft-engine", "egui"]),
     ("apps/remotecraft-cli", &["remotecraft-engine", "remotecraft-mcp", "remotecraft-remote", "ureq"]),
-    ("apps/remotecraft", &["remotecraft-ui-egui", "egui", "eframe", "rfd"]),
+    ("apps/remotecraft", &["remotecraft-ui-egui", "remotecraft-remote", "egui", "eframe", "rfd"]),
     ("apps/remotecraft-web", &["remotecraft-ui-egui", "remotecraft-remote", "egui", "eframe", "rfd", "ehttp"]),
 ];
 const WATCHED: &[&str] = &[

@@ -93,11 +93,13 @@ le stesse variabili nell'ambiente.
 
 | Token | Chi lo usa | Il tecnico è |
 |---|---|---|
-| **di servizio** (`REMOTECRAFT_TOKEN`) | il backend del framework | l'header `X-Remotecraft-User: <id utente>` (opzionale: senza, vale il tecnico del server, `REMOTECRAFT_USER` o altrimenti «tecnico», e lo stesso nome torna nello snapshot dell'app web) |
+| **di servizio** (`REMOTECRAFT_TOKEN`) | il backend del framework | l'header `X-Remotecraft-User: <nome del tecnico>` (opzionale: senza, vale il tecnico del server, `REMOTECRAFT_USER` o altrimenti «tecnico», e lo stesso nome torna nello snapshot dell'app web) |
 | **utente** | il processo MCP di un tecnico | il token stesso |
 
-Gli id vengono normalizzati (`Anna Rossi` → `anna-rossi`). Il nome finisce negli interventi
-(`technician`) e nel registro di audit.
+I nomi vengono normalizzati (`Anna Rossi` → `anna-rossi`) e finiscono negli interventi
+(`technician`), nel registro di audit e, importando un cliente, nella intranet
+(`X-Intranet-User`): il framework deve mandare un nome leggibile (Emily manda lo username),
+non un id interno, perché è quello che l'interfaccia mostra e i report raggruppano.
 
 ```http
 POST /api/users/<utente>/token        → {"user": "marco", "token": "64 caratteri hex"}

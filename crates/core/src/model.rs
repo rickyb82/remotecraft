@@ -55,6 +55,8 @@ pub struct Customer {
     pub archived: bool,
     /// Set when the personal data was erased on request (GDPR art. 17).
     pub erased_at: Option<String>,
+    /// The customer's id in the operator's intranet, when imported from there (`customer.import`).
+    pub intranet_id: Option<u64>,
 }
 
 /// A computer (or server, phone…) the desk looks after.

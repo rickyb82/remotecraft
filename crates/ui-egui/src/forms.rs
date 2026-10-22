@@ -8,6 +8,7 @@ use remotecraft_engine::core::{InterventionKind, fold, rustdesk};
 use remotecraft_engine::views;
 use serde_json::Value;
 
+use crate::derived::Cached;
 use crate::theme::Tokens;
 use crate::widgets::{self, Tone};
 use crate::{Completed, DeskApp, format};
@@ -32,7 +33,74 @@ impl Picker {
 /// How many matches a picker lists.
 const MATCHES: usize = 6;
 
-fn pick_row(ui: &mut egui::Ui, t: &Tokens, title: &str, sub: &str) -> Response {
+/// The operator's intranet behind a customer field: the text searched there on request and
+/// the answer of `intranet.search` (a [`Cached`] slot: the screen runs it and applies it).
+#[derive(Clone, Debug, Default)]
+pub struct IntranetLookup {
+    /// The text searched (empty: nothing asked yet).
+    pub query: String,
+    pub cached: Cached,
+}
+
+/// A row of the intranet's answer, as the pickers list it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IntranetRow {
+    pub intranet_id: u64,
+    pub name: String,
+    /// The tax id and the city, for the second column.
+    pub detail: String,
+    pub ceased: bool,
+    /// The desk's customer when already imported (or with the same tax id).
+    pub customer: Option<u64>,
+}
+
+impl IntranetLookup {
+    /// The rows of the last answer (the intranet's text clipped: it is not the desk's).
+    pub fn rows(&self) -> Vec<IntranetRow> {
+        let Some(list) = self.cached.value.as_ref().and_then(|v| v["customers"].as_array()) else { return Vec::new() };
+        list.iter()
+            .take(50)
+            .filter_map(|r| {
+                let intranet_id = r["intranet_id"].as_u64().filter(|i| *i > 0)?;
+                let name = format::clipped(r["name"].as_str().unwrap_or_default(), 80);
+                let detail = [r["tax_id"].as_str().unwrap_or_default(), r["city"].as_str().unwrap_or_default()]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format::clipped(s, 40))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                Some(IntranetRow { intranet_id, name, detail, ceased: r["ceased"].as_bool().unwrap_or(false), customer: r["customer"].as_u64() })
+            })
+            .collect()
+    }
+
+    /// Whether the last search was for this (folded) text.
+    fn is_for(&self, fq: &str) -> bool {
+        !self.query.is_empty() && fold(&self.query) == fq
+    }
+}
+
+/// How a customer field behaves: `locked` shows the name without a field (the customer is
+/// fixed); `create` offers to create a customer with the name typed; `intranet` (with
+/// `create`, when the desk can reach it) offers to search the intranet and import from it.
+#[derive(Clone, Copy, Default)]
+pub struct PickOptions<'a> {
+    pub locked: bool,
+    pub create: bool,
+    pub intranet: Option<&'a IntranetLookup>,
+}
+
+/// What a customer field asked for besides a pick: a customer to create with this name, a
+/// search of the intranet for this text, a customer of the intranet to import (its id and
+/// name).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PickerAnswer {
+    pub create: Option<String>,
+    pub search: Option<String>,
+    pub import: Option<(u64, String)>,
+}
+
+pub(crate) fn pick_row(ui: &mut egui::Ui, t: &Tokens, title: &str, sub: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), egui::Sense::click());
     let p = ui.painter();
     if resp.hovered() {
@@ -47,20 +115,20 @@ fn pick_row(ui: &mut egui::Ui, t: &Tokens, title: &str, sub: &str) -> Response {
     resp
 }
 
-/// A form row picking a customer by name, tax id, e-mail or contact. `locked` shows the name
-/// without a field (the customer is fixed). The matches stay listed until one is picked (a
-/// click takes the focus from the field, so they cannot follow it), and a name typed exactly as
-/// the only customer it finds picks that customer. With `create`, a name no customer has offers
-/// a row that creates it: answers that name when the row is clicked. Call inside a two-column
-/// `Grid`; ends the row.
-pub fn customer_picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str, p: &mut Picker, locked: bool, create: bool) -> Option<String> {
+/// A form row picking a customer by name, tax id, e-mail or contact. The matches stay listed
+/// until one is picked (a click takes the focus from the field, so they cannot follow it), and
+/// a name typed exactly as the only customer it finds picks that customer; see [`PickOptions`]
+/// for creating and importing. Call inside a two-column `Grid`; ends the row.
+pub fn customer_picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str, p: &mut Picker, options: PickOptions) -> PickerAnswer {
+    let mut answer = PickerAnswer::default();
     ui.label(RichText::new(label).color(t.muted));
-    if locked {
+    if options.locked {
         ui.label(RichText::new(&p.text).color(t.ui_text));
         ui.end_row();
-        return None;
+        return answer;
     }
-    let mut created = None;
+    let create = options.create;
+    let intranet = options.intranet.filter(|_| create && app.session.intranet());
     ui.vertical(|ui| {
         let r = ui.add(egui::TextEdit::singleline(&mut p.text).hint_text(app.tr("Type a name…")).desired_width(f32::INFINITY));
         let fq = fold(p.text.trim());
@@ -97,16 +165,16 @@ pub fn customer_picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str
             // engine would refuse it as a duplicate.
             let taken = data.customers.iter().any(|c| c.erased_at.is_none() && fold(&c.name) == fq);
             let archived = data.customers.iter().any(|c| c.archived && c.erased_at.is_none() && fold(&c.name) == fq);
-            let name = p.text.trim();
-            let shown = format::clipped(name, 60);
+            let name = p.text.trim().to_string();
+            let shown = format::clipped(&name, 60);
             if create && !taken {
-                let title = app.language.fill("Create the customer \"{name}\"", &[("name", name)]);
+                let title = app.language.fill("Create the customer \"{name}\"", &[("name", &name)]);
                 if pick_row(ui, t, &format!("+ {title}"), "").clicked() {
                     // As the engine stores it (a pasted tab becomes a space), so the answer
                     // finds the field still naming it.
-                    let clean = remotecraft_engine::core::line(name);
+                    let clean = remotecraft_engine::core::line(&name);
                     p.text = clean.clone();
-                    created = Some(clean);
+                    answer.create = Some(clean);
                 }
             } else if archived {
                 let text = app.language.fill("The customer \"{name}\" is archived: restore it to pick it", &[("name", &shown)]);
@@ -115,10 +183,63 @@ pub fn customer_picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str
                 let text = app.language.fill("No customer matches \"{query}\"", &[("query", &shown)]);
                 ui.label(RichText::new(text).small().color(t.muted));
             }
+            if let Some(lookup) = intranet {
+                intranet_rows(app, ui, t, lookup, p, &mut answer);
+            }
         }
     });
     ui.end_row();
-    created
+    answer
+}
+
+/// Under a customer field: the row that searches the intranet for the text, or, once searched,
+/// what it found (a customer already in the desk is picked; another is imported).
+fn intranet_rows(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, lookup: &IntranetLookup, p: &mut Picker, answer: &mut PickerAnswer) {
+    let name = p.text.trim().to_string();
+    if !lookup.is_for(&fold(&name)) {
+        let title = app.language.fill("Search the intranet for \"{name}\"", &[("name", &format::clipped(&name, 60))]);
+        if pick_row(ui, t, &format!("» {title}"), "").clicked() {
+            answer.search = Some(remotecraft_engine::core::line(&name));
+        }
+        return;
+    }
+    if lookup.cached.loading() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(14.0).color(t.accent));
+            ui.label(RichText::new(app.tr("Searching the intranet…")).small().color(t.muted));
+        });
+        return;
+    }
+    if !lookup.cached.error.is_empty() {
+        widgets::error_line(ui, t, &app.language.tr_message(&lookup.cached.error));
+        return;
+    }
+    let rows = lookup.rows();
+    if rows.is_empty() {
+        ui.label(RichText::new(app.tr("Nothing in the intranet")).small().color(t.muted));
+        return;
+    }
+    ui.label(RichText::new(app.tr("From the intranet")).small().color(t.muted));
+    let data = app.data();
+    for row in rows.iter().take(MATCHES) {
+        let sub = match row.customer {
+            Some(_) => app.tr("Already in the desk").to_string(),
+            None if row.ceased => format!("{} · {}", row.detail, app.tr("Ceased")),
+            None => row.detail.clone(),
+        };
+        if pick_row(ui, t, &row.name, &sub).clicked() {
+            match row.customer.filter(|c| data.customer(*c).is_some_and(|c| c.erased_at.is_none())) {
+                Some(id) => {
+                    p.id = Some(id);
+                    p.text = crate::customer_name(data, id);
+                }
+                None => {
+                    p.text.clone_from(&row.name);
+                    answer.import = Some((row.intranet_id, row.name.clone()));
+                }
+            }
+        }
+    }
 }
 
 /// A form row picking a PC by name, host name or RustDesk ID, among `customer`'s PCs when

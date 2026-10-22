@@ -86,6 +86,13 @@ scorciatoie da tastiera (`/` cerca, `s` avvia, `x` chiude, `n` nuovo, `?` aiuto)
   - per ogni client fornisce i valori da inserire, la **stringa da importare** e il **nome da
     dare all'installer Windows** perché si configuri da solo;
   - `rustdesk.check` controlla che hbbs e hbbr rispondano.
+- **Clienti dalla intranet**: se sulla stessa macchina gira la intranet (il gestionale di
+  fatturazione), un cliente nuovo si prende da lì invece di riscriverlo: nel modulo *Nuovo
+  cliente* e nel campo *Cliente* di *Nuovo PC* compare *Cerca nella intranet*; una riga scelta
+  importa anagrafica, partita IVA, contatti e indirizzo, e resta legata al cliente della intranet
+  (una seconda importazione lo aggiorna, non lo duplica). Si importa solo chi serve, uno alla
+  volta; PC, interventi e registro privacy restano nel gestionale. In MCP: `search_intranet` e
+  `import_customer`.
 - **API e MCP**: il framework chiama `POST /api/cmd` (o le rotte REST di sola lettura) con il
   suo token di servizio e indica il tecnico. Ogni tecnico può avere il suo assistente MCP con un
   token personale. Le regole sono le stesse dappertutto, perché interfaccia, CLI, API e MCP
@@ -115,6 +122,11 @@ docker compose ps                       # deve diventare "healthy"
   `127.0.0.1:7979`: davanti mettici il framework o un reverse proxy HTTPS.
 - RustDesk non dipende dal gestionale: se l'API non parte, hbbs e hbbr continuano a servire i
   client e `docker compose logs` dice perché.
+- **Con la intranet sulla stessa macchina**: aggiungi a `.env` il suo token
+  (`REMOTECRAFT_INTRANET_TOKEN=…`, lo stesso `INTRANET_TOKEN` del suo `.env`) e avvia con
+  `docker compose -f docker-compose.yml -f docker-compose.intranet.yml up -d --build`: il
+  container entra nella rete Docker della intranet e i clienti si importano da lì
+  ([docs/deploy.md](docs/deploy.md#la-intranet)).
 
 ### Aggiornamento
 

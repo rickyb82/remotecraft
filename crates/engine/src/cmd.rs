@@ -51,6 +51,22 @@ pub const COMMANDS: &[Command] = &[
     ),
     c("customer.get", "Customer", "Customers › Open", "{customer: id|name} → customer, devices, recent interventions, privacy status, totals", R, R),
     c(
+        "intranet.search",
+        "Search the Intranet",
+        "Customers › From the intranet",
+        "{query (a name, a VAT number, a tax code or the intranet's id), limit? (20)} → the intranet's customers, with the desk's customer when one is already imported",
+        R,
+        R,
+    ),
+    c(
+        "customer.import",
+        "Import from the Intranet",
+        "Customers › From the intranet",
+        "{intranet_id} → the customer created from the intranet's record (or the one already imported, or with the same tax id, updated with it); PCs, interventions and the GDPR record stay here",
+        W,
+        W,
+    ),
+    c(
         "customer.list",
         "Customers",
         "Customers",
@@ -230,6 +246,8 @@ pub(crate) fn dispatch(desk: &mut Desk, ctx: &mut Ctx, id: &str, p: &Value) -> R
         "customer.add" => customer_add(desk.data_mut(), ctx, p)?,
         "customer.update" => customer_update(desk.data_mut(), ctx, p)?,
         "customer.get" => customer_get(desk.data(), ctx, p)?,
+        "intranet.search" => intranet_search(desk, ctx, p)?,
+        "customer.import" => customer_import(desk, ctx, p)?,
         "customer.list" => customer_list(desk.data(), p)?,
         "customer.archive" => customer_archive(desk.data_mut(), ctx, p)?,
         "customer.remove" => customer_remove(desk.data_mut(), ctx, p)?,
@@ -497,6 +515,161 @@ fn customer_list(data: &Data, p: &Value) -> CoreResult<Value> {
     let total = rows.len();
     let list: Vec<Value> = rows.into_iter().skip(offset).take(limit).map(|c| views::customer_row(data, c)).collect();
     Ok(json!({"customers": list, "total": total}))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The operator's intranet
+
+/// Most rows a search of the intranet answers.
+const INTRANET_MAX: usize = 50;
+
+/// A customer as the intranet describes it (`customer_json` of `tab_clienti`), in the desk's
+/// terms. The intranet's answer is hostile input: every text is clipped, nothing is trusted.
+struct IntranetCustomer {
+    id: u64,
+    name: String,
+    kind: CustomerKind,
+    tax_id: String,
+    email: String,
+    phone: String,
+    address: String,
+    city: String,
+    contact: Option<Contact>,
+    ceased: bool,
+}
+
+impl IntranetCustomer {
+    fn read(v: &Value) -> Option<Self> {
+        let field = |k: &str| v.get(k).and_then(Value::as_str).map(remotecraft_core::line).unwrap_or_default();
+        let id = v.get("id").and_then(Value::as_u64).filter(|i| *i > 0)?;
+        let name = field("name");
+        if name.is_empty() {
+            return None;
+        }
+        let vat = field("vat");
+        let tax_id = if vat.is_empty() { field("fiscal_code") } else { vat }.to_uppercase().replace(' ', "");
+        let phone = field("phone");
+        let phone = if phone.is_empty() { field("mobile") } else { phone };
+        let email = field("email");
+        let email = if remotecraft_core::valid_email(&email) { email } else { String::new() };
+        let contact_name = field("contact");
+        let contact = (!contact_name.is_empty()).then(|| Contact { name: contact_name, phone: field("contact_phone"), ..Contact::default() });
+        Some(Self {
+            id,
+            name,
+            kind: if v.get("private").and_then(Value::as_bool).unwrap_or(false) { CustomerKind::Person } else { CustomerKind::Company },
+            tax_id,
+            email,
+            phone,
+            address: field("address_line"),
+            city: field("city"),
+            contact,
+            ceased: field("invoice_month") == "X",
+        })
+    }
+
+    /// Where the desk already has this customer: imported before, or with the same tax id
+    /// (or, without tax ids, the same name).
+    fn already(&self, data: &Data) -> Option<u64> {
+        let alive = |c: &&Customer| c.erased_at.is_none();
+        data.customers
+            .iter()
+            .filter(alive)
+            .find(|c| c.intranet_id == Some(self.id))
+            .or_else(|| data.customers.iter().filter(alive).find(|c| !self.tax_id.is_empty() && c.tax_id == self.tax_id))
+            .or_else(|| {
+                data.customers.iter().filter(alive).find(|c| self.tax_id.is_empty() && c.tax_id.is_empty() && fold(&c.name) == fold(&self.name))
+            })
+            .map(|c| c.id)
+    }
+
+    fn json(&self, data: &Data) -> Value {
+        json!({
+            "intranet_id": self.id, "name": self.name, "kind": self.kind, "tax_id": self.tax_id, "email": self.email, "phone": self.phone,
+            "address": self.address, "city": self.city, "contact": self.contact.as_ref().map(|k| k.name.clone()).unwrap_or_default(),
+            "ceased": self.ceased, "customer": self.already(data),
+        })
+    }
+
+    /// Writes the intranet's record into the desk's customer: the registry fields; the contact
+    /// is added when no contact has that name; tags, notes and the GDPR record are the desk's.
+    fn apply(&self, c: &mut Customer) {
+        c.intranet_id = Some(self.id);
+        c.name.clone_from(&self.name);
+        c.kind = self.kind;
+        c.tax_id.clone_from(&self.tax_id);
+        if !self.email.is_empty() {
+            c.email.clone_from(&self.email);
+        }
+        if !self.phone.is_empty() {
+            c.phone.clone_from(&self.phone);
+        }
+        if !self.address.is_empty() {
+            c.address.clone_from(&self.address);
+        }
+        if let Some(k) = &self.contact
+            && !c.contacts.iter().any(|x| fold(&x.name) == fold(&k.name))
+            && c.contacts.len() < limits::MAX_CONTACTS
+        {
+            c.contacts.push(k.clone());
+        }
+    }
+}
+
+/// Runs a command of the intranet as the technician, or says why the desk cannot.
+fn intranet_call(desk: &Desk, ctx: &Ctx, command: &str, params: &Value) -> CoreResult<Value> {
+    let Some(call) = desk.intranet() else {
+        return Err(Error::Refused(
+            "the intranet is not reachable from this RemoteCraft: set REMOTECRAFT_INTRANET_URL and REMOTECRAFT_INTRANET_TOKEN on the server".into(),
+        ));
+    };
+    call(&ctx.actor, command, params).map_err(|e| Error::Refused(format!("intranet: {}", remotecraft_core::clip(&e, 300))))
+}
+
+fn intranet_search(desk: &Desk, ctx: &Ctx, p: &Value) -> CoreResult<Value> {
+    let query = required(p, "query")?;
+    let limit = bounded(p, "limit", INTRANET_MAX as u64)?.filter(|n| *n > 0).unwrap_or(20);
+    let v = intranet_call(desk, ctx, "customers.search", &json!({"query": query, "category": "all", "limit": limit}))?;
+    let data = desk.data();
+    let customers: Vec<Value> =
+        v["customers"].as_array().into_iter().flatten().take(INTRANET_MAX).filter_map(IntranetCustomer::read).map(|c| c.json(data)).collect();
+    Ok(json!({"customers": customers, "count": customers.len()}))
+}
+
+fn customer_import(desk: &mut Desk, ctx: &mut Ctx, p: &Value) -> CoreResult<Value> {
+    let id = number(p, "intranet_id")?.filter(|i| *i > 0).ok_or_else(|| invalid("`intranet_id` (the customer's id in the intranet) is required"))?;
+    let v = intranet_call(desk, ctx, "customer.get", &json!({"id": id}))?;
+    let found = IntranetCustomer::read(&v["customer"]).ok_or_else(|| Error::NotFound(format!("the intranet has no customer {id}")))?;
+    if found.id != id {
+        return Err(Error::Refused(format!("the intranet answered customer {} for {id}", found.id)));
+    }
+    let data = desk.data_mut();
+    let now = time::stamp(ctx.now);
+    match found.already(data) {
+        Some(existing) => {
+            let mut c = data.customer(existing).cloned().ok_or_else(|| Error::NotFound(format!("no customer {existing}")))?;
+            found.apply(&mut c);
+            c.updated_at = now;
+            ctx.touch("customer", existing);
+            let out = json!({"customer": views::customer_json(&c), "created": false});
+            if let Some(slot) = data.customer_mut(existing) {
+                *slot = c;
+            }
+            Ok(out)
+        }
+        None => {
+            if data.customers.len() >= limits::MAX_CUSTOMERS {
+                return Err(Error::Refused("the desk is full".into()));
+            }
+            let mut c = Customer { created_at: now.clone(), updated_at: now, ..Customer::default() };
+            found.apply(&mut c);
+            c.id = next(&mut data.counters.customer)?;
+            ctx.touch("customer", c.id);
+            let out = json!({"customer": views::customer_json(&c), "created": true, "next": "device.add for their PCs, privacy.notice and privacy.consent for the GDPR record"});
+            data.customers.push(c);
+            Ok(out)
+        }
+    }
 }
 
 fn customer_archive(data: &mut Data, ctx: &mut Ctx, p: &Value) -> CoreResult<Value> {

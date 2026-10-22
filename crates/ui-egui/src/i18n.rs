@@ -176,6 +176,18 @@ pub const LABELS: &[&str] = &[
     crate::NOT_A_RUSTDESK_ID,
     "Create the customer \"{name}\"",
     "The customer \"{name}\" is archived: restore it to pick it",
+    "From the intranet",
+    "Search the intranet",
+    "Search the intranet for \"{name}\"",
+    "Searching the intranet…",
+    "Nothing in the intranet",
+    "Already in the desk",
+    "Ceased",
+    "Name, VAT number or tax code…",
+    "A customer of the billing system is imported with their registry; PCs, interventions and the GDPR record stay here.",
+    "Customer imported from the intranet",
+    "Customer updated from the intranet",
+    "Customers can be imported from the intranet",
 ];
 
 #[cfg(test)]

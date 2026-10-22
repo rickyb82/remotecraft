@@ -57,7 +57,7 @@ L'elenco sempre aggiornato è `remotecraft-cli commands` (o `GET /api/commands`)
 
 | Area | Comandi |
 |---|---|
-| Clienti | `customer.add`, `customer.update`, `customer.get`, `customer.list`, `customer.archive`, `customer.remove` (solo senza storico) |
+| Clienti | `customer.add`, `customer.update`, `customer.get`, `customer.list`, `customer.archive`, `customer.remove` (solo senza storico), `intranet.search`, `customer.import` (dalla intranet, se configurata) |
 | PC | `device.add`, `device.update`, `device.get`, `device.list`, `device.find`, `device.retire`, `device.remove` (solo senza storico), `device.connect` |
 | Interventi | `intervention.start`, `intervention.stop`, `intervention.add`, `intervention.update`, `intervention.remove`, `intervention.get`, `intervention.list`, `intervention.running` |
 | Report | `report.time` |
@@ -94,6 +94,11 @@ L'elenco sempre aggiornato è `remotecraft-cli commands` (o `GET /api/commands`)
 
 ### Regole da sapere
 
+- **Clienti dalla intranet.** `intranet.search {query, limit?}` interroga la intranet (nome,
+  partita IVA, codice fiscale o id) e risponde le righe con `intranet_id` e, se il gestionale
+  ha già quel cliente, il suo `customer`; `customer.import {intranet_id}` crea il cliente con
+  l'anagrafica della intranet (o aggiorna quello già importato o con la stessa partita IVA:
+  `created: false`). Senza `REMOTECRAFT_INTRANET_URL` entrambi rispondono 409.
 - **Connessione rapida.** `device.connect` accetta, al posto di `device`, un `rustdesk_id`: se
   l'ID è di un PC (in servizio, altrimenti dismesso) risponde come per quel PC, consenso
   compreso; altrimenti, per un ID di sole cifre, dà solo il link e il comando, con

@@ -97,7 +97,9 @@ fn main() {
     let (mut w, mut h) = (1440usize, 900usize);
     let mut out = "snapshot.png".to_string();
     let mut dark = false;
-    let mut app = DeskApp::demo();
+    // A pretend intranet with two customers: the forms offer to search and import.
+    let intranet = args.iter().any(|a| a == "--intranet");
+    let mut app = if intranet { DeskApp::demo_with_intranet() } else { DeskApp::demo() };
     let mut language = remotecraft_ui_egui::Language::En;
     let mut open: Option<usize> = None;
     let mut new = false;
@@ -115,6 +117,7 @@ fn main() {
             "--search" => app.search = it.next().cloned().unwrap_or_default(),
             // The customer typed (not picked) in the new PC form opened by `--new`.
             "--customer" => customer = it.next().cloned(),
+            "--intranet" => {}
             "--size" => {
                 if let Some((a, b)) = it.next().and_then(|s| s.split_once('x')) {
                     w = a.parse().unwrap_or(w);

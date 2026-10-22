@@ -13,6 +13,9 @@ use remotecraft_engine::core::chrono::{DateTime, Utc};
 use remotecraft_engine::{Completed, DeskSession, Error, Snapshot};
 use serde_json::{Value, json};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod intranet;
+
 /// What arrived from the server, to be applied on the next `pump`. Poll results carry the
 /// number of the poll they answer: a late one counts only when no newer answer was applied.
 enum Incoming {
@@ -349,6 +352,7 @@ pub struct RemoteDesk {
     problems: Vec<String>,
     rustdesk_host: String,
     rustdesk_key: String,
+    intranet: bool,
     revision: u64,
     inbox: Inbox,
     /// A poll is out (since `last_poll`, given up after `poll_window` seconds); `poll_seq` is
@@ -386,6 +390,7 @@ impl RemoteDesk {
             problems: Vec::new(),
             rustdesk_host: String::new(),
             rustdesk_key: String::new(),
+            intranet: false,
             revision: 0,
             inbox: Arc::default(),
             polling: false,
@@ -467,6 +472,7 @@ impl RemoteDesk {
         self.problems = s.problems;
         self.rustdesk_host = s.rustdesk_host;
         self.rustdesk_key = s.rustdesk_key;
+        self.intranet = s.intranet;
         self.problem = None;
     }
 }
@@ -609,6 +615,10 @@ impl DeskSession for RemoteDesk {
 
     fn rustdesk_defaults(&self) -> (String, String) {
         (self.rustdesk_host.clone(), self.rustdesk_key.clone())
+    }
+
+    fn intranet(&self) -> bool {
+        self.intranet
     }
 
     fn problems(&self) -> Vec<String> {

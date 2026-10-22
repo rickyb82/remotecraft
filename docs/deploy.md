@@ -34,8 +34,41 @@ Variabili d'ambiente:
 | `RUSTDESK_HOST` | consigliata | nome pubblico del server (es. `rustdesk.siriustec.it`): hbbs lo annuncia come relay, il gestionale lo mostra ai client |
 | `TZ` | no (`Europe/Rome`) | fuso orario per gli orari scritti a mano (`9:30`) e per i report mensili |
 | `RUSTDESK_TAG` (build) | no (`1.1.16`) | versione dell'immagine ufficiale da cui copiare hbbs/hbbr |
+| `REMOTECRAFT_INTRANET_URL`, `REMOTECRAFT_INTRANET_TOKEN`, `REMOTECRAFT_INTRANET_ROLE` | no | la intranet da cui importare i clienti (vedi [La intranet](#la-intranet)); senza, il gestionale non la propone |
 
 Volumi: `/data/rustdesk` (coppia di chiavi e database di hbbs) e `/data/desk` (gestionale).
+
+## La intranet
+
+Se sulla stessa macchina gira la intranet (`intranet-cli serve` nel suo container, sulla porta
+7978), il gestionale può importare i clienti da lì: `intranet.search` e `customer.import`, cioè
+*Cerca nella intranet* nel modulo *Nuovo cliente* e nel campo *Cliente* di *Nuovo PC*, e gli
+strumenti MCP `search_intranet` / `import_customer`. Serve solo un cliente alla volta: non c'è
+una sincronizzazione.
+
+```sh
+echo "REMOTECRAFT_INTRANET_TOKEN=$(grep ^INTRANET_TOKEN= ../intranet/.env | cut -d= -f2-)" >> .env
+docker compose -f docker-compose.yml -f docker-compose.intranet.yml up -d --build
+docker compose exec -u remotecraft remotecraft remotecraft-cli run intranet.search '{"query": "rossi"}'
+```
+
+`docker-compose.intranet.yml` fa entrare il container nella rete Docker della intranet
+(`intranet_default`; `REMOTECRAFT_INTRANET_NETWORK` se si chiama diversamente) e imposta
+`REMOTECRAFT_INTRANET_URL=http://intranet:7978`. Il gestionale chiama `POST /api/cmd` della
+intranet con il suo token di servizio (`Authorization: Bearer`), il nome del tecnico in
+`X-Intranet-User` e `REMOTECRAFT_INTRANET_ROLE` (`super_admin` se non indicato) in
+`X-Intranet-Role`, come fa il framework: nella intranet le ricerche risultano fatte da quel
+tecnico. Il token della intranet resta nell'ambiente del container e non viene mai salvato
+nel gestionale né mostrato.
+
+Ogni cliente importato porta il suo id della intranet (`intranet_id`): una seconda
+importazione aggiorna anagrafica, partita IVA, recapiti e indirizzo e lascia tag, note, PC,
+interventi e registro privacy. Un cliente già nel gestionale con la stessa partita IVA viene
+collegato, non duplicato. Dalla intranet arrivano solo i campi dell'anagrafica: niente
+credenziali, contratti o fatture.
+
+Le chiamate partono dal server (`serve`): l'app web le fa fare a lui, l'app desktop e la CLI
+le fanno da sole se hanno le stesse variabili nell'ambiente.
 
 ## Migrazione dai due container di prima
 

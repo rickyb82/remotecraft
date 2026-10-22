@@ -276,6 +276,31 @@ fn all_digits(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_digit())
 }
 
+/// The demo desk with a pretend intranet of two customers behind it (`intranet.search` and
+/// `customer.import` work on them), for tests and the snapshot example.
+pub fn demo_intranet() -> engine::Desk {
+    let mut desk = engine::Desk::demo();
+    let rows = || {
+        vec![
+            json!({"id": 501, "name": "Rossi Impianti S.r.l.", "vat": "IT05555555555", "email": "info@rossi.example", "phone": "+39 0784 000501",
+                "address_line": "Via Roma 1, 08100 Nuoro (NU)", "city": "Nuoro", "contact": "Mario Rossi", "contact_phone": "+39 333 0000501", "private": false, "invoice_month": "A"}),
+            json!({"id": 502, "name": "Rossi Anna", "fiscal_code": "RSSNNA80A41F979X", "mobile": "+39 333 0000502", "city": "Orgosolo", "private": true, "invoice_month": "X"}),
+        ]
+    };
+    desk.set_intranet(Box::new(move |_, command, params| match command {
+        "customers.search" => {
+            let q = params["query"].as_str().unwrap_or_default().to_lowercase();
+            let hits: Vec<Value> = rows().into_iter().filter(|r| r["name"].as_str().unwrap_or_default().to_lowercase().contains(q.trim())).collect();
+            Ok(json!({"customers": hits, "count": hits.len()}))
+        }
+        "customer.get" => {
+            rows().into_iter().find(|r| r["id"] == params["id"]).map(|r| json!({"customer": r})).ok_or_else(|| "no customer".to_string())
+        }
+        _ => Err(format!("unknown command {command}")),
+    }));
+    desk
+}
+
 /// The name of a customer, for rows and chips.
 pub fn customer_name(data: &Data, id: u64) -> String {
     data.customer(id).map(|c| c.name.clone()).unwrap_or_default()
@@ -381,6 +406,11 @@ impl DeskApp {
     /// The demo app: the demo desk, no files.
     pub fn demo() -> Self {
         Self::new(Box::new(Session::demo()))
+    }
+
+    /// The demo desk with a pretend intranet behind it (tests, the snapshot example).
+    pub fn demo_with_intranet() -> Self {
+        Self::new(Box::new(Session::new(demo_intranet())))
     }
 
     pub fn tr<'a>(&self, text: &'a str) -> &'a str {

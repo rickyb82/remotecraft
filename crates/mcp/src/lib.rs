@@ -26,6 +26,7 @@ const MAX_LINE: usize = 8 * 1024 * 1024;
 
 const INSTRUCTIONS: &str = "RemoteCraft is a support desk: customers, their PCs with the RustDesk ID, interventions with times and notes, and the GDPR record \
 (privacy notice delivered, consents given or withdrawn). Find people and PCs with find_customers / find_device (a RustDesk ID like 123 456 789 works everywhere a device is asked). \
+A customer the desk does not have yet may be in the operator's intranet: search_intranet, then import_customer with the row's intranet_id (never type their details by hand when the intranet has them). \
 Time work with start_intervention (it returns the rustdesk:// link) and stop_intervention, or record past work with log_intervention. \
 Remote interventions need the customer's remote_assistance consent: when start_intervention refuses, tell the person and either record_consent (with the evidence) \
 or, only if the person says the customer agreed another way, retry with consent_override and the reason. \
@@ -119,6 +120,20 @@ fn tools() -> Vec<Tool> {
             description: "Change a customer's details: only the fields given change (contacts and tags are replaced as a whole).",
             properties: with(&customer_fields, json!({"customer": customer})),
             required: &["customer"],
+        },
+        Tool {
+            name: "search_intranet",
+            command: "intranet.search",
+            description: "Search the operator's intranet (the billing system) for a customer by name, VAT number or tax code, to import them: each row says whether the desk already has them (customer). Refused when the intranet is not reachable.",
+            properties: json!({"query": text, "limit": limit}),
+            required: &["query"],
+        },
+        Tool {
+            name: "import_customer",
+            command: "customer.import",
+            description: "Create a customer from the intranet's record (intranet_id from search_intranet): name, tax id, e-mail, phone, address and contact. A customer already imported, or with the same tax id, is updated instead of duplicated; PCs, interventions and the GDPR record stay in the desk. Show the row and ask before importing.",
+            properties: json!({"intranet_id": {"type": "integer", "minimum": 1, "description": "The customer's id in the intranet"}}),
+            required: &["intranet_id"],
         },
         Tool {
             name: "archive_customer",

@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 remotecraft-ui-egui = { workspace = true }
+remotecraft-remote = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
 rfd = { workspace = true }

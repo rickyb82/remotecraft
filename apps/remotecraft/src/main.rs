@@ -122,6 +122,12 @@ fn main() -> Result<(), String> {
         desk.set_actor(a);
     }
     desk.set_rustdesk_probe("", Box::new(probe));
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_default();
+    if let Some(call) =
+        remotecraft_remote::intranet::caller(&env("REMOTECRAFT_INTRANET_URL"), &env("REMOTECRAFT_INTRANET_TOKEN"), &env("REMOTECRAFT_INTRANET_ROLE"))
+    {
+        desk.set_intranet(call);
+    }
     let mut app = DeskApp::new(Box::new(Session::new(desk)));
     if let Some(l) = lang {
         app.language = l;

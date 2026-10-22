@@ -249,6 +249,10 @@ pub enum Intent {
     Removed,
     /// `device.update {unattended: false}` from a warning on the card.
     Unticked,
+    /// `intranet.search` from the New customer form answered.
+    IntranetSearched,
+    /// `customer.import` from the New customer form answered.
+    Imported,
 }
 
 /// This screen's own state.
@@ -257,6 +261,9 @@ pub struct State {
     pub form: Option<Form>,
     /// The form's command in flight.
     pub busy: Option<u64>,
+    /// The intranet behind the New customer form: the text to search and the answer.
+    pub intranet: forms::IntranetLookup,
+    pub intranet_text: String,
     pub show_archived: bool,
     /// Only the customers with this tag.
     pub tag: Option<String>,
@@ -407,9 +414,126 @@ fn narrow_width(width: f32) -> bool {
     width < NARROW
 }
 
+/// Above the New customer form: a search of the operator's intranet and its rows; a row
+/// imports the customer (the form closes on the answer), one already in the desk opens it.
+/// Answers whether the form was closed.
+fn intranet_block(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, busy: bool) -> bool {
+    let mut search = false;
+    let mut import = None;
+    let mut open = None;
+    widgets::card(t).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(app.tr("From the intranet")).strong().color(t.ui_text));
+        ui.label(
+            RichText::new(
+                app.tr("A customer of the billing system is imported with their registry; PCs, interventions and the GDPR record stay here."),
+            )
+            .small()
+            .color(t.muted),
+        );
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            // The box leaves room for the button; the button wraps under it when the pane is
+            // narrow, so the card never widens the pane.
+            let room = (ui.available_width() - 220.0).clamp(140.0, 420.0);
+            let hint = app.tr("Name, VAT number or tax code…").to_string();
+            let r = ui.add(egui::TextEdit::singleline(&mut app.customers.intranet_text).hint_text(hint).desired_width(room));
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                search = true;
+            }
+            if widgets::icon_text_button(ui, t, Icon::Search, app.tr("Search the intranet"), !busy).clicked() {
+                search = true;
+            }
+        });
+        let lookup = &app.customers.intranet;
+        if lookup.cached.loading() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0).color(t.accent));
+                ui.label(RichText::new(app.tr("Searching the intranet…")).small().color(t.muted));
+            });
+        } else if !lookup.cached.error.is_empty() {
+            widgets::error_line(ui, t, &app.language.tr_message(&lookup.cached.error));
+        } else if !lookup.query.is_empty() {
+            let rows = lookup.rows();
+            if rows.is_empty() {
+                ui.label(RichText::new(app.tr("Nothing in the intranet")).small().color(t.muted));
+            }
+            for row in &rows {
+                let sub = match row.customer {
+                    Some(_) => app.tr("Already in the desk").to_string(),
+                    None if row.ceased => format!("{} · {}", row.detail, app.tr("Ceased")),
+                    None => row.detail.clone(),
+                };
+                if forms::pick_row(ui, t, &row.name, &sub).clicked() && !busy {
+                    match row.customer.filter(|c| app.data().customer(*c).is_some_and(|c| c.erased_at.is_none())) {
+                        Some(id) => open = Some(id),
+                        None => import = Some(row.intranet_id),
+                    }
+                }
+            }
+        }
+    });
+    ui.add_space(8.0);
+    if search {
+        let query = crate::core::line(&app.customers.intranet_text);
+        if !query.is_empty() {
+            app.customers.intranet.query.clone_from(&query);
+            derived::refresh(
+                app,
+                |a| &mut a.customers.intranet.cached,
+                "intranet.search",
+                json!({"query": query}),
+                crate::Intent::Customers(Intent::IntranetSearched),
+            );
+        }
+    }
+    if let Some(intranet_id) = import {
+        let job = app.run_as("customer.import", json!({"intranet_id": intranet_id}), crate::Intent::Customers(Intent::Imported));
+        app.customers.busy = Some(job);
+    }
+    if let Some(id) = open {
+        app.customers.form = None;
+        app.customers.busy = None;
+        app.open_customer(id);
+        return true;
+    }
+    false
+}
+
 /// Applies a finished command of this screen.
 pub fn on_result(app: &mut DeskApp, intent: Intent, c: &Completed) {
     match intent {
+        Intent::IntranetSearched => {
+            app.customers.intranet.cached.finish(c);
+        }
+        Intent::Imported => {
+            // Only the form that sent it (see `Saved`).
+            let mine = app.customers.busy == Some(c.job);
+            if mine {
+                app.customers.busy = None;
+            }
+            match &c.result {
+                Ok(v) => {
+                    let text = if v["created"].as_bool() == Some(false) {
+                        "Customer updated from the intranet"
+                    } else {
+                        "Customer imported from the intranet"
+                    };
+                    app.toast(app.tr(text).to_string());
+                    if mine {
+                        app.customers.form = None;
+                        if let Some(id) = forms::new_id(v, "customer") {
+                            app.open_when_ready(Screen::Customers, id);
+                        }
+                    }
+                }
+                Err(e) => {
+                    if mine && let Some(f) = app.customers.form.as_mut() {
+                        f.error = app.language.tr_message(&e.to_string());
+                    }
+                }
+            }
+        }
         Intent::Saved => {
             // Only the form that sent it: on a remote desk the answer may come after the form
             // was closed and another one opened, which a late answer must leave alone.
@@ -485,7 +609,10 @@ pub fn new(app: &mut DeskApp) {
 
 /// Opens the new-customer form with `name` prefilled (from the search, the setup guide).
 pub fn open_new(app: &mut DeskApp, name: &str) {
-    app.customers.form = Some(Form { name: clip(name.trim(), limits::MAX_FIELD).to_string(), ..Form::default() });
+    let name = clip(name.trim(), limits::MAX_FIELD).to_string();
+    app.customers.intranet = forms::IntranetLookup::default();
+    app.customers.intranet_text.clone_from(&name);
+    app.customers.form = Some(Form { name, ..Form::default() });
     app.customers.busy = None;
     if app.screen != Screen::Customers {
         app.go(Screen::Customers);
@@ -1457,6 +1584,9 @@ pub fn form_ui(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens) -> bool {
         ui.label(RichText::new(format!("#{} · {} {}", c.id, app.tr("Updated"), updated)).small().color(t.muted));
     }
     ui.add_space(8.0);
+    if f.id.is_none() && app.session.intranet() && intranet_block(app, ui, t, busy) {
+        return true;
+    }
     widgets::card(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
         egui::Grid::new("customer-grid").num_columns(2).spacing([12.0, 8.0]).min_col_width(LABEL_W).show(ui, |ui| {
@@ -1762,6 +1892,81 @@ mod tests {
         frame(&mut app);
         assert!(app.data().customer(id).is_none());
         assert_eq!(app.selected_customer, None);
+    }
+
+    /// One frame on a context that lives across frames: the texts painted and where.
+    fn frame_texts(ctx: &egui::Context, app: &mut DeskApp, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                egui::Shape::Vec(list) => list.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1440.0, 900.0))), events, ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        let mut out = Vec::new();
+        for c in &output.shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// Clicks the rightmost text painted as `text`, as a mouse does; answers the texts after.
+    fn click_text(ctx: &egui::Context, app: &mut DeskApp, text: &str) -> Vec<(String, Rect)> {
+        let texts = frame_texts(ctx, app, Vec::new());
+        let at = texts
+            .iter()
+            .filter(|(t, _)| t == text)
+            .map(|(_, r)| r.center())
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .unwrap_or_else(|| panic!("{text:?} is not painted: {:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>()));
+        let button =
+            |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame_texts(ctx, app, vec![egui::Event::PointerMoved(at), button(true)]);
+        frame_texts(ctx, app, vec![button(false)]);
+        frame_texts(ctx, app, Vec::new())
+    }
+
+    #[test]
+    fn a_new_customer_is_imported_from_the_intranet() {
+        let mut app = DeskApp::demo_with_intranet();
+        app.language = Language::En;
+        let ctx = egui::Context::default();
+        open_new(&mut app, "Rossi");
+        let texts = frame_texts(&ctx, &mut app, Vec::new());
+        assert!(texts.iter().any(|(t, _)| t == "From the intranet"), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        assert_eq!(app.customers.intranet_text, "Rossi", "the name typed is the search");
+        let texts = click_text(&ctx, &mut app, "Search the intranet");
+        assert!(
+            texts.iter().any(|(t, _)| t == "Rossi Impianti S.r.l.") && texts.iter().any(|(t, _)| t == "Rossi Anna"),
+            "{:?}",
+            texts.iter().map(|t| &t.0).collect::<Vec<_>>()
+        );
+        assert!(texts.iter().any(|(t, _)| t == "RSSNNA80A41F979X · Orgosolo · Ceased"));
+        let customers = app.data().customers.len();
+        click_text(&ctx, &mut app, "Rossi Impianti S.r.l.");
+        frame_texts(&ctx, &mut app, Vec::new());
+        assert_eq!(app.data().customers.len(), customers + 1);
+        let imported = app.data().customers.iter().find(|c| c.intranet_id == Some(501)).unwrap();
+        assert_eq!((imported.tax_id.as_str(), imported.contacts.len()), ("IT05555555555", 1));
+        assert!(app.customers.form.is_none(), "the form closed");
+        assert_eq!(app.selected_customer, Some(imported.id), "and the customer opened");
+        assert!(app.toast.as_ref().is_some_and(|(text, _)| text == "Customer imported from the intranet"));
+        // Opened again: the imported one is the desk's, a click opens it instead of importing.
+        let id = imported.id;
+        open_new(&mut app, "Rossi");
+        frame_texts(&ctx, &mut app, Vec::new());
+        let texts = click_text(&ctx, &mut app, "Search the intranet");
+        assert!(texts.iter().any(|(t, _)| t == "Already in the desk"));
+        click_text(&ctx, &mut app, "Rossi Impianti S.r.l.");
+        assert_eq!((app.customers.form.is_none(), app.selected_customer, app.data().customers.len()), (true, Some(id), customers + 1));
+        // Without an intranet the form has no such block.
+        let mut app = demo();
+        open_new(&mut app, "Rossi");
+        let texts = frame_texts(&ctx, &mut app, Vec::new());
+        assert!(!texts.iter().any(|(t, _)| t == "From the intranet"));
     }
 
     #[test]

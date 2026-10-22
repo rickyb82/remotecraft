@@ -50,6 +50,10 @@ pub trait DeskSession {
     fn problems(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Whether the operator's intranet is reachable (customers can be imported from it).
+    fn intranet(&self) -> bool {
+        false
+    }
     fn italian(&self) -> bool {
         self.data().preferences.language != "en"
     }
@@ -204,6 +208,10 @@ impl DeskSession for Session {
     fn rustdesk_defaults(&self) -> (String, String) {
         let env = self.desk.rustdesk();
         (env.host.clone(), env.key.clone())
+    }
+
+    fn intranet(&self) -> bool {
+        self.desk.has_intranet()
     }
 
     fn problems(&self) -> Vec<String> {

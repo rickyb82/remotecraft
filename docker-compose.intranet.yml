@@ -1,0 +1,22 @@
+# RemoteCraft next to the intranet on the same machine: customers are imported from it.
+#
+#   echo "REMOTECRAFT_INTRANET_TOKEN=<the intranet's INTRANET_TOKEN>" >> .env
+#   docker compose -f docker-compose.yml -f docker-compose.intranet.yml up -d
+#
+# The container joins the intranet's Docker network (`intranet_default`, from its own
+# `docker compose`: set REMOTECRAFT_INTRANET_NETWORK when it is called otherwise) and calls it
+# as `http://intranet:7978`. Nothing else changes.
+services:
+  remotecraft:
+    environment:
+      REMOTECRAFT_INTRANET_URL: ${REMOTECRAFT_INTRANET_URL:-http://intranet:7978}
+      REMOTECRAFT_INTRANET_TOKEN: ${REMOTECRAFT_INTRANET_TOKEN:?set the intranet's service token}
+      REMOTECRAFT_INTRANET_ROLE: ${REMOTECRAFT_INTRANET_ROLE:-super_admin}
+    networks:
+      - default
+      - intranet
+
+networks:
+  intranet:
+    name: ${REMOTECRAFT_INTRANET_NETWORK:-intranet_default}
+    external: true

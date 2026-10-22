@@ -93,6 +93,8 @@ pub struct Snapshot {
     /// The RustDesk server next to the desk: name and key, when the container knows them.
     pub rustdesk_host: String,
     pub rustdesk_key: String,
+    /// The operator's intranet is reachable: customers can be imported from it.
+    pub intranet: bool,
 }
 
 /// Audit entries kept in memory when the desk has no files (tests, demo).
@@ -131,6 +133,8 @@ pub struct Desk {
     problems: Vec<String>,
     /// What the host knows about the RustDesk server next to it.
     rustdesk: RustDeskEnv,
+    /// The operator's intranet, when the host can reach it.
+    intranet: Option<SharedIntranet>,
     /// Bumped on every change (and every reload), for remote interfaces.
     revision: u64,
 }
@@ -142,6 +146,15 @@ pub type Probe = Box<dyn Fn(&str, u16) -> std::result::Result<u64, String> + Sen
 
 /// A [`Probe`] shared with the threads that run it.
 pub(crate) type SharedProbe = Arc<dyn Fn(&str, u16) -> std::result::Result<u64, String> + Send + Sync>;
+
+/// Runs a command of the operator's intranet (`customers.search`, `customer.get`) as a
+/// technician: `(actor, command, params)` → the command's answer, or why it failed. Injected
+/// by the app (the engine never touches the network); absent, `intranet.search` and
+/// `customer.import` refuse.
+pub type IntranetCall = Box<dyn Fn(&str, &str, &Value) -> std::result::Result<Value, String> + Send + Sync>;
+
+/// An [`IntranetCall`] shared with the commands that run it.
+pub(crate) type SharedIntranet = Arc<dyn Fn(&str, &str, &Value) -> std::result::Result<Value, String> + Send + Sync>;
 
 /// The RustDesk server running next to the desk (same container or machine).
 #[derive(Default)]
@@ -171,6 +184,7 @@ impl Desk {
             memory_audit: Vec::new(),
             problems,
             rustdesk: RustDeskEnv::default(),
+            intranet: None,
             revision: first_revision(),
         })
     }
@@ -189,6 +203,7 @@ impl Desk {
             memory_audit: Vec::new(),
             problems,
             rustdesk: RustDeskEnv::default(),
+            intranet: None,
             revision: first_revision(),
         }
     }
@@ -235,6 +250,20 @@ impl Desk {
     pub fn set_rustdesk_probe(&mut self, check_host: &str, probe: Probe) {
         self.rustdesk.check_host = remotecraft_core::line(check_host);
         self.rustdesk.probe = Some(Arc::from(probe));
+    }
+
+    /// How `intranet.search` and `customer.import` reach the operator's intranet.
+    pub fn set_intranet(&mut self, call: IntranetCall) {
+        self.intranet = Some(Arc::from(call));
+    }
+
+    /// Whether the intranet is reachable from here (customers can be imported).
+    pub fn has_intranet(&self) -> bool {
+        self.intranet.is_some()
+    }
+
+    pub(crate) fn intranet(&self) -> Option<SharedIntranet> {
+        self.intranet.clone()
     }
 
     pub fn data(&self) -> &Data {
@@ -338,6 +367,7 @@ impl Desk {
             problems: self.problems.clone(),
             rustdesk_host: self.rustdesk.host.clone(),
             rustdesk_key: self.rustdesk.key.clone(),
+            intranet: self.intranet.is_some(),
         }))
     }
 

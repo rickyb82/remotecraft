@@ -88,3 +88,11 @@
   match with it, so a customer could not be picked with the mouse), picks the only customer a
   name typed in full finds, and in the PC form offers *Create the customer "…"*; the PC form
   says what is missing while Save is off.
+- 2026-10-22: customers imported from the operator's intranet on demand: `intranet.search` and
+  `customer.import` (an injected caller of the intranet's `POST /api/cmd`, with its service
+  token and the technician's name; `remote::intranet` for the apps), the `search_intranet` /
+  `import_customer` tools, *Search the intranet* in the New customer form and under the PC
+  form's customer field; an imported customer keeps its `intranet_id`, so a second import
+  updates it and one with the same tax id is linked, not duplicated; tags, notes, PCs,
+  interventions and the GDPR record stay the desk's. `docker-compose.intranet.yml` joins the
+  intranet's Docker network.

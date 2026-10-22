@@ -57,16 +57,25 @@ impl Link {
         let resp = self.request(self.agent.post(format!("{}/api/cmd", self.base)), &actor).header("Content-Type", "application/json").send(body);
         let v = answer(resp, MAX_ANSWER)?;
         let Some(job) = v.get("job").and_then(Value::as_u64) else { return Ok(v) };
+        // The first snapshot is whole (`since=0`: the session's state and its last answers);
+        // the next ones ask only what changed since its revision, so the wait costs the intranet
+        // one `{"unchanged": true}` per poll. A job's answer comes with a newer revision.
+        let mut since = 0;
         loop {
             if started.elapsed() >= TIMEOUT {
                 return Err(format!("the intranet did not answer job {job} within {} s", TIMEOUT.as_secs()));
             }
-            std::thread::sleep(POLL);
-            let resp = self.request(self.agent.get(format!("{}/api/snapshot?since=0", self.base)), &actor).call();
+            if since != 0 {
+                std::thread::sleep(POLL);
+            }
+            let resp = self.request(self.agent.get(format!("{}/api/snapshot?since={since}", self.base)), &actor).call();
             let snapshot = answer_raw(resp, MAX_SNAPSHOT)?;
             if let Some(c) = snapshot["completed"].as_array().into_iter().flatten().find(|c| c["job"].as_u64() == Some(job)) {
                 let error = c["error"].as_str().unwrap_or_default();
                 return if error.is_empty() { Ok(c["result"].clone()) } else { Err(remotecraft_engine::core::clip(error, MAX_ERROR).to_string()) };
+            }
+            if let Some(r) = snapshot["revision"].as_u64().filter(|r| *r > 0) {
+                since = r;
             }
         }
     }
@@ -207,12 +216,17 @@ mod tests {
         let (base, _) = fake("<html>", "<html>", 502);
         let call = caller(&base, "t", "x").unwrap();
         assert!(call("a", "customer.get", &json!({})).unwrap_err().contains("502"));
-        let (base, _) = fake(r#"{"result": {"job": 1}}"#, r#"{"completed": "nonsense"}"#, 200);
+        let (base, seen) = fake(r#"{"result": {"job": 1}}"#, r#"{"revision": 5, "completed": "nonsense"}"#, 200);
         let call = caller(&base, "t", "x").unwrap();
         // Never answered: the wait ends (the test's timeout is the real one, kept short enough).
         let t = std::thread::spawn(move || call("a", "customer.get", &json!({})));
         let r = t.join().unwrap();
         assert!(r.unwrap_err().contains("did not answer job 1"));
+        // The first poll takes the whole snapshot, the next ones only what changed since it.
+        let requests = seen.lock().unwrap().clone();
+        assert!(requests.get(1).is_some_and(|(h, _)| h.starts_with("GET /api/snapshot?since=0 ")), "{:?}", requests.get(1));
+        assert!(requests.get(2).is_some_and(|(h, _)| h.starts_with("GET /api/snapshot?since=5 ")), "{:?}", requests.get(2));
+        assert!(requests.len() > 10 && requests.len() < 150, "{} polls", requests.len());
         let call = caller("http://127.0.0.1:1", "t", "x").unwrap();
         assert!(call("a", "customer.get", &json!({})).unwrap_err().contains("unreachable"));
         assert!(caller("", "t", "x").is_none() && caller("intranet:7978", "t", "x").is_none());

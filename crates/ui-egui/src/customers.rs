@@ -1989,7 +1989,8 @@ mod tests {
         let texts = frame_texts(&ctx, &mut app, Vec::new());
         assert!(texts.iter().any(|(t, _)| t == "From the intranet"), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
         assert_eq!(app.customers.intranet_text, "Rossi", "the name typed is the search");
-        let texts = click_text(&ctx, &mut app, "Search the intranet");
+        click_text(&ctx, &mut app, "Search the intranet");
+        let texts = settle(&ctx, &mut app);
         assert!(
             texts.iter().any(|(t, _)| t == "Rossi Impianti S.r.l.") && texts.iter().any(|(t, _)| t == "Rossi Anna"),
             "{:?}",
@@ -1998,7 +1999,7 @@ mod tests {
         assert!(texts.iter().any(|(t, _)| t == "RSSNNA80A41F979X · Orgosolo · Ceased"));
         let customers = app.data().customers.len();
         click_text(&ctx, &mut app, "Rossi Impianti S.r.l.");
-        frame_texts(&ctx, &mut app, Vec::new());
+        settle(&ctx, &mut app);
         assert_eq!(app.data().customers.len(), customers + 1);
         let imported = app.data().customers.iter().find(|c| c.intranet_id == Some(501)).unwrap();
         assert_eq!((imported.tax_id.as_str(), imported.contacts.len()), ("IT05555555555", 1));

@@ -689,8 +689,9 @@ fn no_intranet() -> Error {
 }
 
 pub(crate) fn intranet_fetch(desk: &Desk, actor: &str, command: &str, params: &Value) -> CoreResult<IntranetFetch> {
-    let call = desk.intranet().ok_or_else(no_intranet)?;
+    // The parameters first: a bad request is a 400 with or without an intranet.
     let request = intranet_request(command, params)?;
+    let call = desk.intranet().ok_or_else(no_intranet)?;
     Ok(IntranetFetch { call, actor: actor.to_string(), command: command.to_string(), params: params.clone(), request })
 }
 

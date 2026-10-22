@@ -46,6 +46,13 @@ Se sulla stessa macchina gira la intranet (`intranet-cli serve` nel suo containe
 strumenti MCP `search_intranet` / `import_customer`. Serve solo un cliente alla volta: non c'è
 una sincronizzazione.
 
+**Dentro Emily** (RemoteCraft e intranet avviati da `familai.sh`, nello stesso compose) non c'è
+niente da configurare: il compose di Emily passa a RemoteCraft `INTRANET_URL` e
+`INTRANET_TOKEN` del suo `.env`; basta che la intranet sia attiva (`./familai.sh intranet up`)
+e che RemoteCraft sia stato ricreato dopo (`./familai.sh remotecraft upgrade`).
+
+**Da solo**, con la intranet in un altro compose sulla stessa macchina:
+
 ```sh
 echo "REMOTECRAFT_INTRANET_TOKEN=$(grep ^INTRANET_TOKEN= ../intranet/.env | cut -d= -f2-)" >> .env
 echo "COMPOSE_FILE=docker-compose.yml:docker-compose.intranet.yml" >> .env

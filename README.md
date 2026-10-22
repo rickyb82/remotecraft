@@ -122,11 +122,11 @@ docker compose ps                       # deve diventare "healthy"
   `127.0.0.1:7979`: davanti mettici il framework o un reverse proxy HTTPS.
 - RustDesk non dipende dal gestionale: se l'API non parte, hbbs e hbbr continuano a servire i
   client e `docker compose logs` dice perché.
-- **Con la intranet sulla stessa macchina**: aggiungi a `.env` il suo token
-  (`REMOTECRAFT_INTRANET_TOKEN=…`, lo stesso `INTRANET_TOKEN` del suo `.env`) e avvia con
+- **Con la intranet sulla stessa macchina**: dentro Emily non serve niente (il suo compose
+  collega i due container); da solo, aggiungi a `.env` il token della intranet
+  (`REMOTECRAFT_INTRANET_TOKEN=…`, lo stesso `INTRANET_TOKEN` del suo `.env`) e
   `COMPOSE_FILE=docker-compose.yml:docker-compose.intranet.yml`, poi il solito
-  `docker compose up -d --build`: il container entra nella rete Docker della intranet e i
-  clienti si importano da lì ([docs/deploy.md](docs/deploy.md#la-intranet)).
+  `docker compose up -d --build` ([docs/deploy.md](docs/deploy.md#la-intranet)).
 
 ### Aggiornamento
 

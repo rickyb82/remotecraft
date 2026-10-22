@@ -62,7 +62,9 @@ impl IntranetLookup {
             .take(50)
             .filter_map(|r| {
                 let intranet_id = r["intranet_id"].as_u64().filter(|i| *i > 0)?;
-                let name = format::clipped(r["name"].as_str().unwrap_or_default(), 80);
+                // The whole name (the row truncates it on screen): a click sends it back to the
+                // engine, which must find the field naming the customer it answers.
+                let name = remotecraft_engine::core::line(r["name"].as_str().unwrap_or_default());
                 let detail = [r["tax_id"].as_str().unwrap_or_default(), r["city"].as_str().unwrap_or_default()]
                     .iter()
                     .filter(|s| !s.is_empty())
@@ -196,22 +198,28 @@ pub fn customer_picker(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, label: &str
 /// what it found (a customer already in the desk is picked; another is imported).
 fn intranet_rows(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, lookup: &IntranetLookup, p: &mut Picker, answer: &mut PickerAnswer) {
     let name = p.text.trim().to_string();
-    if !lookup.is_for(&fold(&name)) {
-        let title = app.language.fill("Search the intranet for \"{name}\"", &[("name", &format::clipped(&name, 60))]);
-        if pick_row(ui, t, &format!("» {title}"), "").clicked() {
-            answer.search = Some(remotecraft_engine::core::line(&name));
-        }
-        return;
-    }
-    if lookup.cached.loading() {
+    let searched = lookup.is_for(&fold(&name));
+    if searched && lookup.cached.loading() {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new().size(14.0).color(t.accent));
             ui.label(RichText::new(app.tr("Searching the intranet…")).small().color(t.muted));
         });
         return;
     }
-    if !lookup.cached.error.is_empty() {
+    let failed = searched && !lookup.cached.error.is_empty();
+    if failed {
         widgets::error_line(ui, t, &app.language.tr_message(&lookup.cached.error));
+    }
+    if !searched || failed {
+        // Not searched yet, or failed: the row that asks (again).
+        let title = app.language.fill("Search the intranet for \"{name}\"", &[("name", &format::clipped(&name, 60))]);
+        if pick_row(ui, t, &format!("» {title}"), "").clicked() {
+            // As the engine reads it (a pasted tab becomes a space), so the answer is for the
+            // field's text.
+            let clean = remotecraft_engine::core::line(&name);
+            p.text = clean.clone();
+            answer.search = Some(clean);
+        }
         return;
     }
     let rows = lookup.rows();
@@ -227,11 +235,19 @@ fn intranet_rows(app: &DeskApp, ui: &mut egui::Ui, t: &Tokens, lookup: &Intranet
             None if row.ceased => format!("{} · {}", row.detail, app.tr("Ceased")),
             None => row.detail.clone(),
         };
+        let local = row.customer.and_then(|c| data.customer(c)).filter(|c| c.erased_at.is_none());
+        if let Some(c) = local.filter(|c| c.archived) {
+            // Archived in the desk: said, as the matches say it; importing again would bring
+            // it back, which is a decision for the Customers screen.
+            let text = app.language.fill("The customer \"{name}\" is archived: restore it to pick it", &[("name", &format::clipped(&c.name, 60))]);
+            ui.label(RichText::new(text).small().color(t.muted));
+            continue;
+        }
         if pick_row(ui, t, &row.name, &sub).clicked() {
-            match row.customer.filter(|c| data.customer(*c).is_some_and(|c| c.erased_at.is_none())) {
-                Some(id) => {
-                    p.id = Some(id);
-                    p.text = crate::customer_name(data, id);
+            match local {
+                Some(c) => {
+                    p.id = Some(c.id);
+                    p.text.clone_from(&c.name);
                 }
                 None => {
                     p.text.clone_from(&row.name);

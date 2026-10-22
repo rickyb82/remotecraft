@@ -665,6 +665,19 @@ fn run(hub: &Hub, actor: &str, command: &str, params: &Value) -> (&'static str, 
             drop(d);
             check.map(|c| c.run())
         }
+        // The intranet too answers in seconds: asked with the desk released, then the
+        // command runs with the answer.
+        Ok(mut d) if matches!(command, "intranet.search" | "customer.import") => {
+            let fetch = d.prepare_intranet(actor, command, params);
+            drop(d);
+            fetch.and_then(|f| {
+                let answer = f.run();
+                match hub.desk.lock() {
+                    Ok(mut d) => d.execute_fetched(&f, answer),
+                    Err(_) => Err(remotecraft_engine::Error::Core(remotecraft_engine::core::Error::Io("the desk is unavailable".into()))),
+                }
+            })
+        }
         Ok(mut d) => d.execute_as(actor, command, params),
         Err(_) => return ("500 Internal Server Error", json!({"error": "the desk is unavailable"})),
     };

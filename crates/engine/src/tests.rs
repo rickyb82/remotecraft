@@ -72,6 +72,26 @@ fn every_command_survives_hostile_params() {
             }
         }
     }
+    // The intranet's answers are hostile too: junk, junk as a customer, junk as the list.
+    let answers: Vec<Value> = junk
+        .iter()
+        .cloned()
+        .chain(junk.iter().map(|j| json!({"customer": j, "customers": [j, {"id": "7"}, {"id": 7}, {"id": 7, "name": ["x"]}]})))
+        .chain([json!({"customer": {"id": 1, "name": "x".repeat(100_000), "vat": "y".repeat(100_000), "email": 5, "private": "no", "contact": 1}})])
+        .collect();
+    for answer in answers {
+        for command in ["intranet.search", "customer.import"] {
+            for p in [json!({"query": "x", "intranet_id": 1}), json!({"query": "x", "intranet_id": 7})] {
+                let mut d = demo();
+                let a = answer.clone();
+                d.set_intranet(Box::new(move |_, _, _| Ok(a.clone())));
+                let before = d.data().clone();
+                if d.execute(command, &p).is_err() {
+                    assert_eq!(d.data(), &before, "{command} changed the desk on failure with {answer}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -570,7 +590,7 @@ fn customers_come_from_the_intranet_on_demand() {
     // Without the intranet: a clear refusal, nothing changed.
     assert!(fails(&mut d, "intranet.search", json!({"query": "rossi"})).contains("not reachable"));
     with_intranet(&mut d);
-    let found = run(&mut d, "intranet.search", json!({"query": "rossi"}));
+    let found = run(&mut d, "intranet.search", json!({"query": "rossi", "limit": 1000}));
     assert_eq!(found["count"], 1);
     let row = &found["customers"][0];
     assert_eq!((row["intranet_id"].as_u64(), row["tax_id"].as_str(), row["city"].as_str()), (Some(501), Some("IT05555555555"), Some("Nuoro")));
@@ -591,7 +611,7 @@ fn customers_come_from_the_intranet_on_demand() {
     // Imported again: the same customer, updated, not a second one; the search says which.
     run(&mut d, "customer.update", json!({"customer": id, "tags": ["contratto"], "notes": "Server in cantina"}));
     let again = run(&mut d, "customer.import", json!({"intranet_id": 501}));
-    assert_eq!((again["created"].as_bool(), again["customer"]["id"].as_u64()), (Some(false), Some(id)));
+    assert_eq!((again["created"].as_bool(), again["customer"]["id"].as_u64(), again["unarchived"].as_bool()), (Some(false), Some(id), Some(false)));
     assert_eq!(d.data().customers.len(), before + 1);
     let c = d.data().customer(id).unwrap();
     assert_eq!((c.tags.as_slice(), c.notes.as_str()), (&["contratto".to_string()][..], "Server in cantina"), "the desk's own fields stay");
@@ -603,6 +623,31 @@ fn customers_come_from_the_intranet_on_demand() {
     let v = run(&mut d, "customer.import", json!({"intranet_id": 502}));
     let c = d.data().customer(v["customer"]["id"].as_u64().unwrap()).unwrap();
     assert_eq!((c.kind, c.email.as_str(), c.phone.as_str(), c.tax_id.as_str()), (CustomerKind::Person, "", "+39 333 2", "LNRNNA80A41F979X"));
+    // Archived in the desk, imported again: a customer again.
+    run(&mut d, "customer.archive", json!({"customer": id}));
+    let back = run(&mut d, "customer.import", json!({"intranet_id": 501}));
+    assert_eq!(back["unarchived"], true);
+    assert!(!d.data().customer(id).unwrap().archived);
+    // A tax id the desk alone holds survives an import whose record has none.
+    let anna = d.data().customers.iter().find(|c| c.intranet_id == Some(502)).map(|c| c.id).unwrap();
+    run(&mut d, "customer.update", json!({"customer": anna, "tax_id": "LNRNNA80A41F979X"}));
+    run(&mut d, "customer.import", json!({"intranet_id": 502}));
+    assert_eq!(d.data().customer(anna).unwrap().tax_id, "LNRNNA80A41F979X");
+    // A desk customer linked to one record is not moved to another with the same tax id.
+    d.set_intranet(Box::new(|_, _, params| match params["id"].as_u64() {
+        Some(777) => Ok(json!({"customer": {"id": 777, "name": "Rossi Impianti (nuova)", "vat": "IT05555555555", "private": false}})),
+        _ => Err("no".into()),
+    }));
+    let err = fails(&mut d, "customer.import", json!({"intranet_id": 777}));
+    assert!(err.contains("already linked to intranet record 501"), "{err}");
+    assert_eq!(d.data().customer(id).unwrap().intranet_id, Some(501));
+    // Unlinked by hand, the next import takes the new record.
+    run(&mut d, "customer.update", json!({"customer": id, "intranet_id": null}));
+    assert_eq!(d.data().customer(id).unwrap().intranet_id, None);
+    let moved = run(&mut d, "customer.import", json!({"intranet_id": 777}));
+    assert_eq!((moved["created"].as_bool(), moved["customer"]["id"].as_u64()), (Some(false), Some(id)));
+    assert_eq!(d.data().customer(id).unwrap().intranet_id, Some(777));
+    with_intranet(&mut d);
     // Unknown, missing or hostile ids are refused and change nothing.
     let count = d.data().customers.len();
     assert!(fails(&mut d, "customer.import", json!({"intranet_id": 999})).contains("intranet"));

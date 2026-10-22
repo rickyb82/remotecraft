@@ -477,7 +477,9 @@ fn intranet_block(app: &mut DeskApp, ui: &mut egui::Ui, t: &Tokens, busy: bool) 
     if search {
         let query = crate::core::line(&app.customers.intranet_text);
         if !query.is_empty() {
-            app.customers.intranet.query.clone_from(&query);
+            // A click is a request: searched again even after an error, and a search still
+            // out is forgotten (its answer would be another text's).
+            app.customers.intranet = forms::IntranetLookup { query: query.clone(), cached: derived::Cached::default() };
             derived::refresh(
                 app,
                 |a| &mut a.customers.intranet.cached,
@@ -1913,6 +1915,19 @@ mod tests {
         out
     }
 
+    /// Frames until no command waits on another thread (the intranet), then one more: the
+    /// texts painted.
+    fn settle(ctx: &egui::Context, app: &mut DeskApp) -> Vec<(String, Rect)> {
+        for _ in 0..500 {
+            if app.session.jobs_pending() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            frame_texts(ctx, app, Vec::new());
+        }
+        frame_texts(ctx, app, Vec::new())
+    }
+
     /// Clicks the rightmost text painted as `text`, as a mouse does; answers the texts after.
     fn click_text(ctx: &egui::Context, app: &mut DeskApp, text: &str) -> Vec<(String, Rect)> {
         let texts = frame_texts(ctx, app, Vec::new());
@@ -1927,6 +1942,42 @@ mod tests {
         frame_texts(ctx, app, vec![egui::Event::PointerMoved(at), button(true)]);
         frame_texts(ctx, app, vec![button(false)]);
         frame_texts(ctx, app, Vec::new())
+    }
+
+    #[test]
+    fn a_second_intranet_search_replaces_the_first() {
+        use std::sync::{Arc, Mutex};
+        // An intranet whose answers wait until released: the second search must not be lost,
+        // and the first answer must not show under the second text.
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let mut desk = crate::engine::Desk::demo();
+        let g = gate.clone();
+        desk.set_intranet(Box::new(move |_, _, params| {
+            drop(g.lock().unwrap());
+            let q = params["query"].as_str().unwrap_or_default().to_string();
+            Ok(json!({"customers": [{"id": 1, "name": format!("Found {q}"), "private": false}], "count": 1}))
+        }));
+        let mut app = DeskApp::new(Box::new(crate::engine::Session::new(desk)));
+        app.language = Language::En;
+        let ctx = egui::Context::default();
+        open_new(&mut app, "Impianti");
+        frame_texts(&ctx, &mut app, Vec::new());
+        click_text(&ctx, &mut app, "Search the intranet");
+        app.customers.intranet_text = "Anna".into();
+        click_text(&ctx, &mut app, "Search the intranet");
+        assert_eq!(app.customers.intranet.query, "Anna");
+        drop(held);
+        let mut texts = Vec::new();
+        for _ in 0..200 {
+            texts = frame_texts(&ctx, &mut app, Vec::new());
+            if texts.iter().any(|(t, _)| t.starts_with("Found ")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(texts.iter().any(|(t, _)| t == "Found Anna"), "{:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        assert!(!texts.iter().any(|(t, _)| t == "Found Impianti"), "the first answer is not shown under the second text");
     }
 
     #[test]
@@ -1958,7 +2009,8 @@ mod tests {
         let id = imported.id;
         open_new(&mut app, "Rossi");
         frame_texts(&ctx, &mut app, Vec::new());
-        let texts = click_text(&ctx, &mut app, "Search the intranet");
+        click_text(&ctx, &mut app, "Search the intranet");
+        let texts = settle(&ctx, &mut app);
         assert!(texts.iter().any(|(t, _)| t == "Already in the desk"));
         click_text(&ctx, &mut app, "Rossi Impianti S.r.l.");
         assert_eq!((app.customers.form.is_none(), app.selected_customer, app.data().customers.len()), (true, Some(id), customers + 1));

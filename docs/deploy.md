@@ -48,11 +48,15 @@ una sincronizzazione.
 
 ```sh
 echo "REMOTECRAFT_INTRANET_TOKEN=$(grep ^INTRANET_TOKEN= ../intranet/.env | cut -d= -f2-)" >> .env
-docker compose -f docker-compose.yml -f docker-compose.intranet.yml up -d --build
+echo "COMPOSE_FILE=docker-compose.yml:docker-compose.intranet.yml" >> .env
+docker compose up -d --build
 docker compose exec -u remotecraft remotecraft remotecraft-cli run intranet.search '{"query": "rossi"}'
 ```
 
-`docker-compose.intranet.yml` fa entrare il container nella rete Docker della intranet
+`COMPOSE_FILE` in `.env` fa valere `docker-compose.intranet.yml` per ogni `docker compose`
+(anche l'aggiornamento di sempre, `git pull && docker compose up -d --build`): senza, un
+`docker compose up` ricreerebbe il container senza la intranet. Quel file fa entrare il
+container nella rete Docker della intranet
 (`intranet_default`; `REMOTECRAFT_INTRANET_NETWORK` se si chiama diversamente) e imposta
 `REMOTECRAFT_INTRANET_URL=http://intranet:7978`. Il gestionale chiama `POST /api/cmd` della
 intranet con il suo token di servizio (`Authorization: Bearer`), il nome del tecnico in
@@ -67,8 +71,12 @@ interventi e registro privacy. Un cliente già nel gestionale con la stessa part
 collegato, non duplicato. Dalla intranet arrivano solo i campi dell'anagrafica: niente
 credenziali, contratti o fatture.
 
-Le chiamate partono dal server (`serve`): l'app web le fa fare a lui, l'app desktop e la CLI
-le fanno da sole se hanno le stesse variabili nell'ambiente.
+La intranet esegue i comandi su un suo worker e risponde subito con un numero di job: il
+gestionale aspetta il risultato nello snapshot della sessione del tecnico (al massimo 15
+secondi, poi rinuncia con un errore). L'attesa non blocca niente: il server rilascia il
+gestionale mentre aspetta, l'app desktop chiede su un altro thread. Le chiamate partono dal
+server (`serve`): l'app web le fa fare a lui, l'app desktop e la CLI le fanno da sole se hanno
+le stesse variabili nell'ambiente.
 
 ## Migrazione dai due container di prima
 

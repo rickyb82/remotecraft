@@ -125,7 +125,7 @@ fn tools() -> Vec<Tool> {
             name: "search_intranet",
             command: "intranet.search",
             description: "Search the operator's intranet (the billing system) for a customer by name, VAT number or tax code, to import them: each row says whether the desk already has them (customer). Refused when the intranet is not reachable.",
-            properties: json!({"query": text, "limit": limit}),
+            properties: json!({"query": text, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}),
             required: &["query"],
         },
         Tool {

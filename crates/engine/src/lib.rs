@@ -14,7 +14,7 @@ pub mod views;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use cmd::{COMMANDS, Command, RustDeskCheck};
+pub use cmd::{COMMANDS, Command, IntranetFetch, RustDeskCheck};
 pub use remotecraft_core as core;
 use remotecraft_core::chrono::{DateTime, Utc};
 use remotecraft_core::{Data, storage, time};
@@ -106,6 +106,9 @@ pub(crate) struct Ctx {
     pub now: DateTime<Utc>,
     pub targets: Vec<String>,
     pub detail: String,
+    /// The intranet's answer fetched before the command ran ([`Desk::execute_fetched`]), so
+    /// the command never waits on the network while it holds the desk.
+    pub fetched: Option<std::result::Result<Value, String>>,
 }
 
 impl Ctx {
@@ -282,6 +285,29 @@ impl Desk {
 
     /// Runs a command for `actor` (the technician the framework or the token names).
     pub fn execute_as(&mut self, actor: &str, command: &str, params: &Value) -> Result<Value> {
+        self.execute_with(actor, command, params, None)
+    }
+
+    /// An `intranet.search` or `customer.import` prepared with [`Desk::prepare_intranet`]:
+    /// the parameters checked and the intranet's request made, so the slow part
+    /// ([`IntranetFetch::run`]) can run without the desk — on another thread, or outside the
+    /// server's lock. The same answer as `execute_as(actor, command, params)`, which fetches
+    /// while it holds the desk.
+    pub fn prepare_intranet(&mut self, actor: &str, command: &str, params: &Value) -> Result<IntranetFetch> {
+        let empty = json!({});
+        let params = object_params(params, &empty)?;
+        self.reload_if_changed()?;
+        let actor = remotecraft_core::line(actor);
+        let actor = if actor.is_empty() { self.actor.clone() } else { actor };
+        Ok(cmd::intranet_fetch(self, &actor, command, params)?)
+    }
+
+    /// Runs the command the fetch was prepared for, with the intranet's answer.
+    pub fn execute_fetched(&mut self, fetch: &IntranetFetch, answer: std::result::Result<Value, String>) -> Result<Value> {
+        self.execute_with(fetch.actor(), fetch.command_id(), fetch.command_params(), Some(answer))
+    }
+
+    fn execute_with(&mut self, actor: &str, command: &str, params: &Value, fetched: Option<std::result::Result<Value, String>>) -> Result<Value> {
         let Some(spec) = COMMANDS.iter().find(|c| c.id == command) else {
             return Err(Error::UnknownCommand(remotecraft_core::clip(command, 80).to_string()));
         };
@@ -289,8 +315,13 @@ impl Desk {
         let params = object_params(params, &empty)?;
         self.reload_if_changed()?;
         let actor = remotecraft_core::line(actor);
-        let mut ctx =
-            Ctx { actor: if actor.is_empty() { self.actor.clone() } else { actor }, now: self.now(), targets: Vec::new(), detail: String::new() };
+        let mut ctx = Ctx {
+            actor: if actor.is_empty() { self.actor.clone() } else { actor },
+            now: self.now(),
+            targets: Vec::new(),
+            detail: String::new(),
+            fetched,
+        };
         if !spec.writes {
             let out = cmd::dispatch(self, &mut ctx, command, params)?;
             if spec.audited {

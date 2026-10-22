@@ -124,9 +124,9 @@ docker compose ps                       # deve diventare "healthy"
   client e `docker compose logs` dice perché.
 - **Con la intranet sulla stessa macchina**: aggiungi a `.env` il suo token
   (`REMOTECRAFT_INTRANET_TOKEN=…`, lo stesso `INTRANET_TOKEN` del suo `.env`) e avvia con
-  `docker compose -f docker-compose.yml -f docker-compose.intranet.yml up -d --build`: il
-  container entra nella rete Docker della intranet e i clienti si importano da lì
-  ([docs/deploy.md](docs/deploy.md#la-intranet)).
+  `COMPOSE_FILE=docker-compose.yml:docker-compose.intranet.yml`, poi il solito
+  `docker compose up -d --build`: il container entra nella rete Docker della intranet e i
+  clienti si importano da lì ([docs/deploy.md](docs/deploy.md#la-intranet)).
 
 ### Aggiornamento
 
